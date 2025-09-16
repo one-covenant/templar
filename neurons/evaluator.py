@@ -449,7 +449,7 @@ class Evaluator:
             "--model",
             "vllm",
             "--model_args",
-            f"pretrained={model_path},tensor_parallel_size={tp}",
+            f"pretrained={model_path},tensor_parallel_size={tp},gpu_memory_utilization=0.85",
             "--tasks",
             ",".join(tasks),
             "--batch_size",
@@ -459,10 +459,6 @@ class Evaluator:
         ]
         if num_fewshot > 0:
             cmd.extend(["--num_fewshot", str(num_fewshot)])
-
-        # Prevent vLLM from exceeding max_model_len when prompts already hit 2048.
-        # This truncates up to 1 prompt token when needed so 2047 + 1 gen stays within 2048.
-        cmd.extend(["--gen_kwargs", "truncate_prompt_tokens=1"])
 
         # ── NEW: clean environment for the child ──────────────────────────────
         clean_env = os.environ.copy()
