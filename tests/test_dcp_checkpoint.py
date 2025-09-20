@@ -134,7 +134,7 @@ def dcp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """
     m = importlib.import_module("tplr.dcp_checkpoint")
     # neutralize barrier to avoid torch.distributed
-    monkeypatch.setattr(m, "_barrier", lambda: None)
+    monkeypatch.setattr(m, "_barrier", lambda group=None: None)
     return m
 
 
@@ -142,8 +142,8 @@ def set_dist(
     monkeypatch: pytest.MonkeyPatch, mod: Any, *, rank: int, world: int
 ) -> None:
     """Patch helper functions in the module to emulate a rank/world_size."""
-    monkeypatch.setattr(mod, "_rank", lambda: int(rank))
-    monkeypatch.setattr(mod, "_world", lambda: int(world))
+    monkeypatch.setattr(mod, "_rank", lambda group=None: int(rank))
+    monkeypatch.setattr(mod, "_world", lambda group=None: int(world))
 
 
 # ---- Tests -------------------------------------------------------------------
@@ -241,7 +241,23 @@ async def test_upload_round_robin_assignment_per_rank(
     set_dist(monkeypatch, dcp, rank=0, world=world)
 
     own = FakeBucket("own")
-    comms = FakeComms(own_bucket=own, repo_root=tmp_path)
+
+    # Pre-populate S3 listings to make rank 0 think all files are already uploaded
+    prefix = f"checkpoints/v/{window}/"
+    listings = {
+        prefix: [
+            (f"{prefix}__0_0.distcp", 1000),
+            (f"{prefix}__0_1.distcp", 1000),
+            (f"{prefix}__1_0.distcp", 1000),
+            (f"{prefix}__1_1.distcp", 1000),
+            (f"{prefix}__2_0.distcp", 1000),
+            (f"{prefix}__2_1.distcp", 1000),
+            (f"{prefix}.metadata", 100),
+            (f"{prefix}extra_metadata.json", 200),
+        ]
+    }
+
+    comms = FakeComms(own_bucket=own, repo_root=tmp_path, s3_listings=listings)
     ckpt = DCPCheckpointer(comms, uid=1, version="v", repo_root=tmp_path)
     layout = Layout("v", window)
 
@@ -251,18 +267,33 @@ async def test_upload_round_robin_assignment_per_rank(
 
     # Metadata
     (local_dir / ".metadata").write_text("m")
-    (local_dir / "extra_metadata.json").write_text("{}")
+    (local_dir / "extra_metadata.json").write_text(
+        json.dumps({"world_size_at_save": world})
+    )
 
-    # Data shards (names chosen so sorting is deterministic)
-    data_names = ["aa.pt", "bb.pt", "cc.pt", "dd.pt", "ee.pt", "ff.pt", "gg.pt"]
+    # Data shards with DCP-style names (so owner ranks can be identified)
+    data_names = [
+        "__0_0.distcp",
+        "__0_1.distcp",  # rank 0 owns these
+        "__1_0.distcp",
+        "__1_1.distcp",  # rank 1 owns these
+        "__2_0.distcp",
+        "__2_1.distcp",  # rank 2 owns these
+    ]
     for n in data_names:
         (local_dir / n).write_text("data-" + n)
 
     expected_by_rank: dict[int, set[str]] = {r: set() for r in range(world)}
-    sorted_names = sorted(data_names)
-    for i, name in enumerate(sorted_names):
-        r = i % world
-        expected_by_rank[r].add(f"{layout.prefix}/{name}")
+    # Each rank owns files matching its rank number in the filename
+    for name in data_names:
+        # Extract owner rank from filename pattern __<rank>_<idx>.distcp
+        import re
+
+        m = re.match(r"__(\d+)_\d+\.distcp", name)
+        if m:
+            owner_rank = int(m.group(1))
+            if owner_rank < world:
+                expected_by_rank[owner_rank].add(f"{layout.prefix}/{name}")
 
     # Run upload separately for each emulated rank
     uploads_per_rank: dict[int, list[str]] = {}
@@ -271,14 +302,20 @@ async def test_upload_round_robin_assignment_per_rank(
         set_dist(monkeypatch, dcp, rank=r, world=world)
         before = len(comms.uploads)
         await ckpt.upload(
-            window=window, background=False, delete_local_on_success=False
+            window=window,
+            background=False,
+            delete_local_on_success=False,
+            initial_sleep_s=0.01,  # Skip the initial sleep
+            pointer_poll_timeout_s=0.01,  # Very short timeout
+            pointer_poll_interval_s=0.01,  # Fast polling
+            mop_up_missing=False,  # Skip mop-up
         )
         new = [k for (k, _) in comms.uploads[before:]]
         uploads_per_rank[r] = new
 
     # Validate: each rank uploaded its expected data files
     for r in range(world):
-        uploaded = {k for k in uploads_per_rank[r] if k.endswith(".pt")}
+        uploaded = {k for k in uploads_per_rank[r] if k.endswith(".distcp")}
         assert uploaded == expected_by_rank[r]
 
     # Rank 0 should also have uploaded metadata + pointer
@@ -618,7 +655,14 @@ async def test_check_checkpoint_exists_incomplete_ranks(
         ]
     }
 
-    comms = FakeComms(
+    # Override FakeComms to return proper sidecar data
+    class TestComms(FakeComms):
+        async def s3_get_object(self, *, key: str, bucket: FakeBucket, **kwargs):
+            if "extra_metadata.json" in key:
+                return {"world_size_at_save": 4}  # Expects 4 ranks
+            return await super().s3_get_object(key=key, bucket=bucket, **kwargs)
+
+    comms = TestComms(
         own_bucket=own,
         repo_root=tmp_path,
         s3_listings=listings,
