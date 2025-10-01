@@ -229,8 +229,7 @@ class Miner(BaseNode, Trainer):
             apply_tp(
                 self.model,
                 world_mesh["tp"],
-                loss_parallel=False,  # Set based on your needs
-                enable_float8_tensorwise_tp=False,
+                loss_parallel=False,
             )
         
 
