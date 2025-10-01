@@ -37,6 +37,7 @@ import torch
 import uvloop
 from torch.amp.grad_scaler import GradScaler
 from torch.distributed.tensor import DTensor as DT
+from torchtitan.distributed import ParallelDims
 
 import tplr
 from neurons import BaseNode, Trainer
@@ -209,6 +210,29 @@ class Miner(BaseNode, Trainer):
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
         self.dp_shard = int(getattr(tt, "dp_shard", 1))
+
+        self.parallel_dims = ParallelDims(
+            dp_replicate=self.dp_replicate,
+            dp_shard=self.dp_shard,
+            cp=self.cp_degree,
+            tp=self.tp_degree,
+            pp=self.pp_degree,
+            ep=1,
+            etp=1,
+            world_size=self.world_size,
+        )
+
+        world_mesh = self.parallel_dims.world_mesh
+
+        if self.parallel_dims.tp_enabled:
+            from torchtitan.models.llama3.infra.parallelize import apply_tp
+            apply_tp(
+                self.model,
+                world_mesh["tp"],
+                loss_parallel=False,  # Set based on your needs
+                enable_float8_tensorwise_tp=False,
+            )
+        
 
         # Init compression
         self.transformer = tplr.compress.ChunkingTransformer(
