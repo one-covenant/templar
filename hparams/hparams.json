@@ -27,7 +27,7 @@
     "reserve_peer_count": 10,
     "reserve_decay_ratio": 0.5,
     "minimum_peers": 1,
-    "peer_replacement_frequency": 5,
+    "peer_replacement_frequency": 2,
     "peer_list_window_margin": 1,
     "active_check_interval": 100,
     "recent_windows": 2,
