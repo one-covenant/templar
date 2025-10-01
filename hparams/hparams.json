@@ -48,6 +48,8 @@
     "quantization_range": 6,
     "burn_rate": 0.5,
     "idx_overlap_threshold": 0.4,
+    "consecutive_negative_threshold": 3,
+    "exclude_negative_peers": true,
   "optimizer": {
     "type": "adamw",
     "adamw": {
