@@ -1393,6 +1393,8 @@ class Validator(BaseNode, Trainer):
             mean_final_intended = 0.0
             mean_final_actual = 0.0
             reserve_used = 0
+            gather_peers_positive_ratio = 0.0
+            gather_peers_with_history = 0
 
             if self.is_master and gather_result is not None:
                 actual_gather_uids = list(gather_result.uids)
@@ -1414,6 +1416,40 @@ class Validator(BaseNode, Trainer):
                         if uid in self.comms.reserve_peers
                     ]
                 )
+
+                # Calculate how many gather peers have >50% positive evaluations
+                gather_peers_above_threshold = 0
+                for uid in actual_gather_uids:
+                    if uid in self.peer_eval_history:
+                        window = self.peer_eval_history[uid]
+                        if (
+                            len(window) >= 10
+                        ):  # Only count peers with sufficient history
+                            gather_peers_with_history += 1
+                            neg_count = sum(window)  # True=1 for negative
+                            positive_ratio = 1 - (neg_count / len(window))
+                            if positive_ratio > 0.5:  # More than 50% positive
+                                gather_peers_above_threshold += 1
+
+                # Calculate percentage of gather peers with >50% positive
+                if gather_peers_with_history > 0:
+                    gather_peers_positive_ratio = (
+                        gather_peers_above_threshold / gather_peers_with_history
+                    )
+
+                    # Log summary of gather peer performance
+                    tplr.log_with_context(
+                        level="info",
+                        message=(
+                            f"Gather peers performance: {gather_peers_above_threshold}/{gather_peers_with_history} "
+                            f"({gather_peers_positive_ratio:.1%}) have >50% positive evals in last 20 windows"
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                        gather_peers_above_threshold=gather_peers_above_threshold,
+                        gather_peers_with_history=gather_peers_with_history,
+                        positive_ratio_pct=gather_peers_positive_ratio * 100,
+                    )
 
             # Only master evaluates miner sync and applies slashing
             if self.is_master:
@@ -2376,6 +2412,8 @@ class Validator(BaseNode, Trainer):
                     "validator/gather/intended_mean_final": mean_final_intended,
                     "validator/gather/actual_mean_final": mean_final_actual,
                     "validator/gather/reserve_used": reserve_used,
+                    "validator/gather/peers_positive_ratio": gather_peers_positive_ratio
+                    * 100,
                 }
                 self.wandb.log(evaluation_metrics, step=self.global_step)
 
