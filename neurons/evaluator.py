@@ -942,32 +942,16 @@ class Evaluator:
             with pause_ddp_for_lm_eval(f"win{window}") as sentinel:
                 if self.is_master:
                     try:
-                        regular_tasks = [t for t in self.tasks if t != "mmlu"]
-                        if regular_tasks:
-                            tplr.logger.info(
-                                f"[Master] Running evaluation for tasks: {regular_tasks}"
-                            )
-                            results = self.run_lm_eval_multi_gpu(
-                                model_path=model_path,
-                                tasks=regular_tasks,
-                                window=window,
-                                global_step=global_step,
-                            )
-                            tplr.logger.info(f"[Master] Task results: {results}")
-                        # MMLU with few-shot (every 4th evaluation)
-                        if (
-                            "mmlu" in self.tasks
-                            and len(self.evaluated_windows) % 4 == 0
-                        ):
-                            tplr.logger.info("[Master] Running MMLU with 5-shot")
-                            mmlu_results = self.run_lm_eval_multi_gpu(
-                                model_path=model_path,
-                                tasks=["mmlu"],
-                                window=window,
-                                global_step=global_step,
-                                num_fewshot=5,
-                            )
-                            tplr.logger.info(f"[Master] MMLU results: {mmlu_results}")
+                        tplr.logger.info(
+                            f"[Master] Running evaluation for tasks: {self.tasks}"
+                        )
+                        results = self.run_lm_eval_multi_gpu(
+                            model_path=model_path,
+                            tasks=self.tasks,
+                            window=window,
+                            global_step=global_step,
+                        )
+                        tplr.logger.info(f"[Master] Task results: {results}")
                     finally:
                         # Always signal completion so non-masters can proceed
                         tplr.logger.info(
@@ -1263,7 +1247,7 @@ def get_config() -> bt.config:
     parser.add_argument(
         "--tasks",
         type=str,
-        default="arc_challenge,arc_easy,openbookqa,winogrande,piqa,hellaswag",
+        default="arc_challenge,arc_easy,openbookqa,winogrande,piqa,hellaswag,mmlu",
         help="Comma-separated evaluation tasks",
     )
     parser.add_argument(
