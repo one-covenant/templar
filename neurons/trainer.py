@@ -411,6 +411,179 @@ class Trainer:
                 if torch.is_tensor(v):
                     yield s, k, v
 
+    def compute_adam_metrics(self) -> dict:
+        """
+        Compute comprehensive metrics from Adam-based optimizers (AdamW or Muon with Adam auxiliaries).
+        This should be called BEFORE gradients are cleared.
+
+        Handles distributed training by computing local squared norms and aggregating across ranks.
+
+        Returns:
+            dict: Metrics including grad norms, update norms, param norms, ratios, and optimizer hyperparams
+        """
+        metrics = {}
+
+        # Local squared norms (will be summed across ranks then sqrt)
+        local_grad_norm_sq = 0.0
+        local_param_norm_sq = 0.0
+        local_update_norm_sq = 0.0
+        local_exp_avg_norm_sq = 0.0
+        local_exp_avg_sq_norm_sq = 0.0
+
+        # For max values, we'll collect locally then reduce with MAX operation
+        local_grad_norm_max = 0.0
+        local_update_norm_max = 0.0
+
+        # For ratios, we need to compute per-parameter then average
+        local_update_to_param_ratios_sum = 0.0
+        local_ratio_count = 0
+
+        num_params_with_grad = 0
+
+        # Get optimizer config
+        optimizer_config = getattr(self.hparams, "optimizer", {})
+        optimizer_type = optimizer_config.get("type", "muon").lower()
+
+        # Extract hyperparameters based on optimizer type
+        if optimizer_type == "adamw":
+            opt_config = optimizer_config.get("adamw", {})
+            metrics["adam/lr"] = opt_config.get("learning_rate", 2e-4)
+            metrics["adam/beta1"] = opt_config.get("betas", [0.9, 0.95])[0]
+            metrics["adam/beta2"] = opt_config.get("betas", [0.9, 0.95])[1]
+            metrics["adam/eps"] = opt_config.get("eps", 1e-8)
+            metrics["adam/weight_decay"] = opt_config.get("weight_decay", 0.1)
+        elif optimizer_type == "muon":
+            opt_config = optimizer_config.get("muon", {})
+            # For Muon, we use the Adam auxiliary optimizer parameters
+            metrics["adam/lr"] = opt_config.get("learning_rate", 0.02) * opt_config.get(
+                "embed_lr_scale", 0.5
+            )
+            metrics["adam/beta1"] = 0.9  # Default Adam betas used in Muon
+            metrics["adam/beta2"] = 0.95
+            metrics["adam/eps"] = 1e-8
+            metrics["adam/weight_decay"] = self.hparams.weight_decay
+
+        # Iterate through model parameters and optimizer state
+        for p in self.model.parameters():
+            if not p.requires_grad:
+                continue
+
+            # Compute parameter norm squared
+            local_param_norm_sq += (p.norm() ** 2).item()
+
+            # Compute gradient norm if gradient exists
+            if p.grad is not None:
+                num_params_with_grad += 1
+                grad_norm = p.grad.norm().item()
+                local_grad_norm_sq += grad_norm**2
+                local_grad_norm_max = max(local_grad_norm_max, grad_norm)
+
+            # Extract optimizer state if available
+            if p in self.inner_optimizer.state:
+                state = self.inner_optimizer.state[p]
+
+                # Get momentum/exp_avg for update norm calculation
+                if "exp_avg" in state:
+                    exp_avg = state["exp_avg"]
+                    exp_avg_norm = exp_avg.norm().item()
+                    local_exp_avg_norm_sq += exp_avg_norm**2
+
+                    # Update norm (same as exp_avg for Adam)
+                    local_update_norm_sq += exp_avg_norm**2
+                    local_update_norm_max = max(local_update_norm_max, exp_avg_norm)
+
+                    # Update to param ratio (per-parameter)
+                    param_norm = p.norm().item()
+                    if param_norm > 1e-8:
+                        local_update_to_param_ratios_sum += exp_avg_norm / param_norm
+                        local_ratio_count += 1
+
+                # Get exp_avg_sq if available (for AdamW)
+                if "exp_avg_sq" in state:
+                    exp_avg_sq = state["exp_avg_sq"]
+                    local_exp_avg_sq_norm_sq += (exp_avg_sq.norm() ** 2).item()
+
+        # Aggregate across ranks if distributed
+        if self.world_size > 1 and dist_helper.is_distributed():
+            from torch.distributed import ReduceOp
+
+            # Sum squared norms across ranks, then sqrt
+            global_grad_norm_sq = dist_helper.ddp_reduce(
+                local_grad_norm_sq, device=self.device
+            )
+            global_param_norm_sq = dist_helper.ddp_reduce(
+                local_param_norm_sq, device=self.device
+            )
+            global_update_norm_sq = dist_helper.ddp_reduce(
+                local_update_norm_sq, device=self.device
+            )
+            global_exp_avg_norm_sq = dist_helper.ddp_reduce(
+                local_exp_avg_norm_sq, device=self.device
+            )
+            global_exp_avg_sq_norm_sq = dist_helper.ddp_reduce(
+                local_exp_avg_sq_norm_sq, device=self.device
+            )
+
+            # Max values across ranks
+            global_grad_norm_max = dist_helper.ddp_reduce(
+                local_grad_norm_max, op=ReduceOp.MAX, device=self.device
+            )
+            global_update_norm_max = dist_helper.ddp_reduce(
+                local_update_norm_max, op=ReduceOp.MAX, device=self.device
+            )
+
+            # For ratio: sum and count across ranks, then divide
+            global_ratio_sum = dist_helper.ddp_reduce(
+                local_update_to_param_ratios_sum, device=self.device
+            )
+            global_ratio_count = int(
+                dist_helper.ddp_reduce(local_ratio_count, device=self.device)
+            )
+
+            # Total params with grad across ranks
+            num_params_with_grad = int(
+                dist_helper.ddp_reduce(num_params_with_grad, device=self.device)
+            )
+        else:
+            global_grad_norm_sq = local_grad_norm_sq
+            global_param_norm_sq = local_param_norm_sq
+            global_update_norm_sq = local_update_norm_sq
+            global_exp_avg_norm_sq = local_exp_avg_norm_sq
+            global_exp_avg_sq_norm_sq = local_exp_avg_sq_norm_sq
+            global_grad_norm_max = local_grad_norm_max
+            global_update_norm_max = local_update_norm_max
+            global_ratio_sum = local_update_to_param_ratios_sum
+            global_ratio_count = local_ratio_count
+
+        # Compute final metrics (sqrt of summed squared norms = global L2 norm)
+        metrics["adam/grad_norm_mean"] = (
+            (global_grad_norm_sq**0.5) if global_grad_norm_sq > 0 else 0.0
+        )
+        metrics["adam/grad_norm_max"] = global_grad_norm_max
+        metrics["adam/update_norm_mean"] = (
+            (global_update_norm_sq**0.5) if global_update_norm_sq > 0 else 0.0
+        )
+        metrics["adam/update_norm_max"] = global_update_norm_max
+        metrics["adam/param_norm_mean"] = (
+            (global_param_norm_sq**0.5) if global_param_norm_sq > 0 else 0.0
+        )
+        metrics["adam/update_to_param_ratio_mean"] = (
+            global_ratio_sum / global_ratio_count if global_ratio_count > 0 else 0.0
+        )
+
+        # Optional moment buffer checks
+        metrics["adam/exp_avg_norm_mean"] = (
+            (global_exp_avg_norm_sq**0.5) if global_exp_avg_norm_sq > 0 else 0.0
+        )
+        metrics["adam/exp_avg_sq_norm_mean"] = (
+            (global_exp_avg_sq_norm_sq**0.5) if global_exp_avg_sq_norm_sq > 0 else 0.0
+        )
+
+        # Sanity check metric
+        metrics["num_params_with_grad"] = num_params_with_grad
+
+        return metrics
+
     def offload_inner_optimizer_states(self, *, log: bool = True) -> None:
         """
         Move inner optimizer state tensors (e.g., AdamW exp_avg, exp_avg_sq) to pinned CPU memory.
@@ -725,7 +898,42 @@ class Trainer:
             await asyncio.sleep(0)
 
         # ---------------------------------------------------------------------- #
-        # 6. Return aggregated metrics
+        # 6. Compute gradient and optimizer metrics BEFORE clearing gradients
+        # ---------------------------------------------------------------------- #
+        adam_metrics = self.compute_adam_metrics()
+
+        # Compute global gradient and weight norms (squared sum across ranks, then stats)
+        local_grad_norms_sq = []
+        local_weight_norms_sq = []
+
+        for p in self.model.parameters():
+            if p.requires_grad:
+                local_weight_norms_sq.append((p.norm() ** 2).item())
+                if p.grad is not None:
+                    local_grad_norms_sq.append((p.grad.norm() ** 2).item())
+
+        # Sum squared norms across ranks
+        total_grad_norm_sq = sum(local_grad_norms_sq) if local_grad_norms_sq else 0.0
+        total_weight_norm_sq = (
+            sum(local_weight_norms_sq) if local_weight_norms_sq else 0.0
+        )
+
+        if self.world_size > 1 and dist_helper.is_distributed():
+            total_grad_norm_sq = dist_helper.ddp_reduce(
+                total_grad_norm_sq, device=self.device
+            )
+            total_weight_norm_sq = dist_helper.ddp_reduce(
+                total_weight_norm_sq, device=self.device
+            )
+
+        # Global norms (sqrt of summed squares)
+        global_grad_norm = (total_grad_norm_sq**0.5) if total_grad_norm_sq > 0 else 0.0
+        global_weight_norm = (
+            (total_weight_norm_sq**0.5) if total_weight_norm_sq > 0 else 0.0
+        )
+
+        # ---------------------------------------------------------------------- #
+        # 7. Return aggregated metrics
         # ---------------------------------------------------------------------- #
         batch_count = int(dist_helper.ddp_reduce(batch_count, device=self.device))
         return {
@@ -733,6 +941,9 @@ class Trainer:
             "window_entry_loss": window_entry_loss,
             "batch_count": batch_count,  # cross-rank sum
             "batch_tokens": global_tokens,  # cross-rank sum
+            "global_grad_norm": global_grad_norm,  # global gradient norm
+            "global_weight_norm": global_weight_norm,  # global weight norm
+            "adam_metrics": adam_metrics,  # Adam optimizer metrics dict
         }
 
     def outer_step(self, gather_result):
