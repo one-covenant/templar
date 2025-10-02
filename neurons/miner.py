@@ -540,6 +540,9 @@ class Miner(BaseNode, Trainer):
             window_entry_loss = res["window_entry_loss"]
             n_batches = res["batch_count"]
             window_tokens = res["batch_tokens"]
+            global_grad_norm = res["global_grad_norm"]
+            global_weight_norm = res["global_weight_norm"]
+            adam_metrics = res["adam_metrics"]
 
             # Free VRAM pressure during compression by offloading inner opt states to CPU
             # (they are not needed until the next inner_steps call).
@@ -730,14 +733,6 @@ class Miner(BaseNode, Trainer):
             self.total_tokens_processed += window_tokens
             tokens_per_sec = window_tokens / training_time if training_time else 0.0
 
-            # ─────────────── gradient & weight norms (local) ────────────────
-            grad_norms = [
-                p.grad.norm().item()
-                for p in self.model.parameters()
-                if p.grad is not None
-            ]
-            weight_norms = [p.norm().item() for p in self.model.parameters()]
-
             # ---------------------------------------------------------------------
             # 6. Await both gather
             # ---------------------------------------------------------------------
@@ -821,13 +816,6 @@ class Miner(BaseNode, Trainer):
             if self.is_master:
                 # Calculate common metrics values
                 momentum_norms: list[float] = sum(gathered_mom, [])
-                mean_grad_norm = sum(grad_norms) / len(grad_norms) if grad_norms else 0
-                grad_norm_std = (
-                    torch.tensor(grad_norms).std().item() if grad_norms else 0
-                )
-                mean_weight_norm = (
-                    sum(weight_norms) / len(weight_norms) if weight_norms else 0
-                )
                 mean_momentum_norm = (
                     sum(momentum_norms) / len(momentum_norms) if momentum_norms else 0
                 )
@@ -840,42 +828,43 @@ class Miner(BaseNode, Trainer):
                 # Only log to WandB when we've performed an outer step
                 # This ensures step values are unique and represent actual optimization steps
                 if gather_result is not None:
-                    self.wandb.log(
-                        {
-                            # Add timing metrics
-                            "miner/timing/window_total": window_total_time,
-                            "miner/timing/peer_update": peer_update_time,
-                            "miner/timing/data_loading": data_loading_time,
-                            "miner/timing/training": training_time,
-                            "miner/timing/compression": compression_time,
-                            "miner/timing/gather": gather_time,
-                            "miner/timing/put": put_time,
-                            "miner/timing/model_update": model_update_time,
-                            # Existing metrics
-                            "miner/window_entry_loss": window_entry_loss,
-                            "miner/tokens_per_sec": tokens_per_sec,
-                            "miner/total_tokens": self.total_tokens_processed,
-                            "miner/batch_tokens": window_tokens,
-                            "miner/global_step": self.global_step,
-                            "miner/gpu_memory_allocated": torch.cuda.memory_allocated()
-                            / 1024**2,
-                            "miner/gpu_memory_cached": torch.cuda.memory_reserved()
-                            / 1024**2,
-                            "miner/gather_peers": len(self.comms.peers),
-                            "miner/effective_batch_size": len(self.comms.peers)
-                            * self.hparams.batch_size,
-                            "miner/inner_lr": inner_lr,
-                            "miner/mean_grad_norm": mean_grad_norm,
-                            "miner/max_grad_norm": max(grad_norms) if grad_norms else 0,
-                            "miner/min_grad_norm": min(grad_norms) if grad_norms else 0,
-                            "miner/grad_norm_std": grad_norm_std,
-                            "miner/mean_weight_norm": mean_weight_norm,
-                            "miner/mean_momentum_norm": mean_momentum_norm,
-                            # Added gather success rate in %
-                            "miner/gather/success_rate": gather_success_rate,
-                        },
-                        step=self.global_step,
-                    )
+                    wandb_metrics = {
+                        # Add timing metrics
+                        "miner/timing/window_total": window_total_time,
+                        "miner/timing/peer_update": peer_update_time,
+                        "miner/timing/data_loading": data_loading_time,
+                        "miner/timing/training": training_time,
+                        "miner/timing/compression": compression_time,
+                        "miner/timing/gather": gather_time,
+                        "miner/timing/put": put_time,
+                        "miner/timing/model_update": model_update_time,
+                        # Existing metrics
+                        "miner/window_entry_loss": window_entry_loss,
+                        "miner/tokens_per_sec": tokens_per_sec,
+                        "miner/total_tokens": self.total_tokens_processed,
+                        "miner/batch_tokens": window_tokens,
+                        "miner/global_step": self.global_step,
+                        "miner/gpu_memory_allocated": torch.cuda.memory_allocated()
+                        / 1024**2,
+                        "miner/gpu_memory_cached": torch.cuda.memory_reserved()
+                        / 1024**2,
+                        "miner/gather_peers": len(self.comms.peers),
+                        "miner/effective_batch_size": len(self.comms.peers)
+                        * self.hparams.batch_size,
+                        "miner/inner_lr": inner_lr,
+                        # Global gradient and weight norms (now computed correctly)
+                        "miner/global_grad_norm": global_grad_norm,
+                        "miner/global_weight_norm": global_weight_norm,
+                        "miner/mean_momentum_norm": mean_momentum_norm,
+                        # Added gather success rate in %
+                        "miner/gather/success_rate": gather_success_rate,
+                    }
+
+                    # Add Adam optimizer metrics (prefixed with miner/)
+                    for key, value in adam_metrics.items():
+                        wandb_metrics[f"miner/{key}"] = value
+
+                    self.wandb.log(wandb_metrics, step=self.global_step)
 
                 self.metrics_logger.log(
                     measurement="training_step_v2",

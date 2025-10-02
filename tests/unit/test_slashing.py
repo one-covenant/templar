@@ -33,6 +33,11 @@ def validator_instance(monkeypatch):
     validator.current_window = 0
     validator.peer_eval_history = {}
 
+    # Add new attributes for consecutive negative tracking
+    validator.consecutive_negative_count = {}
+    validator.excluded_from_gather = set()
+    validator.exclusion_start_window = {}
+
     # Mock comms and metagraph
     validator.comms = SimpleNamespace()
     validator.comms.metagraph = SimpleNamespace()

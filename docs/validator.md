@@ -277,15 +277,14 @@ You should see a container named `templar-validator-<WALLET_HOTKEY>`.
 8. **Run the Validator**:
 
    ```bash
-   python neurons/validator.py \
-     --actual_batch_size 6 \
-     --wallet.name default \
-     --wallet.hotkey validator \
+   torchrun --standalone --nnodes 1 --nproc_per_node 4 \
+     neurons/validator.py \
+     --wallet.name <wallet_name> \
+     --wallet.hotkey <hotkey> \
      --device cuda \
-     --use_wandb \
-     --netuid <netuid> \
+     --netuid 3 \
      --subtensor.network <network> \
-     --sync_state
+     --use_wandb
    ```
 
 ---

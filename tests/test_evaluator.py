@@ -45,10 +45,21 @@ def setup_evaluator_with_mocks():
             version="test_version",
             cache_dir="/tmp/cache",
             tasks="arc_easy",
+            from_window=None,
+            to_window=None,
+            no_follow=False,
+            force_reval=False,
+            custom_eval_path=None,  # Add this to prevent TypeError
         )
         evaluator.netuid = 3
         evaluator.version = "test_version"
         evaluator.eval_interval = 30
+
+        # Setup backfill & control flags
+        evaluator.from_window = None
+        evaluator.to_window = None
+        evaluator.no_follow = False
+        evaluator.force_reval = False
 
         # Setup distributed attributes
         evaluator.rank = 0
@@ -67,6 +78,7 @@ def setup_evaluator_with_mocks():
             None  # No bootstrap version by default
         )
         evaluator.ckpt = MagicMock()
+        evaluator.model_cache = MagicMock()
 
         # Setup state tracking
         evaluator.evaluated_windows = set()
@@ -76,6 +88,9 @@ def setup_evaluator_with_mocks():
 
         # Setup wandb mock
         evaluator.wandb = MagicMock()
+
+        # Note: Don't mock _resolve_to_window and backfill_range here
+        # They need to be tested as real methods in some tests
 
         yield evaluator
 
@@ -526,84 +541,6 @@ async def test_evaluate_window_global_step_calculation(evaluator):
     evaluator.run_custom_eval.assert_called_once_with(150, 50)  # 150 - 100 = 50
 
 
-@pytest.mark.asyncio
-async def test_evaluate_window_mmlu_every_fourth(evaluator):
-    """
-    Test that MMLU with few-shot is run every 4th evaluation
-    """
-    # Set up so that MMLU will run (len(evaluated_windows) % 4 == 0)
-    # We need 0, 4, 8, 12, etc. windows already evaluated
-    # Let's use 0 windows (empty set) so the first evaluation triggers MMLU
-    evaluator.evaluated_windows = set()  # Empty, so len() % 4 == 0
-    evaluator.tasks = ["arc_easy", "mmlu"]
-    evaluator.ckpt.download_and_load = AsyncMock(return_value=(130, 30))
-    evaluator.save_model_for_eval = MagicMock(return_value="/tmp/model_130")
-    evaluator.run_custom_eval = MagicMock(return_value=(5.2, 1.8))
-    evaluator.run_lm_eval_multi_gpu = MagicMock(
-        return_value={"arc_easy": 0.75, "mmlu": 0.60}
-    )
-    evaluator.model_cache = MagicMock()
-
-    # Mock the sentinel file context
-    mock_sentinel = MagicMock()
-    mock_sentinel.touch = MagicMock()
-
-    with patch("neurons.evaluator.pause_ddp_for_lm_eval") as mock_pause:
-        mock_pause.return_value.__enter__ = MagicMock(return_value=mock_sentinel)
-        mock_pause.return_value.__exit__ = MagicMock(return_value=None)
-
-        success = await evaluator.evaluate_window(130, is_baseline=False)
-
-    assert success
-    # Should be called twice: once for regular tasks, once for MMLU with few-shot
-    assert evaluator.run_lm_eval_multi_gpu.call_count == 2
-
-    # Check the calls
-    calls = evaluator.run_lm_eval_multi_gpu.call_args_list
-    # First call should be regular tasks without mmlu
-    assert "arc_easy" in calls[0][1]["tasks"]
-    assert "mmlu" not in calls[0][1]["tasks"]
-
-    # Second call should be MMLU with few-shot
-    assert calls[1][1]["tasks"] == ["mmlu"]
-    assert calls[1][1]["num_fewshot"] == 5
-
-
-@pytest.mark.asyncio
-async def test_evaluate_window_mmlu_not_fourth(evaluator):
-    """
-    Test that MMLU with few-shot is NOT run when not the 4th evaluation
-    """
-    # Set up so that MMLU will NOT run (len(evaluated_windows) % 4 != 0)
-    evaluator.evaluated_windows = {100, 110}  # 2 windows, so len() % 4 == 2
-    evaluator.tasks = ["arc_easy", "mmlu"]
-    evaluator.ckpt.download_and_load = AsyncMock(return_value=(130, 30))
-    evaluator.save_model_for_eval = MagicMock(return_value="/tmp/model_130")
-    evaluator.run_custom_eval = MagicMock(return_value=(5.2, 1.8))
-    evaluator.run_lm_eval_multi_gpu = MagicMock(return_value={"arc_easy": 0.75})
-    evaluator.model_cache = MagicMock()
-
-    # Mock the sentinel file context
-    mock_sentinel = MagicMock()
-    mock_sentinel.touch = MagicMock()
-
-    with patch("neurons.evaluator.pause_ddp_for_lm_eval") as mock_pause:
-        mock_pause.return_value.__enter__ = MagicMock(return_value=mock_sentinel)
-        mock_pause.return_value.__exit__ = MagicMock(return_value=None)
-
-        success = await evaluator.evaluate_window(130, is_baseline=False)
-
-    assert success
-    # Should be called only once for regular tasks
-    assert evaluator.run_lm_eval_multi_gpu.call_count == 1
-
-    # Check the call
-    calls = evaluator.run_lm_eval_multi_gpu.call_args_list
-    # Only call should be regular tasks without mmlu
-    assert "arc_easy" in calls[0][1]["tasks"]
-    assert "mmlu" not in calls[0][1]["tasks"]
-
-
 def test_evaluator_cleanup():
     """
     Test evaluator cleanup method
@@ -756,6 +693,322 @@ def test_run_custom_eval_distributed(evaluator):
                                 assert (
                                     mock_reduce.call_count == 3
                                 )  # loss, tokens, bytes
+
+
+# ============================================================================
+# BACKFILL AND VERSIONING TESTS
+# ============================================================================
+
+
+def test_model_cache_with_namespace():
+    """Test model cache with version namespace."""
+    import tempfile
+    from pathlib import Path
+
+    from neurons.evaluator import ModelCache
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_dir = Path(tmpdir)
+
+        # Test without namespace (backward compatibility)
+        cache_no_ns = ModelCache(base_dir=cache_dir)
+        assert cache_no_ns.base_dir == cache_dir
+        assert cache_no_ns.get_path(100) == cache_dir / "window_100"
+
+        # Test with namespace
+        cache_v1 = ModelCache(base_dir=cache_dir, namespace="v2.1.0")
+        expected_dir = cache_dir / "v2.1.0"
+        assert cache_v1.base_dir == expected_dir
+        assert expected_dir.exists()
+        assert cache_v1.get_path(100) == expected_dir / "window_100"
+
+        # Test different versions have isolated caches
+        cache_v2 = ModelCache(base_dir=cache_dir, namespace="v3.0.0")
+        path_v1 = cache_v1.get_path(100)
+        path_v2 = cache_v2.get_path(100)
+        assert path_v1 != path_v2
+        assert path_v1 == cache_dir / "v2.1.0" / "window_100"
+        assert path_v2 == cache_dir / "v3.0.0" / "window_100"
+
+
+@pytest.fixture
+def evaluator_with_backfill():
+    """Fixture for evaluator with backfill features enabled."""
+    for gen in setup_evaluator_with_mocks():
+        evaluator = gen
+
+        # Add backfill-specific attributes
+        evaluator.config.from_window = None
+        evaluator.config.to_window = None
+        evaluator.config.no_follow = False
+        evaluator.config.force_reval = False
+
+        evaluator.from_window = evaluator.config.from_window
+        evaluator.to_window = evaluator.config.to_window
+        evaluator.no_follow = evaluator.config.no_follow
+        evaluator.force_reval = evaluator.config.force_reval
+        evaluator.tasks = []  # Add tasks attribute for evaluate_window
+
+        # Import and bind the actual methods from Evaluator for backfill testing
+        from neurons.evaluator import Evaluator
+
+        evaluator._resolve_to_window = Evaluator._resolve_to_window.__get__(evaluator)
+        evaluator.backfill_range = Evaluator.backfill_range.__get__(evaluator)
+
+        yield evaluator
+
+
+@pytest.mark.asyncio
+async def test_force_reval_flag(evaluator_with_backfill):
+    """Test that force_reval allows re-evaluation of already evaluated windows."""
+    evaluator = evaluator_with_backfill
+    evaluator.evaluated_windows.add(100)
+    evaluator.start_window = 0
+
+    # Test without force_reval
+    evaluator.force_reval = False
+    result = await evaluator.evaluate_window(100)
+    assert result == True  # Returns True but doesn't actually evaluate
+
+    # Test with force_reval
+    evaluator.force_reval = True
+    evaluator.ckpt.download_and_load = AsyncMock(return_value=(100, 50))
+    evaluator.save_model_for_eval = MagicMock(return_value="/tmp/model")
+    evaluator.run_custom_eval = MagicMock(return_value=(5.2, 1.8))
+    evaluator.model_cache = MagicMock()
+    evaluator.tasks = []
+
+    with patch("neurons.evaluator.pause_ddp_for_lm_eval"):
+        result = await evaluator.evaluate_window(100)
+
+    # Should have called save_model_for_eval despite window being in evaluated_windows
+    evaluator.save_model_for_eval.assert_called_once_with(100)
+    assert result == True
+
+
+@pytest.mark.asyncio
+async def test_negative_global_step_clamping(evaluator_with_backfill):
+    """Test that negative global_step values are clamped to 0."""
+    evaluator = evaluator_with_backfill
+    evaluator.start_window = 150  # High start window
+
+    # Mock checkpoint at window 100 (before start_window)
+    evaluator.ckpt.download_and_load = AsyncMock(
+        return_value=(100, -1)
+    )  # -1 means no global_step
+    evaluator.save_model_for_eval = MagicMock(return_value="/tmp/model")
+    evaluator.model_cache = MagicMock()
+    evaluator.tasks = []
+
+    # Track the global_step passed to run_custom_eval
+    captured_step = None
+
+    def capture_step(window, global_step):
+        nonlocal captured_step
+        captured_step = global_step
+        return None, None
+
+    evaluator.run_custom_eval = MagicMock(side_effect=capture_step)
+
+    with patch("neurons.evaluator.pause_ddp_for_lm_eval"):
+        await evaluator.evaluate_window(100)
+
+    # Global step should be clamped to 0, not negative (100 - 150 would be -50)
+    assert captured_step == 0
+
+
+@pytest.mark.asyncio
+async def test_resolve_to_window(evaluator_with_backfill):
+    """Test _resolve_to_window discovers latest READY window."""
+    evaluator = evaluator_with_backfill
+
+    # Mock discovering latest window
+    evaluator.ckpt._discover_latest = AsyncMock(return_value=250)
+    evaluator.ckpt.check_checkpoint_exists = AsyncMock(return_value=True)
+
+    with patch("tplr.distributed.dist_helper.broadcast") as mock_broadcast:
+        result = await evaluator._resolve_to_window()
+
+    assert result == 250
+    evaluator.ckpt._discover_latest.assert_called_once_with(prefer_highest_staked=True)
+    evaluator.ckpt.check_checkpoint_exists.assert_called_once_with(window=250)
+
+
+@pytest.mark.asyncio
+async def test_backfill_range_execution(evaluator_with_backfill):
+    """Test executing a backfill range."""
+    evaluator = evaluator_with_backfill
+    evaluator.from_window = 100
+    evaluator.to_window = 102
+    evaluator.start_window = 0
+
+    # Mock checkpoint checking - 101 is missing
+    async def mock_check_exists(window):
+        return window in [100, 102]  # 101 is not ready
+
+    evaluator.ckpt.check_checkpoint_exists = mock_check_exists
+
+    # Track evaluated windows
+    evaluated = []
+
+    async def mock_evaluate(window, is_baseline=False):
+        evaluated.append(window)
+        return True
+
+    evaluator.evaluate_window = mock_evaluate
+
+    with patch("tplr.distributed.dist_helper.broadcast") as mock_broadcast:
+        with patch("tplr.distributed.dist_helper.safe_barrier") as mock_barrier:
+            await evaluator.backfill_range()
+
+    # Should have evaluated only windows 100 and 102 (101 was missing)
+    assert evaluated == [100, 102]
+    # Should have called barrier for each evaluated window
+    assert mock_barrier.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_backfill_range_with_force_reval(evaluator_with_backfill):
+    """Test backfill with force_reval re-evaluates windows."""
+    evaluator = evaluator_with_backfill
+    evaluator.from_window = 100
+    evaluator.to_window = 101
+    evaluator.force_reval = True
+    evaluator.start_window = 0
+    evaluator.evaluated_windows = {100, 101}  # Already evaluated
+
+    evaluator.ckpt.check_checkpoint_exists = AsyncMock(return_value=True)
+
+    # Track evaluated windows
+    evaluated = []
+
+    async def mock_evaluate(window, is_baseline=False):
+        evaluated.append(window)
+        return True
+
+    evaluator.evaluate_window = mock_evaluate
+
+    with patch("tplr.distributed.dist_helper.broadcast"):
+        with patch("tplr.distributed.dist_helper.safe_barrier"):
+            await evaluator.backfill_range()
+
+    # Should have re-evaluated both windows despite them being in evaluated_windows
+    assert evaluated == [100, 101]
+
+
+@pytest.mark.asyncio
+async def test_backfill_range_resolve_bounds(evaluator_with_backfill):
+    """Test backfill resolves bounds when not fully specified."""
+    evaluator = evaluator_with_backfill
+    evaluator.from_window = 100
+    evaluator.to_window = None  # Should resolve to latest
+    evaluator.start_window = 50
+
+    # Mock resolving to_window
+    evaluator._resolve_to_window = AsyncMock(return_value=150)
+    evaluator.ckpt.check_checkpoint_exists = AsyncMock(return_value=True)
+    evaluator.evaluate_window = AsyncMock(return_value=True)
+
+    with patch("tplr.distributed.dist_helper.broadcast") as mock_broadcast:
+        # Mock broadcast to return the resolved bounds
+        def broadcast_side_effect(tensor, src=0):
+            if tensor.shape[0] == 2:  # bounds tensor
+                tensor[0] = 100
+                tensor[1] = 150
+
+        mock_broadcast.side_effect = broadcast_side_effect
+
+        with patch("tplr.distributed.dist_helper.safe_barrier"):
+            await evaluator.backfill_range()
+
+    # Should have called _resolve_to_window since to_window was None
+    evaluator._resolve_to_window.assert_called_once()
+
+    # Should evaluate all windows in range (mocked to always be ready)
+    assert evaluator.evaluate_window.call_count == 51  # 100 to 150 inclusive
+
+
+@pytest.mark.asyncio
+async def test_run_with_no_follow(evaluator_with_backfill):
+    """Test that no_follow flag prevents entering the main loop."""
+    evaluator = evaluator_with_backfill
+    evaluator.from_window = 100
+    evaluator.to_window = 100
+    evaluator.no_follow = True
+
+    evaluator.comms.get_commitments = AsyncMock(return_value={})
+    evaluator.comms.get_start_window = AsyncMock(return_value=0)
+    evaluator.check_latest_checkpoint = AsyncMock(return_value=None)
+    # Mock backfill_range for this test
+    evaluator.backfill_range = AsyncMock()
+
+    # Run should return early due to no_follow
+    await evaluator.run()
+
+    # backfill_range should have been called
+    evaluator.backfill_range.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_backfill_mode(evaluator_with_backfill):
+    """Test run enters backfill mode when from_window or to_window is set."""
+    evaluator = evaluator_with_backfill
+    evaluator.from_window = 100
+    evaluator.to_window = 105
+    evaluator.no_follow = False  # Will continue to main loop
+
+    evaluator.comms.get_commitments = AsyncMock(return_value={})
+    evaluator.comms.get_start_window = AsyncMock(return_value=0)
+    evaluator.check_latest_checkpoint = AsyncMock(
+        side_effect=[None, KeyboardInterrupt()]
+    )
+    evaluator.backfill_range = AsyncMock()
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        try:
+            await evaluator.run()
+        except KeyboardInterrupt:
+            pass
+
+    # Should have called backfill_range before entering main loop
+    evaluator.backfill_range.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_backfill_flipped_bounds(evaluator_with_backfill):
+    """Test backfill handles flipped bounds correctly."""
+    evaluator = evaluator_with_backfill
+    evaluator.from_window = 150  # Higher than to_window
+    evaluator.to_window = 100  # Lower than from_window
+    evaluator.start_window = 0
+
+    evaluator.ckpt.check_checkpoint_exists = AsyncMock(return_value=True)
+
+    # Track evaluated windows
+    evaluated = []
+
+    async def mock_evaluate(window, is_baseline=False):
+        evaluated.append(window)
+        return True
+
+    evaluator.evaluate_window = mock_evaluate
+
+    with patch("tplr.distributed.dist_helper.broadcast") as mock_broadcast:
+        # Mock broadcast to return the flipped bounds
+        def broadcast_side_effect(tensor, src=0):
+            if tensor.shape[0] == 2:  # bounds tensor
+                tensor[0] = 150
+                tensor[1] = 100
+
+        mock_broadcast.side_effect = broadcast_side_effect
+
+        with patch("tplr.distributed.dist_helper.safe_barrier"):
+            await evaluator.backfill_range()
+
+    # Should evaluate from 100 to 150 (normalized order)
+    assert min(evaluated) == 100
+    assert max(evaluated) == 150
+    assert len(evaluated) == 51  # 100 to 150 inclusive
 
 
 if __name__ == "__main__":
