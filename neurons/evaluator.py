@@ -144,8 +144,15 @@ def _loss_to_bpb(
 class ModelCache:
     """Manages converted HuggingFace models."""
 
-    def __init__(self, base_dir: Path = Path("models/cache")):
-        self.base_dir = base_dir
+    def __init__(
+        self, base_dir: Path = Path("models/cache"), namespace: str | None = None
+    ):
+        # Scope the cache by version (namespace) to avoid collisions when
+        # the same window number exists across different model versions.
+        if namespace:
+            self.base_dir = base_dir / namespace
+        else:
+            self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def get_path(self, window: int) -> Path:
@@ -209,7 +216,17 @@ class Evaluator:
         # Core configuration
         self.netuid = config.netuid
         self.version = config.version or tplr.__version__
+        tplr.__version__ = self.version
+        tplr.logger.info(
+            f"Running evaluations for {self.version = }. Setting tplr version to {tplr.__version__}"
+        )
         self.eval_interval = config.eval_interval
+
+        # Backfill & control flags
+        self.from_window: int | None = config.from_window
+        self.to_window: int | None = config.to_window
+        self.no_follow: bool = bool(config.no_follow)
+        self.force_reval: bool = bool(config.force_reval)
 
         # Load hyperparameters
         self.hparams = tplr.load_hparams()
@@ -221,6 +238,7 @@ class Evaluator:
         self.world_size = dist_helper.world_size
         self.local_rank = dist_helper.local_rank
         self.is_master = dist_helper.is_master
+        assert dist_helper.device is not None
         self.device = dist_helper.device
 
         if self.world_size < 2:
@@ -258,6 +276,7 @@ class Evaluator:
                 role="evaluator",
                 group="evaluations",
                 job_type="eval",
+                version=self.version,
             )
         else:
             self.wandb = NullMetricsLogger()
@@ -272,7 +291,9 @@ class Evaluator:
         self.model = self._initialize_or_load_model()
 
         # Model cache
-        self.model_cache = ModelCache(Path(cast(str, config.cache_dir)))
+        self.model_cache = ModelCache(
+            Path(cast(str, config.cache_dir)), namespace=self.version
+        )
 
         # Tasks configuration
         self.tasks = (
@@ -449,7 +470,7 @@ class Evaluator:
             "--model",
             "vllm",
             "--model_args",
-            f"pretrained={model_path},tensor_parallel_size={tp}",
+            f"pretrained={model_path},tensor_parallel_size={tp},gpu_memory_utilization=0.85",
             "--tasks",
             ",".join(tasks),
             "--batch_size",
@@ -459,10 +480,6 @@ class Evaluator:
         ]
         if num_fewshot > 0:
             cmd.extend(["--num_fewshot", str(num_fewshot)])
-
-        # Prevent vLLM from exceeding max_model_len when prompts already hit 2048.
-        # This truncates up to 1 prompt token when needed so 2047 + 1 gen stays within 2048.
-        cmd.extend(["--gen_kwargs", "truncate_prompt_tokens=1"])
 
         # ── NEW: clean environment for the child ──────────────────────────────
         clean_env = os.environ.copy()
@@ -854,7 +871,7 @@ class Evaluator:
     async def evaluate_window(self, window: int, is_baseline: bool = False) -> bool:
         """Evaluate a specific window."""
 
-        if window in self.evaluated_windows:
+        if window in self.evaluated_windows and not self.force_reval:
             tplr.logger.info(f"Window {window} already evaluated")
             return True
 
@@ -903,6 +920,11 @@ class Evaluator:
         if model_path is None:
             return False
 
+        # Ensure non-negative global_step if we are backfilling earlier than start_window
+        # (avoid negative steps in metrics backends).
+        if isinstance(global_step, int) and global_step < 0:
+            global_step = 0
+
         # Run custom perplexity evaluation
         _ = self.run_custom_eval(window, global_step)
 
@@ -920,32 +942,16 @@ class Evaluator:
             with pause_ddp_for_lm_eval(f"win{window}") as sentinel:
                 if self.is_master:
                     try:
-                        regular_tasks = [t for t in self.tasks if t != "mmlu"]
-                        if regular_tasks:
-                            tplr.logger.info(
-                                f"[Master] Running evaluation for tasks: {regular_tasks}"
-                            )
-                            results = self.run_lm_eval_multi_gpu(
-                                model_path=model_path,
-                                tasks=regular_tasks,
-                                window=window,
-                                global_step=global_step,
-                            )
-                            tplr.logger.info(f"[Master] Task results: {results}")
-                        # MMLU with few-shot (every 4th evaluation)
-                        if (
-                            "mmlu" in self.tasks
-                            and len(self.evaluated_windows) % 4 == 0
-                        ):
-                            tplr.logger.info("[Master] Running MMLU with 5-shot")
-                            mmlu_results = self.run_lm_eval_multi_gpu(
-                                model_path=model_path,
-                                tasks=["mmlu"],
-                                window=window,
-                                global_step=global_step,
-                                num_fewshot=5,
-                            )
-                            tplr.logger.info(f"[Master] MMLU results: {mmlu_results}")
+                        tplr.logger.info(
+                            f"[Master] Running evaluation for tasks: {self.tasks}"
+                        )
+                        results = self.run_lm_eval_multi_gpu(
+                            model_path=model_path,
+                            tasks=self.tasks,
+                            window=window,
+                            global_step=global_step,
+                        )
+                        tplr.logger.info(f"[Master] Task results: {results}")
                     finally:
                         # Always signal completion so non-masters can proceed
                         tplr.logger.info(
@@ -979,6 +985,131 @@ class Evaluator:
                 self.ckpt.cleanup_local_checkpoints(keep_latest=1)
         return True
 
+    async def _resolve_to_window(self) -> int | None:
+        """
+        Resolve the 'to_window' bound when backfilling if it wasn't provided.
+        Uses the remote pointer to the latest complete checkpoint.
+        """
+        latest: int | None = None
+        if self.is_master:
+            try:
+                candidate = await self.ckpt._discover_latest(prefer_highest_staked=True)
+                if candidate is not None:
+                    is_complete = await self.ckpt.check_checkpoint_exists(
+                        window=candidate
+                    )
+                    if is_complete:
+                        latest = candidate
+                        tplr.logger.info(
+                            f"[Master] Resolved to_window → latest READY window {latest}"
+                        )
+            except Exception:
+                tplr.logger.exception("Resolving to_window (latest)")
+        # broadcast
+        t = torch.tensor(
+            [-1 if latest is None else latest],
+            dtype=torch.int32,
+            device=self.device if self.device != "cpu" else "cpu",
+        )
+        dist_helper.broadcast(t, src=0)
+        val = int(t.item())
+        return None if val < 0 else val
+
+    async def backfill_range(self) -> None:
+        """
+        Backfill evaluations within [from_window, to_window], inclusive.
+        - Skips missing/incomplete checkpoints.
+        - Respects --force_reval to re-run already-evaluated windows.
+        """
+        assert self.from_window is not None or self.to_window is not None, (
+            "backfill_range called without bounds"
+        )
+
+        # Resolve bounds (master computes, all ranks participate in broadcast)
+        if self.is_master:
+            resolved_from = (
+                self.from_window if self.from_window is not None else self.start_window
+            )
+            resolved_to = self.to_window
+        else:
+            resolved_from = None
+            resolved_to = None
+
+        # All ranks must participate in _resolve_to_window if needed
+        if self.to_window is None:
+            resolved_to = await self._resolve_to_window()
+
+        if self.is_master:
+            bounds = torch.tensor(
+                [
+                    -1 if resolved_from is None else int(resolved_from),
+                    -1 if resolved_to is None else int(resolved_to),
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            bounds = torch.zeros(
+                2,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+        # Broadcast both bounds
+        dist_helper.broadcast(bounds, src=0)
+        resolved_from, resolved_to = [
+            None if int(v.item()) < 0 else int(v.item()) for v in bounds
+        ]
+
+        if resolved_from is None or resolved_to is None:
+            if self.is_master:
+                tplr.logger.warning(
+                    "[Master] Backfill bounds unresolved; skipping backfill."
+                )
+            return
+
+        if resolved_from > resolved_to:
+            # Normalize order if accidentally flipped.
+            resolved_from, resolved_to = resolved_to, resolved_from
+
+        if self.is_master:
+            tplr.logger.info(
+                f"[Master] Backfilling windows [{resolved_from}, {resolved_to}] for version '{self.version}'"
+            )
+
+        for w in range(resolved_from, resolved_to + 1):
+            # Master checks completeness and broadcasts result
+            if self.is_master:
+                ready = await self.ckpt.check_checkpoint_exists(window=w)
+                ready_tensor = torch.tensor(
+                    [1 if ready else 0],
+                    dtype=torch.int64,
+                    device=self.device if self.device != "cpu" else "cpu",
+                )
+            else:
+                # Non-master ranks prepare empty tensor for broadcast
+                ready_tensor = torch.zeros(
+                    1,
+                    dtype=torch.int64,
+                    device=self.device if self.device != "cpu" else "cpu",
+                )
+
+            # Broadcast checkpoint readiness from master to all ranks
+            dist_helper.broadcast(ready_tensor, src=0)
+            ready = bool(ready_tensor.item())
+
+            if not ready:
+                if self.is_master:
+                    tplr.logger.info(
+                        f"[Master] Skip window {w}: checkpoint not complete/available"
+                    )
+                continue
+
+            await self.evaluate_window(w)
+            dist_helper.safe_barrier(
+                tag=f"backfill_win_{w}", local_rank=self.local_rank
+            )
+
     async def run(self):
         """Main evaluation loop."""
 
@@ -990,7 +1121,7 @@ class Evaluator:
 
         # Get the start window for global_step calculation (master fetches, then broadcasts)
         if self.is_master:
-            start_window = await self.comms.get_start_window()
+            start_window = await self.comms.get_start_window(version=self.version)
             assert start_window is not None
             self.start_window = start_window
 
@@ -1036,6 +1167,23 @@ class Evaluator:
                     f"[Master] Found checkpoint at window {latest}, evaluating..."
                 )
             await self.evaluate_window(latest)
+
+        # If the user specified an explicit backfill range, perform it now.
+        # In backfill mode, we:
+        #  - do not run baseline
+        #  - evaluate all READY checkpoints in the inclusive range
+        #  - exit immediately if --no_follow was passed
+        if self.from_window is not None or self.to_window is not None:
+            if self.is_master:
+                tplr.logger.info("[Master] Entering backfill mode")
+            await self.backfill_range()
+
+            if self.no_follow:
+                if self.is_master:
+                    tplr.logger.info(
+                        "[Master] --no_follow set; exiting after backfill."
+                    )
+                return
 
         # Main loop
         if self.is_master:
@@ -1099,7 +1247,7 @@ def get_config() -> bt.config:
     parser.add_argument(
         "--tasks",
         type=str,
-        default="arc_challenge,arc_easy,openbookqa,winogrande,piqa,hellaswag",
+        default="arc_challenge,arc_easy,openbookqa,winogrande,piqa,hellaswag,mmlu",
         help="Comma-separated evaluation tasks",
     )
     parser.add_argument(
@@ -1112,6 +1260,33 @@ def get_config() -> bt.config:
     )
     parser.add_argument(
         "--project", type=str, default="templar-eval", help="WandB project name"
+    )
+
+    # Backfill / control flags
+    parser.add_argument(
+        "--from_window",
+        type=int,
+        default=None,
+        help="Backfill: starting window (inclusive). If omitted but --to_window is set, "
+        "the start window is resolved from the network's start window.",
+    )
+    parser.add_argument(
+        "--to_window",
+        type=int,
+        default=None,
+        help="Backfill: ending window (inclusive). If omitted while --from_window is set, "
+        "the latest READY window will be discovered remotely.",
+    )
+    parser.add_argument(
+        "--no_follow",
+        action="store_true",
+        help="One-shot mode. Do not resume/tail to the latest after the initial evaluation/backfill.",
+    )
+    parser.add_argument(
+        "--force_reval",
+        action="store_true",
+        help="Re-evaluate windows even if they were already evaluated in this process (ignores the in-memory set). "
+        "Does not remove existing model caches.",
     )
 
     # Add wallet and subtensor args
