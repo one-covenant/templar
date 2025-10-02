@@ -946,7 +946,7 @@ class Trainer:
             "adam_metrics": adam_metrics,  # Adam optimizer metrics dict
         }
 
-    def outer_step(self, gather_result):
+    def outer_step(self, gather_result, log_wandb: bool = False):
         tplr.neurons.outer_step(
             self.model,
             self.outer_optimizer,
@@ -959,5 +959,6 @@ class Trainer:
             is_master=self.is_master,
             world_size=self.world_size,
             use_dct=self.hparams.use_dct,
+            wandb_run=self.wandb if self.is_master and log_wandb else None,
         )
         return
