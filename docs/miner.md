@@ -192,28 +192,27 @@ This guide will help you set up and run a miner for **τemplar**. We'll cover bo
 8. **Run the Miner**:
 
    ```bash
-   python neurons/miner.py \
-     --actual_batch_size 6 \
-     --wallet.name default \
-     --wallet.hotkey miner \
+   torchrun --standalone --nnodes 1 --nproc_per_node 8 \
+     neurons/miner.py \
+     --wallet.name <wallet_name> \
+     --wallet.hotkey <hotkey> \
      --device cuda \
-     --use_wandb \
-     --netuid <netuid> \
+     --netuid 3 \
      --subtensor.network <network> \
-     --sync_state
+     --use_wandb
    ```
 
   *PM2 Support Installation
 
   ```bash
-   pm2 start neurons/miner.py --interpreter python3 --name sn3miner -- \
-   --actual_batch_size 6 \
-   --wallet.name default \
-   --wallet.hotkey miner \
+   pm2 start "torchrun --standalone --nnodes 1 --nproc_per_node 8 neurons/miner.py \
+   --wallet.name <wallet_name> \
+   --wallet.hotkey <hotkey> \
    --device cuda \
    --subtensor.network <network> \
-   --sync_state \
-   --netuid <netuid> 
+   --netuid 3 \
+   --use_wandb" \
+   --name sn3miner
   ```
 
 ---
