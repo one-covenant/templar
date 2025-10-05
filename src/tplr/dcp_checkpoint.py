@@ -29,6 +29,7 @@ from typing import Iterable
 
 import torch
 import torch.distributed as dist
+from rich.markup import escape as _escape
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
 from torch.distributed.checkpoint.state_dict import (
     ValueType,
@@ -44,6 +45,11 @@ from torch.distributed.checkpoint.state_dict_saver import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 import tplr
+
+
+# Safe escaping for untrusted log inserts (paths, keys, exceptions, etc.)
+def _safe(obj) -> str:
+    return _escape(str(obj))
 
 
 # ── Model-only Stateful (Titan-compatible distributed state dicts) ─────────────
@@ -167,7 +173,7 @@ class DCPCheckpointer:
                     f"[DCP] created CPU(Gloo) process group for async_save on rank {_rank()}"
                 )
             except Exception as e:
-                tplr.logger.warning(f"[DCP] failed to create CPU(Gloo) PG: {e}")
+                tplr.logger.warning(f"[DCP] failed to create CPU(Gloo) PG: {_safe(e)}")
 
     # ── Paths ──────────────────────────────────────────────────────────────────
     def _local_dir(self, layout: Layout) -> Path:
@@ -196,7 +202,7 @@ class DCPCheckpointer:
         t0 = time.perf_counter()
         tplr.logger.info(
             f"[DCP][save] rank {_rank(process_group)}/{_world(process_group)} → begin local save "
-            f"(window={window}, dir={out_dir})"
+            f"(window={window}, dir={_safe(out_dir)})"
         )
         save(
             state_dict=state,
@@ -264,7 +270,7 @@ class DCPCheckpointer:
 
         # Prepare a stable snapshot (so training can keep going).
         tplr.logger.info(
-            f"[DCP][save-async] rank {_rank()}/{_world()} snapshot → (window={window}, dir={out_dir})"
+            f"[DCP][save-async] rank {_rank()}/{_world()} snapshot → (window={window}, dir={_safe(out_dir)})"
         )
         snap = SnapshotState(model)
 
@@ -390,7 +396,7 @@ class DCPCheckpointer:
                 await self.comms.s3_put_object(key=key, file_path=str(path))
                 dt = time.perf_counter() - t0
                 tplr.logger.info(
-                    f"[DCP][upload] rank {r}/{world} ↑ {key} "
+                    f"[DCP][upload] rank {r}/{world} ↑ {_safe(key)} "
                     f"{_mb(size):.2f} MiB in {dt:.2f}s ({_mb(size) / dt if dt > 0 else 0:.2f} MiB/s)"
                 )
 
@@ -657,7 +663,7 @@ class DCPCheckpointer:
         s3 = await self.comms._get_s3_client(bucket)
         tplr.logger.info(
             f"[DCP][download-all] rank {_rank()}/{_world()} start "
-            f"(window={window}, bucket={bucket.name}, prefix={layout.prefix}/)"
+            f"(window={window}, bucket={_safe(bucket.name)}, prefix={_safe(layout.prefix)}/)"
         )
         got_any = False
         total_bytes = 0
@@ -679,7 +685,7 @@ class DCPCheckpointer:
                     dt = time.perf_counter() - t0
                     total_bytes += size
                     tplr.logger.debug(
-                        f"[DCP][download-all] rank {_rank()}/{_world()} ↓ {key} "
+                        f"[DCP][download-all] rank {_rank()}/{_world()} ↓ {_safe(key)} "
                         f"{_mb(size):.2f} MiB in {dt:.2f}s ({_mb(size) / dt if dt > 0 else 0:.2f} MiB/s)"
                     )
             if not resp.get("IsTruncated"):
@@ -772,7 +778,7 @@ class DCPCheckpointer:
             dst = self.repo_root / key  # mirrored path
             if dst.exists():
                 tplr.logger.debug(
-                    f"[DCP][download-dist] rank {r}/{world} skip (exists) {key}"
+                    f"[DCP][download-dist] rank {r}/{world} skip (exists) {_safe(key)}"
                 )
                 continue
             t0 = time.perf_counter()
@@ -781,7 +787,7 @@ class DCPCheckpointer:
             )
             dt = time.perf_counter() - t0
             tplr.logger.debug(
-                f"[DCP][download-dist] rank {r}/{world} ↓ {key} "
+                f"[DCP][download-dist] rank {r}/{world} ↓ {_safe(key)} "
                 f"{_mb(sz):.2f} MiB in {dt:.2f}s ({_mb(sz) / dt if dt > 0 else 0:.2f} MiB/s)"
             )
 
@@ -802,7 +808,7 @@ class DCPCheckpointer:
                     mop_files += 1
                     mop_bytes += sz
                     tplr.logger.debug(
-                        f"[DCP][download-dist] rank 0 mop-up ↓ {key} "
+                        f"[DCP][download-dist] rank 0 mop-up ↓ {_safe(key)} "
                         f"{_mb(sz):.2f} MiB in {dt:.2f}s ({_mb(sz) / dt if dt > 0 else 0:.2f} MiB/s)"
                     )
             tplr.logger.info(
@@ -931,7 +937,7 @@ class DCPCheckpointer:
             return has_metadata and has_sidecar and all_ranks_present
 
         except Exception as e:
-            tplr.logger.warning(f"Error checking checkpoint existence: {e}")
+            tplr.logger.warning(f"Error checking checkpoint existence: {_safe(e)}")
             return False
 
     def cleanup_local_checkpoints(self, keep_latest: int = 1) -> None:
@@ -966,12 +972,12 @@ class DCPCheckpointer:
                     shutil.rmtree(old_checkpoint)
                     if _rank() == 0:
                         tplr.logger.info(
-                            f"[DCP] Removed old checkpoint: {old_checkpoint}"
+                            f"[DCP] Removed old checkpoint: {_safe(old_checkpoint)}"
                         )
                 except Exception as e:
                     if _rank() == 0:
                         tplr.logger.warning(
-                            f"[DCP] Failed to remove {old_checkpoint}: {e}"
+                            f"[DCP] Failed to remove {_safe(old_checkpoint)}: {_safe(e)}"
                         )
         else:
             if _rank() == 0:
