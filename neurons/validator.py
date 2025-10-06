@@ -1664,48 +1664,58 @@ class Validator(BaseNode, Trainer):
                 gradient_valid = True  # Track if gradient is valid
 
                 if self.is_master:
-                    eval_result = await self.comms.get(
-                        uid=str(eval_uid),
-                        window=self.sync_window,
-                        key="gradient",
-                        local=False,
-                        stale_retention=10,
-                        time_max=time_max,
-                        time_min=time_min,
-                    )
-                    if (
-                        not eval_result.success
-                        or not isinstance(eval_result.data, dict)
-                        or eval_result.data.get("__status") in ["TOO_LATE", "TOO_EARLY"]
-                    ):
-                        # Slash the peer for missing gradient
-                        self.slash_for_missing_gradient(eval_uid)
+                    try:
+                        eval_result = await self.comms.get(
+                            uid=str(eval_uid),
+                            window=self.sync_window,
+                            key="gradient",
+                            local=False,
+                            stale_retention=10,
+                            time_max=time_max,
+                            time_min=time_min,
+                        )
+                    except Exception as e:
+                        # Transient infrastructure error (network/IO/deser) - don't slash
+                        tplr.logger.warning(
+                            f"[validator] fetch gradient failed for {eval_uid}: {e} — marking invalid"
+                        )
                         gradient_valid = False
-
                     else:
-                        state_dict = eval_result.data
-                        try:
-                            self.validate_gradient_data(
-                                self.model, eval_uid, state_dict
-                            )
-                            meta = state_dict.get("metadata", {})
-                            self.log_digest_match(eval_uid, meta)
-                            _, total_samples = self._training_pool_digest(
-                                eval_uid, self.sync_window
-                            )
-                            total_batches = (
-                                total_samples // self.hparams.micro_batch_size
-                            )
-                        except Exception as e:
-                            self.slash_for_invalid_gradient(eval_uid, e)
+                        if (
+                            not eval_result.success
+                            or not isinstance(eval_result.data, dict)
+                            or eval_result.data.get("__status")
+                            in ["TOO_LATE", "TOO_EARLY"]
+                        ):
+                            # Slash the peer for missing gradient
+                            self.slash_for_missing_gradient(eval_uid)
                             gradient_valid = False
+
+                        else:
+                            state_dict = eval_result.data
+                            try:
+                                self.validate_gradient_data(
+                                    self.model, eval_uid, state_dict
+                                )
+                                meta = state_dict.get("metadata", {})
+                                self.log_digest_match(eval_uid, meta)
+                                _, total_samples = self._training_pool_digest(
+                                    eval_uid, self.sync_window
+                                )
+                                total_batches = (
+                                    total_samples // self.hparams.micro_batch_size
+                                )
+                                gradient_valid = True
+                            except Exception as e:
+                                self.slash_for_invalid_gradient(eval_uid, e)
+                                gradient_valid = False
 
                 # Broadcast gradient validity to all ranks
                 gradient_valid_tensor = torch.tensor(
-                    [gradient_valid], dtype=torch.bool, device=self.device
+                    [bool(gradient_valid)], dtype=torch.bool, device=self.device
                 )
                 dist_helper.broadcast(gradient_valid_tensor, src=0)
-                gradient_valid = gradient_valid_tensor.item()
+                gradient_valid = bool(gradient_valid_tensor.item())
 
                 # All ranks skip if gradient is invalid
                 if not gradient_valid:
