@@ -321,7 +321,7 @@ class DCPCheckpointer:
             state_dict={"app": snap},
             checkpoint_id=str(out_dir),
             process_group=pg,
-            async_checkpointer_type=AsyncCheckpointerType.PROCESS,  # Process-based for better performance
+            async_checkpointer_type=AsyncCheckpointerType.THREAD,
             planner=planner,
         )
         tplr.logger.info(
@@ -380,11 +380,6 @@ class DCPCheckpointer:
 
             # Initial scan
             data_files, meta_files = _scan()
-            local_owner_ranks = {
-                orank
-                for p in data_files
-                if (orank := _owner_rank_from_name(p.name)) is not None
-            }
 
             # Each rank uploads only files it owns based on the filename encoding
             # DCP filenames include "__{local_pg_rank}_{...}.distcp"
@@ -497,13 +492,6 @@ class DCPCheckpointer:
                             break
                         cont = resp.get("NextContinuationToken")
                     return contents
-
-                async def _remote_name_set() -> set[str]:
-                    return {
-                        Path(o["Key"]).name
-                        for o in await _list_remote_all()
-                        if o.get("Key")
-                    }
 
                 deadline = time.perf_counter() + float(pointer_poll_timeout_s)
                 owners_ok = False
