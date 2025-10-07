@@ -25,7 +25,7 @@ import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Awaitable, Callable, Iterable
 
 import torch
 import torch.distributed as dist
@@ -88,6 +88,28 @@ class SnapshotState(Stateful):
 
 
 # ── Utils ─────────────────────────────────────────────────────────────────────
+async def _retry_n(
+    op: Callable[[], Awaitable],
+    *,
+    desc: str = "",
+    attempts: int = 3,
+    delay_s: float = 1.0,
+):
+    """Always retry a few times on *any* exception."""
+    last: Exception | None = None
+    for i in range(1, attempts + 1):
+        try:
+            return await op()
+        except Exception as e:  # noqa: BLE001 - intentionally broad
+            last = e
+            tplr.logger.warning(
+                f"[DCP][retry] {desc} failed (attempt {i}/{attempts}): {_safe(e)}"
+            )
+            if i < attempts:
+                await asyncio.sleep(delay_s)
+    raise last  # type: ignore[misc]
+
+
 def _rank(group: dist.ProcessGroup | None = None) -> int:
     if not (dist.is_available() and dist.is_initialized()):
         return 0
@@ -299,7 +321,7 @@ class DCPCheckpointer:
             state_dict={"app": snap},
             checkpoint_id=str(out_dir),
             process_group=pg,
-            async_checkpointer_type=AsyncCheckpointerType.PROCESS,  # Process-based for better performance
+            async_checkpointer_type=AsyncCheckpointerType.THREAD,
             planner=planner,
         )
         tplr.logger.info(
@@ -358,11 +380,6 @@ class DCPCheckpointer:
 
             # Initial scan
             data_files, meta_files = _scan()
-            local_owner_ranks = {
-                orank
-                for p in data_files
-                if (orank := _owner_rank_from_name(p.name)) is not None
-            }
 
             # Each rank uploads only files it owns based on the filename encoding
             # DCP filenames include "__{local_pg_rank}_{...}.distcp"
@@ -393,7 +410,10 @@ class DCPCheckpointer:
 
             async def _timed_put(key: str, path: Path, size: int) -> None:
                 t0 = time.perf_counter()
-                await self.comms.s3_put_object(key=key, file_path=str(path))
+                await _retry_n(
+                    lambda: self.comms.s3_put_object(key=key, file_path=str(path)),
+                    desc=f"PUT {_safe(key)}",
+                )
                 dt = time.perf_counter() - t0
                 tplr.logger.info(
                     f"[DCP][upload] rank {r}/{world} ↑ {_safe(key)} "
@@ -463,19 +483,15 @@ class DCPCheckpointer:
                         args = {"Bucket": bucket.name, "Prefix": f"{layout.prefix}/"}
                         if cont:
                             args["ContinuationToken"] = cont
-                        resp = await s3.list_objects_v2(**args)
+                        resp = await _retry_n(
+                            lambda: s3.list_objects_v2(**args),
+                            desc=f"LIST {_safe(layout.prefix)}/",
+                        )
                         contents.extend(resp.get("Contents", []) or [])
                         if not resp.get("IsTruncated"):
                             break
                         cont = resp.get("NextContinuationToken")
                     return contents
-
-                async def _remote_name_set() -> set[str]:
-                    return {
-                        Path(o["Key"]).name
-                        for o in await _list_remote_all()
-                        if o.get("Key")
-                    }
 
                 deadline = time.perf_counter() + float(pointer_poll_timeout_s)
                 owners_ok = False
@@ -507,8 +523,12 @@ class DCPCheckpointer:
                         # Upload this missing shard
                         fixups.append(
                             asyncio.create_task(
-                                self.comms.s3_put_object(
-                                    key=f"{layout.prefix}/{p.name}", file_path=str(p)
+                                _retry_n(
+                                    lambda: self.comms.s3_put_object(
+                                        key=f"{layout.prefix}/{p.name}",
+                                        file_path=str(p),
+                                    ),
+                                    desc=f"PUT(mop) {_safe(layout.prefix)}/{_safe(p.name)}",
                                 )
                             )
                         )
@@ -672,7 +692,9 @@ class DCPCheckpointer:
             args = {"Bucket": bucket.name, "Prefix": f"{layout.prefix}/"}
             if cont:
                 args["ContinuationToken"] = cont
-            resp = await s3.list_objects_v2(**args)
+            resp = await _retry_n(
+                lambda: s3.list_objects_v2(**args), desc=f"LIST {_safe(layout.prefix)}/"
+            )
             for obj in resp.get("Contents", []) or []:
                 key = obj.get("Key")
                 if key:
@@ -743,7 +765,9 @@ class DCPCheckpointer:
             args = {"Bucket": bucket.name, "Prefix": f"{layout.prefix}/"}
             if cont:
                 args["ContinuationToken"] = cont
-            resp = await s3.list_objects_v2(**args)
+            resp = await _retry_n(
+                lambda: s3.list_objects_v2(**args), desc=f"LIST {_safe(layout.prefix)}/"
+            )
             for o in resp.get("Contents", []) or []:
                 if k := o.get("Key"):
                     keys.append((k, int(o.get("Size", 0))))
