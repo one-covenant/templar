@@ -2387,6 +2387,18 @@ class Validator(BaseNode, Trainer):
                     )
 
                 # 16. Log evaluation metrics once all evaluations are done
+                # Calculate global negative evaluation statistics
+                total_negative_evals = sum(
+                    1
+                    for uid in self.evaluated_uids
+                    if 0 <= uid < self.gradient_scores.numel()
+                    and self.gradient_scores[uid].item() < 0
+                )
+                total_excluded_peers = len(self.excluded_from_gather)
+                total_with_consecutive_negative = sum(
+                    1 for count in self.consecutive_negative_count.values() if count > 0
+                )
+
                 threshold_pct = int(round(self.hparams.idx_overlap_threshold * 100))
                 evaluation_metrics = {
                     "validator/loss/own/before": avg_loss_before_per_batch_own,
@@ -2422,8 +2434,14 @@ class Validator(BaseNode, Trainer):
                     "validator/gather/intended_mean_final": mean_final_intended,
                     "validator/gather/actual_mean_final": mean_final_actual,
                     "validator/gather/reserve_used": reserve_used,
-                    "validator/gather/peers_positive_ratio": gather_peers_positive_ratio
+                    "validator/gather/num_peers": len(actual_gather_uids),
+                    "validator/gather/positive_peers": gather_peers_above_threshold,
+                    "validator/gather/positive_peers_ratio": gather_peers_positive_ratio
                     * 100,
+                    # ── negative evaluation global metrics ──────────────────
+                    "validator/negative_eval/total_negative": total_negative_evals,
+                    "validator/negative_eval/total_excluded": total_excluded_peers,
+                    "validator/negative_eval/total_with_consecutive": total_with_consecutive_negative,
                 }
                 self.wandb.log(evaluation_metrics, step=self.global_step)
 
