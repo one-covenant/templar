@@ -88,7 +88,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
     # ------------ start ------------
     gradient, xshapes, totalks = {}, {}, {}
-    lr = float(miner.hparams.outer_learning_rate)
     use_dct = getattr(miner.hparams, "use_dct", False)
     topk = getattr(miner.hparams, "topk_compression", 32)
 
@@ -150,7 +149,7 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             error_feedback.zero_()
         else:
             error_feedback.mul_(miner.hparams.momentum_decay)
-            error_feedback.add_(grad_full, alpha=lr)
+            error_feedback.add_(grad_full)
 
         # --- 4) Encode & compress (owner only) ---
         encoded = miner.transformer.encode(error_feedback, use_dct=use_dct)
