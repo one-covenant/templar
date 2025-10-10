@@ -35,6 +35,7 @@ def validator_instance(monkeypatch):
 
     # Add new attributes for consecutive negative tracking
     validator.consecutive_negative_count = {}
+    validator.consecutive_missing_gradient_count = {}
     validator.excluded_from_gather = set()
     validator.exclusion_start_window = {}
 
