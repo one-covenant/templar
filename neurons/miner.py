@@ -220,11 +220,11 @@ class Miner(BaseNode, Trainer):
                 pdims = ParallelDims(
                     dp_shard=self.dp_shard,
                     dp_replicate=self.dp_replicate,
-                    tp_size=self.tp_degree,
-                    pp_size=self.pp_degree,
-                    cp_size=self.cp_degree,
+                    tp=self.tp_degree,
+                    pp=self.pp_degree,
+                    cp=self.cp_degree,
+                    ep=1,
                     world_size=self.world_size,
-                    enable_loss_parallel=getattr(tt, "enable_loss_parallel", False),
                 )
                 tp_mesh = pdims.build_mesh()["tp"]
                 apply_tp(
