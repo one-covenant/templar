@@ -17,6 +17,7 @@
 
 import asyncio
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -261,21 +262,40 @@ class ShardedDatasetManager:
 
         Args:
             bucket: The (shared shard) r2 storage bucket
-            tokens_file: The path to the tokens file in bucket
-            ids_file: The path to the tokens file's indices in bucket
+            tokens_file: The local path where tokens file should be saved
+            ids_file: The local path where ids file should be saved
         """
-        return await asyncio.gather(
+        # Extract just the filenames for S3 object keys
+        tokens_filename = os.path.basename(tokens_file)
+        ids_filename = os.path.basename(ids_file)
+
+        # Ensure the local directory exists
+        os.makedirs(os.path.dirname(tokens_file), exist_ok=True)
+
+        # Download to temp location first, then move to final destination
+        results = await asyncio.gather(
             self.comms.s3_get_object(
-                tokens_file,
+                tokens_filename,  # S3 object key (just filename)
                 bucket,
                 load_data=False,
+                show_progress=True,
             ),
             self.comms.s3_get_object(
-                ids_file,
+                ids_filename,  # S3 object key (just filename)
                 bucket,
                 load_data=False,
+                show_progress=True,
             ),
         )
+
+        # Move downloaded files to correct locations
+        # s3_get_object with load_data=False returns the temp file path
+        if results[0] and os.path.exists(results[0]):
+            shutil.move(results[0], tokens_file)
+        if results[1] and os.path.exists(results[1]):
+            shutil.move(results[1], ids_file)
+
+        return results
 
     async def create_dataset(self, shard_index: int) -> SharedShardedDataset:
         """Creates a `SharedShardedDataset` instance for a given shard index.
