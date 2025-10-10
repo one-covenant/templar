@@ -43,8 +43,6 @@ from neurons import BaseNode, Trainer
 from neurons.base_node import CPU_COUNT
 from tplr import model_factory
 from tplr.distributed import dist_helper
-from torchtitan.models.llama3.infra.parallelize import apply_tp
-from torchtitan.distributed import ParallelDims
 
 # GPU optimizations
 torch.manual_seed(42)
@@ -212,30 +210,6 @@ class Miner(BaseNode, Trainer):
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
         self.dp_shard = int(getattr(tt, "dp_shard", 1))
 
-        # Apply tensor parallelism explicitly if tp_degree > 1
-        if self.tp_degree > 1 and self.world_size > 1:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                # Create parallel dims for TP mesh
-                pdims = ParallelDims(
-                    dp_shard=self.dp_shard,
-                    dp_replicate=self.dp_replicate,
-                    tp=self.tp_degree,
-                    pp=self.pp_degree,
-                    cp=self.cp_degree,
-                    ep=1,
-                    world_size=self.world_size,
-                )
-                tp_mesh = pdims.build_mesh()["tp"]
-                apply_tp(
-                    self.model,
-                    tp_mesh,
-                    loss_parallel=getattr(tt, "enable_loss_parallel", False),
-                    enable_float8_tensorwise_tp=getattr(tt, "enable_float8_tensorwise_tp", False),
-                    enable_async_tp=getattr(tt, "enable_async_tp", False),
-                )
-                tplr.logger.info(f"[Init] Applied TP with degree {self.tp_degree}")
-
         # Init compression
         self.transformer = tplr.compress.ChunkingTransformer(
             self.model, target_chunk=self.hparams.target_chunk
@@ -268,6 +242,8 @@ class Miner(BaseNode, Trainer):
                     p.shape, device="cpu", pin_memory=True
                 )
 
+            # For DTensor, p.shape already gives global shape (not local shard shape)
+            # For regular tensors, p.shape is just the shape
             enc = self.transformer.encode(
                 torch.empty(p.shape, dtype=torch.float16, device=self.device),
                 use_dct=self.hparams.use_dct,
@@ -409,7 +385,12 @@ class Miner(BaseNode, Trainer):
         val = tensor.item()
         start_window = None if val == -1 else int(val)
         assert start_window is not None
-        self.start_window = start_window
+        # For fresh TP testing, if start_window is way behind, use current_window
+        if start_window < self.current_window - 5:
+            tplr.logger.info(f"start_window ({start_window}) is far behind current_window ({self.current_window}), using current_window")
+            self.start_window = self.current_window
+        else:
+            self.start_window = start_window
 
         # global_step tracks actual outer steps performed (starts at 0)
         self.global_step = 0

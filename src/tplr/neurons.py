@@ -355,6 +355,8 @@ def outer_step(
                 )
 
                 full_grad_src = transformer.decode(decompressed, use_dct=use_dct)
+                # Reshape to match parameter shape (decode might produce different shape)
+                full_grad_src = full_grad_src.reshape(p.shape)
                 # Single conversion to target dtype+device to avoid extra temporaries
                 full_grad_src = full_grad_src.to(
                     dtype=p.dtype, device=p.device, non_blocking=True
@@ -375,10 +377,11 @@ def outer_step(
         if isinstance(p, DT):
             # DTensor param: scatter shards from master
             # Non-source ranks need a full-shape tensor for distribute_tensor to work
+            # Use p.shape (global shape) not xshapes[name] (encoded shape)
             src_tensor = (
                 full_grad_src
                 if on_src
-                else torch.empty(xshapes[name], device=p.device, dtype=p.dtype)
+                else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
             new_grad = distribute_tensor(
                 src_tensor,
@@ -670,11 +673,14 @@ async def handle_checkpoint_catchup(
     # When loading from bootstrap, we always need to catch up from start_window
     # to ensure we're using current version's gradients
     if not ckpt_ok:
-        # No checkpoint found, catch up from start_window
-        tplr.logger.info("No checkpoint found, will catch up from start_window")
-        await catchup_with_aggregation_server(
-            instance, instance.start_window, aggregator_device=aggregator_device
-        )
+        # No checkpoint found, catch up from start_window (unless already at current)
+        if instance.start_window < instance.current_window:
+            tplr.logger.info(f"No checkpoint found, will catch up from start_window {instance.start_window}")
+            await catchup_with_aggregation_server(
+                instance, instance.start_window, aggregator_device=aggregator_device
+            )
+        else:
+            tplr.logger.info(f"No checkpoint found and start_window={instance.start_window} >= current_window={instance.current_window}, skipping catch-up")
     elif from_bootstrap:
         # Loading from bootstrap, catch up from start_window with current version gradients
         tplr.logger.info(
