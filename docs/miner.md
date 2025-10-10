@@ -33,8 +33,7 @@ This guide will help you set up and run a miner for **τemplar**. We'll cover bo
 ## Prerequisites
 
 - **NVIDIA GPU** with CUDA support
-  - **Minimum H200 required** (141GB VRAM)
-  - Recommended: 8x H200 GPUs for optimal performance
+  - **Minimum required: 8x B200 GPUs**
 - **Ubuntu** (or Ubuntu-based Linux distribution)
 - **Git**
 - **Hugging Face Authentication**:
@@ -260,12 +259,11 @@ DEBUG=false
 ### Hardware Requirements
 
 - **GPU Requirements**:
-  - **Minimum: NVIDIA H200 with 141GB VRAM** (as defined in min_compute.yml)
-  - Recommended: 8x H200 GPUs for miners
-  - **Minimum CPU**: 32 cores, 3.5 GHz
-  - **Minimum RAM**: 800 GB
+  - **Minimum required: 8x B200 GPUs** (as defined in min_compute.yml)
+  - **Minimum CPU**: 64 cores, 3.5 GHz (recommended: 128 cores, 4.0 GHz)
+  - **Minimum RAM**: 1200 GB (recommended: 1500 GB)
   - **Minimum Network**: 1024 Mbps download/upload bandwidth
-- **Storage**: 500GB+ recommended for model and data
+- **Storage**: 1000GB minimum, 2000GB recommended for model and data
 - **Network**: Stable internet connection with good bandwidth
 
 ### Network Options

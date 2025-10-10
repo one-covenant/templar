@@ -11,7 +11,7 @@ compute_spec:
   miner:
 
     cpu:
-      min_cores: 32           # Minimum number of CPU cores
+      min_cores: 64           # Minimum number of CPU cores
       min_speed: 3.5          # Minimum speed per core (GHz)
       recommended_cores: 128  # Recommended number of CPU cores
       recommended_speed: 4.0  # Recommended speed per core (GHz)
@@ -19,24 +19,25 @@ compute_spec:
 
     gpu:
       required: True                       # Does the application require a GPU?
-      min_vram: 141                        # Minimum GPU VRAM (GB)
-      recommended_vram: 141                # Recommended GPU VRAM (GB)
+      min_vram: 192                        # Minimum GPU VRAM (GB)
+      recommended_vram: 192                # Recommended GPU VRAM (GB)
       cuda_cores: 16896                    # Minimum number of CUDA cores (if applicable)
-      min_compute_capability: 9.0          # Minimum CUDA compute capability - see https://developer.nvidia.com/cuda-gpus
-      recommended_compute_capability: 9.0  # Recommended CUDA compute capability - see https://developer.nvidia.com/cuda-gpus
-      recommended_gpu: "NVIDIA H200"       # provide a recommended GPU to purchase/rent
-      min_amount: 1                        # Minimum amount of GPUs required for the miner to run
+      min_compute_capability: 10.0         # Minimum CUDA compute capability - see https://developer.nvidia.com/cuda-gpus
+      recommended_compute_capability: 10.0 # Recommended CUDA compute capability - see https://developer.nvidia.com/cuda-gpus
+      recommended_gpu: "NVIDIA B200"       # provide a recommended GPU to purchase/rent
+      min_amount: 8                        # Minimum amount of GPUs required for the miner to run
       recommended_amount: 8                # Recomended amount of GPUs, if distributed training is enabled
 
     memory:
-      min_ram: 800            # Minimum RAM (GB)
-      min_swap: 500           # Minimum swap space (GB)
-      recommended_swap: 1024  # Recommended swap space (GB)
+      min_ram: 1200           # Minimum RAM (GB)
+      recommended_ram: 1500   # Recommended RAM (GB)
+      min_swap: 600           # Minimum swap space (GB)
+      recommended_swap: 1500  # Recommended swap space (GB)
       ram_type: "DDR4"        # RAM type (e.g., DDR4, DDR3, etc.)
 
     storage:
-      min_space: 500            # Minimum free storage space (GB)
-      recommended_space: 500    # Recommended free storage space (GB)
+      min_space: 1000           # Minimum free storage space (GB)
+      recommended_space: 2000   # Recommended free storage space (GB)
       type: "SSD"               # Preferred storage type (e.g., SSD, HDD)
       min_iops: 95000           # Minimum I/O operations per second (if applicable)
       recommended_iops: 300000  # Recommended I/O operations per second
@@ -48,10 +49,10 @@ compute_spec:
   validator:
 
     cpu:
-      min_cores: 32           # Minimum number of CPU cores
+      min_cores: 64           # Minimum number of CPU cores
       min_speed: 3.5          # Minimum speed per core (GHz)
-      recommended_cores: 32   # Recommended number of CPU cores
-      recommended_speed: 4.3  # Recommended speed per core (GHz)
+      recommended_cores: 128  # Recommended number of CPU cores
+      recommended_speed: 4.0  # Recommended speed per core (GHz)
       architecture: "x86_64"  # Architecture type (e.g., x86_64, arm64)
 
     gpu:
@@ -62,18 +63,19 @@ compute_spec:
       min_compute_capability: 9.0          # Minimum CUDA compute capability
       recommended_compute_capability: 9.0  # Recommended CUDA compute capability
       recommended_gpu: "NVIDIA H200"       # provide a recommended GPU to purchase/rent
-      min_amount: 1                        # Minimum amount of GPUs required for the miner to run
-      recommended_amount: 1                # Recomended amount of GPUs, if distributed training is enabled
+      min_amount: 4                        # Minimum amount of GPUs required for the miner to run
+      recommended_amount: 4                # Recomended amount of GPUs, if distributed training is enabled
 
     memory:
-      min_ram: 800            # Minimum RAM (GB)
-      min_swap: 500           # Minimum swap space (GB)
-      recommended_swap: 1024  # Recommended swap space (GB)
+      min_ram: 1200           # Minimum RAM (GB)
+      recommended_ram: 1500   # Recommended RAM (GB)
+      min_swap: 600           # Minimum swap space (GB)
+      recommended_swap: 1500  # Recommended swap space (GB)
       ram_type: "DDR4"        # RAM type (e.g., DDR4, DDR3, etc.)
 
     storage:
-      min_space: 500            # Minimum free storage space (GB)
-      recommended_space: 500    # Recommended free storage space (GB)
+      min_space: 1000           # Minimum free storage space (GB)
+      recommended_space: 2000   # Recommended free storage space (GB)
       type: "SSD"               # Preferred storage type (e.g., SSD, HDD)
       min_iops: 95000           # Minimum I/O operations per second (if applicable)
       recommended_iops: 300000  # Recommended I/O operations per second
