@@ -499,6 +499,9 @@ class Validator(BaseNode, Trainer):
         self.inactive_scores = {}  # {uid: (last_active_window, last_score)}
         self.inactivity_slash_rate = 0.25  # 25% slash per window
         self.missing_gradient_slash_rate = 0.75
+        self.missing_gradient_penalty_score = getattr(
+            self.hparams, "missing_gradient_penalty_score", -99.0
+        )
         self.score_zero_threshold = 1e-4
         self.sync_score_slash_rate = 0.75
         self.idx_similarity_slashing_rate = (
@@ -3076,6 +3079,21 @@ class Validator(BaseNode, Trainer):
                 )
         return
 
+    def record_missing_gradient_for_openskill(self, uid: int) -> None:
+        """Record a missing/invalid gradient in OpenSkill scoring with penalty score.
+
+        Args:
+            uid: The UID of the peer with missing/invalid gradient
+        """
+        # Add to current window scores for OpenSkill rating with penalty score
+        if not hasattr(self, "current_window_scores"):
+            self.current_window_scores = {}
+        self.current_window_scores[uid] = self.missing_gradient_penalty_score
+
+        # Initialize OpenSkill rating if needed
+        if uid not in self.openskill_ratings:
+            self.openskill_ratings[uid] = self.openskill_model.rating(name=str(uid))
+
     def slash_for_missing_gradient(self, eval_uid: int) -> None:
         """Slash a peer for not submitting a gradient.
 
@@ -3129,6 +3147,9 @@ class Validator(BaseNode, Trainer):
 
         # Ensure the UID is included in evaluated_uids only when penalized
         self.evaluated_uids.add(eval_uid)
+
+        # Record missing gradient for OpenSkill scoring
+        self.record_missing_gradient_for_openskill(eval_uid)
 
         # Log updated scores
         tplr.log_with_context(
@@ -3189,6 +3210,9 @@ class Validator(BaseNode, Trainer):
 
         # Include in evaluated UIDs so it gets logged in metrics
         self.evaluated_uids.add(eval_uid)
+
+        # Record invalid gradient for OpenSkill scoring
+        self.record_missing_gradient_for_openskill(eval_uid)
 
         # Log to WandB
         self.wandb.log(
@@ -3963,6 +3987,9 @@ class Validator(BaseNode, Trainer):
                         self.reset_peer(uid)
                     self.evaluated_uids.add(uid)
                     self.peers_last_eval_window[uid] = self.sync_window
+
+                    # Record missing gradient for OpenSkill scoring
+                    self.record_missing_gradient_for_openskill(uid)
                     continue
 
                 # Determine slash multiplier based on success rate and consecutive count
@@ -4018,6 +4045,9 @@ class Validator(BaseNode, Trainer):
                     )
                 self.evaluated_uids.add(uid)
                 self.peers_last_eval_window[uid] = self.sync_window
+
+                # Record missing gradient for OpenSkill scoring
+                self.record_missing_gradient_for_openskill(uid)
             else:
                 tplr.log_with_context(
                     level="info",
