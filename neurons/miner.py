@@ -43,6 +43,8 @@ from neurons import BaseNode, Trainer
 from neurons.base_node import CPU_COUNT
 from tplr import model_factory
 from tplr.distributed import dist_helper
+from torchtitan.models.llama3.infra.parallelize import apply_tp
+from torchtitan.distributed import ParallelDims
 
 # GPU optimizations
 torch.manual_seed(42)
@@ -209,6 +211,30 @@ class Miner(BaseNode, Trainer):
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
         self.dp_shard = int(getattr(tt, "dp_shard", 1))
+
+        # Apply tensor parallelism explicitly if tp_degree > 1
+        if self.tp_degree > 1 and self.world_size > 1:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                # Create parallel dims for TP mesh
+                pdims = ParallelDims(
+                    dp_shard=self.dp_shard,
+                    dp_replicate=self.dp_replicate,
+                    tp_size=self.tp_degree,
+                    pp_size=self.pp_degree,
+                    cp_size=self.cp_degree,
+                    world_size=self.world_size,
+                    enable_loss_parallel=getattr(tt, "enable_loss_parallel", False),
+                )
+                tp_mesh = pdims.build_mesh()["tp"]
+                apply_tp(
+                    self.model,
+                    tp_mesh,
+                    loss_parallel=getattr(tt, "enable_loss_parallel", False),
+                    enable_float8_tensorwise_tp=getattr(tt, "enable_float8_tensorwise_tp", False),
+                    enable_async_tp=getattr(tt, "enable_async_tp", False),
+                )
+                tplr.logger.info(f"[Init] Applied TP with degree {self.tp_degree}")
 
         # Init compression
         self.transformer = tplr.compress.ChunkingTransformer(

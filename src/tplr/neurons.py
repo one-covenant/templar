@@ -338,8 +338,10 @@ def outer_step(
                 min_median_norm = min(min_median_norm, med)
                 max_median_norm = max(max_median_norm, med)
 
-                # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                ref = torch.empty_like(p, device=device, dtype=p.dtype)
+                # Use empty with full shape for decompression (handle TP-sharded params)
+                # If p is DTensor, we need the FULL shape for decompression before sharding
+                full_shape = xshapes[name]
+                ref = torch.empty(full_shape, device=device, dtype=p.dtype)
                 decompressed = compressor.batch_decompress(
                     ref,
                     idxs_dev,
@@ -372,10 +374,11 @@ def outer_step(
         # ------- distribute/broadcast directly into p.grad, step, then free -------
         if isinstance(p, DT):
             # DTensor param: scatter shards from master
+            # Non-source ranks need a full-shape tensor for distribute_tensor to work
             src_tensor = (
                 full_grad_src
                 if on_src
-                else torch.empty(p.shape, device=p.device, dtype=p.dtype)
+                else torch.empty(xshapes[name], device=p.device, dtype=p.dtype)
             )
             new_grad = distribute_tensor(
                 src_tensor,

@@ -251,14 +251,17 @@ def create_parallel_dims(
             world_size=world_size,
         )
     elif role == "validator":
-        # Validator: pipeline parallelism with data parallel replication
-        # Ensure dp_shard is at least 1 to prevent division by zero
-        dp_shard = 4
-        if world_size % dp_shard != 0:
-            raise ValueError(
-                f"World size ({world_size}) must be divisible by "
-                f"dp_shard degree ({dp_shard})"
-            )
+        # Validator: dynamic dp_shard based on hparams and world_size
+        # Try to use hparams.torchtitan.dp_shard if it divides world_size evenly
+        tt = getattr(hparams, "torchtitan", SimpleNamespace())
+        hparam_dp_shard = int(getattr(tt, "dp_shard", 1))
+        
+        if hparam_dp_shard > 0 and world_size % hparam_dp_shard == 0:
+            dp_shard = hparam_dp_shard
+        else:
+            # Default to world_size if hparams dp_shard doesn't divide evenly
+            dp_shard = world_size
+        
         return ParallelDims(
             dp_replicate=world_size // dp_shard,
             dp_shard=dp_shard,

@@ -81,3 +81,5 @@ chain-specs/
 CLAUDE.md
 .cache
 validator-state-*.npz
+validator-state-*.pt
+tokenized
