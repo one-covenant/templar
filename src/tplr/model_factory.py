@@ -262,10 +262,13 @@ def create_parallel_dims(
             # Default to world_size if hparams dp_shard doesn't divide evenly
             dp_shard = world_size
         
+        # Read TP degree from hparams (same as miner)
+        tp_degree = int(getattr(tt, "tp_degree", 1))
+        
         return ParallelDims(
             dp_replicate=world_size // dp_shard,
             dp_shard=dp_shard,
-            tp=1,
+            tp=tp_degree,
             pp=1,
             cp=1,
             ep=1,

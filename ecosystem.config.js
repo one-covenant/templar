@@ -71,7 +71,7 @@ module.exports = {
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "1",
+        "--nproc_per_node", "2",
         "neurons/validator.py",
         "--wallet.name", "templar_test",
         "--wallet.hotkey", "V1",
@@ -84,7 +84,7 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "0"
+        CUDA_VISIBLE_DEVICES: "5,6"
       }
     }
   ]
