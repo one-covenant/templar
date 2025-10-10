@@ -242,8 +242,6 @@ class Miner(BaseNode, Trainer):
                     p.shape, device="cpu", pin_memory=True
                 )
 
-            # For DTensor, p.shape already gives global shape (not local shard shape)
-            # For regular tensors, p.shape is just the shape
             enc = self.transformer.encode(
                 torch.empty(p.shape, dtype=torch.float16, device=self.device),
                 use_dct=self.hparams.use_dct,
