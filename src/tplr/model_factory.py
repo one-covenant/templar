@@ -251,26 +251,29 @@ def create_parallel_dims(
             world_size=world_size,
         )
     elif role == "validator":
-        # Validator: dynamic dp_shard based on hparams and world_size
-        # Try to use hparams.torchtitan.dp_shard if it divides world_size evenly
+        # Validator: read all parallel config from hparams (same as miner)
         tt = getattr(hparams, "torchtitan", SimpleNamespace())
-        hparam_dp_shard = int(getattr(tt, "dp_shard", 1))
         
-        if hparam_dp_shard > 0 and world_size % hparam_dp_shard == 0:
-            dp_shard = hparam_dp_shard
-        else:
-            # Default to world_size if hparams dp_shard doesn't divide evenly
-            dp_shard = world_size
-        
-        # Read TP degree from hparams (same as miner)
         tp_degree = int(getattr(tt, "tp_degree", 1))
+        pp_degree = int(getattr(tt, "pp_degree", 1))
+        cp_degree = int(getattr(tt, "cp_degree", 1))
+        dp_replicate = getattr(tt, "dp_replicate", 1)
+        dp_shard = getattr(tt, "dp_shard", 1)
+        
+        # Validate that world_size matches the parallel configuration
+        required_product = dp_replicate * dp_shard * tp_degree * pp_degree * cp_degree
+        if required_product != 0 and world_size % required_product != 0:
+            raise ValueError(
+                f"world_size ({world_size}) must be divisible by the product of all "
+                f"parallel degrees ({dp_replicate}x{dp_shard}x{tp_degree}x{pp_degree}x{cp_degree} = {required_product})."
+            )
         
         return ParallelDims(
-            dp_replicate=world_size // dp_shard,
+            dp_replicate=dp_replicate,
             dp_shard=dp_shard,
             tp=tp_degree,
-            pp=1,
-            cp=1,
+            pp=pp_degree,
+            cp=cp_degree,
             ep=1,
             world_size=world_size,
         )
