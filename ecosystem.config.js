@@ -17,7 +17,7 @@ module.exports = {
       name            : "TM1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : ".venv/bin/torchrun",
+      script          : "torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -41,7 +41,7 @@ module.exports = {
       name            : "TM2",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : ".venv/bin/torchrun",
+      script          : "torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -67,7 +67,7 @@ module.exports = {
       name            : "TV1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : ".venv/bin/torchrun",
+      script          : "torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
