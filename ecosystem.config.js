@@ -84,7 +84,7 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        DP_SHARD: "4",  // Override hparams value
+        DP_SHARD: "1",  // Override hparams value
         CUDA_VISIBLE_DEVICES: "0"
       }
     }
