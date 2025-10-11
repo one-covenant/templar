@@ -17,7 +17,7 @@ module.exports = {
       name            : "TM1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -41,7 +41,7 @@ module.exports = {
       name            : "TM2",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -67,11 +67,11 @@ module.exports = {
       name            : "TV1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "2",
+        "--nproc_per_node", "1",
         "neurons/validator.py",
         "--wallet.name", "templar_test",
         "--wallet.hotkey", "V1",
@@ -84,7 +84,7 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "5,6"
+        CUDA_VISIBLE_DEVICES: "0"
       }
     }
   ]
