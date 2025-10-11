@@ -67,11 +67,11 @@ def deep_merge(base: dict, override: dict) -> dict:
     """
     Recursively merge two dictionaries, with override taking precedence.
     For nested dictionaries, this performs a deep merge rather than replacing.
-    
+
     Args:
         base (dict): Base dictionary
         override (dict): Dictionary with values to override/merge
-        
+
     Returns:
         dict: Merged dictionary
     """

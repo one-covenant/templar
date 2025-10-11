@@ -675,12 +675,16 @@ async def handle_checkpoint_catchup(
     if not ckpt_ok:
         # No checkpoint found, catch up from start_window (unless already at current)
         if instance.start_window < instance.current_window:
-            tplr.logger.info(f"No checkpoint found, will catch up from start_window {instance.start_window}")
+            tplr.logger.info(
+                f"No checkpoint found, will catch up from start_window {instance.start_window}"
+            )
             await catchup_with_aggregation_server(
                 instance, instance.start_window, aggregator_device=aggregator_device
             )
         else:
-            tplr.logger.info(f"No checkpoint found and start_window={instance.start_window} >= current_window={instance.current_window}, skipping catch-up")
+            tplr.logger.info(
+                f"No checkpoint found and start_window={instance.start_window} >= current_window={instance.current_window}, skipping catch-up"
+            )
     elif from_bootstrap:
         # Loading from bootstrap, catch up from start_window with current version gradients
         tplr.logger.info(
