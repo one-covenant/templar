@@ -21,6 +21,7 @@ Unified model creation and initialization for TorchTitan models across
 evaluator, validator, and miner components.
 """
 
+import os
 from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -252,13 +253,19 @@ def create_parallel_dims(
         )
     elif role == "validator":
         # Validator: read all parallel config from hparams (same as miner)
+        # Support environment variable override for dp_shard
         tt = getattr(hparams, "torchtitan", SimpleNamespace())
         
         tp_degree = int(getattr(tt, "tp_degree", 1))
         pp_degree = int(getattr(tt, "pp_degree", 1))
         cp_degree = int(getattr(tt, "cp_degree", 1))
         dp_replicate = getattr(tt, "dp_replicate", 1)
-        dp_shard = getattr(tt, "dp_shard", 1)
+        
+        # TODO: For Future compatibility when we enable dp_shard in hparams for validator
+        # dp_shard = getattr(tt, "dp_shard", 1)
+        
+        # Allow environment variable to override dp_shard from hparams
+        dp_shard = int(os.getenv("DP_SHARD", getattr(tt, "dp_shard", 1)))
         
         # Validate that world_size matches the parallel configuration
         required_product = dp_replicate * dp_shard * tp_degree * pp_degree * cp_degree
