@@ -256,13 +256,11 @@ def create_parallel_dims(
         # Support environment variable override for dp_shard
         tt = getattr(hparams, "torchtitan", SimpleNamespace())
 
-        tp_degree = int(getattr(tt, "tp_degree", 1))
+        # Allow environment variable to override tp_degree from hparams
+        tp_degree = int(os.getenv("TP_DEGREE", getattr(tt, "tp_degree", 1)))
         pp_degree = int(getattr(tt, "pp_degree", 1))
         cp_degree = int(getattr(tt, "cp_degree", 1))
         dp_replicate = getattr(tt, "dp_replicate", 1)
-
-        # TODO: For Future compatibility when we enable dp_shard in hparams for validator
-        # dp_shard = getattr(tt, "dp_shard", 1)
 
         # Allow environment variable to override dp_shard from hparams
         dp_shard = int(os.getenv("DP_SHARD", getattr(tt, "dp_shard", 1)))
