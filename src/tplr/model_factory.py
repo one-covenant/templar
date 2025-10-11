@@ -255,18 +255,18 @@ def create_parallel_dims(
         # Validator: read all parallel config from hparams (same as miner)
         # Support environment variable override for dp_shard
         tt = getattr(hparams, "torchtitan", SimpleNamespace())
-        
+
         tp_degree = int(getattr(tt, "tp_degree", 1))
         pp_degree = int(getattr(tt, "pp_degree", 1))
         cp_degree = int(getattr(tt, "cp_degree", 1))
         dp_replicate = getattr(tt, "dp_replicate", 1)
-        
+
         # TODO: For Future compatibility when we enable dp_shard in hparams for validator
         # dp_shard = getattr(tt, "dp_shard", 1)
-        
+
         # Allow environment variable to override dp_shard from hparams
         dp_shard = int(os.getenv("DP_SHARD", getattr(tt, "dp_shard", 1)))
-        
+
         # Validate that world_size matches the parallel configuration
         required_product = dp_replicate * dp_shard * tp_degree * pp_degree * cp_degree
         if required_product != 0 and world_size % required_product != 0:
@@ -274,7 +274,7 @@ def create_parallel_dims(
                 f"world_size ({world_size}) must be divisible by the product of all "
                 f"parallel degrees ({dp_replicate}x{dp_shard}x{tp_degree}x{pp_degree}x{cp_degree} = {required_product})."
             )
-        
+
         return ParallelDims(
             dp_replicate=dp_replicate,
             dp_shard=dp_shard,
