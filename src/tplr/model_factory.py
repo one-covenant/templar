@@ -21,6 +21,7 @@ Unified model creation and initialization for TorchTitan models across
 evaluator, validator, and miner components.
 """
 
+import os
 from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -251,20 +252,52 @@ def create_parallel_dims(
             world_size=world_size,
         )
     elif role == "validator":
-        # Validator: pipeline parallelism with data parallel replication
-        # Ensure dp_shard is at least 1 to prevent division by zero
-        dp_shard = 4
-        if world_size % dp_shard != 0:
+        # Validator: read all parallel config from hparams (same as miner)
+        # Support environment variable override for tp_degree and dp_shard
+        tt = getattr(hparams, "torchtitan", SimpleNamespace())
+
+        # Allow environment variable to override tp_degree from hparams
+        tp_degree = int(os.getenv("TP_DEGREE", getattr(tt, "tp_degree", 1)))
+        pp_degree = int(getattr(tt, "pp_degree", 1))
+        cp_degree = int(getattr(tt, "cp_degree", 1))
+        dp_replicate = getattr(tt, "dp_replicate", 1)
+
+        # For dp_shard: check if explicitly set in env var or hparams
+        # If neither is set, auto-calculate from world_size for backward compatibility
+        env_dp_shard = os.getenv("DP_SHARD")
+        hparam_dp_shard = getattr(tt, "dp_shard", None)
+
+        if env_dp_shard is not None:
+            # Environment variable takes highest priority
+            dp_shard = int(env_dp_shard)
+        elif hparam_dp_shard is not None:
+            # Use hparams value if set
+            dp_shard = int(hparam_dp_shard)
+        else:
+            # Auto-calculate from world_size for backward compatibility
+            # dp_shard = world_size / (tp_degree * pp_degree * cp_degree * dp_replicate)
+            divisor = tp_degree * pp_degree * cp_degree * dp_replicate
+            if world_size % divisor != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) must be divisible by "
+                    f"tp_degree({tp_degree}) * pp_degree({pp_degree}) * cp_degree({cp_degree}) * dp_replicate({dp_replicate})"
+                )
+            dp_shard = world_size // divisor
+
+        # Validate that world_size matches the parallel configuration
+        required_product = dp_replicate * dp_shard * tp_degree * pp_degree * cp_degree
+        if required_product != 0 and world_size % required_product != 0:
             raise ValueError(
-                f"World size ({world_size}) must be divisible by "
-                f"dp_shard degree ({dp_shard})"
+                f"world_size ({world_size}) must be divisible by the product of all "
+                f"parallel degrees ({dp_replicate}x{dp_shard}x{tp_degree}x{pp_degree}x{cp_degree} = {required_product})."
             )
+
         return ParallelDims(
-            dp_replicate=world_size // dp_shard,
+            dp_replicate=dp_replicate,
             dp_shard=dp_shard,
-            tp=1,
-            pp=1,
-            cp=1,
+            tp=tp_degree,
+            pp=pp_degree,
+            cp=cp_degree,
             ep=1,
             world_size=world_size,
         )

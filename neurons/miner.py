@@ -383,7 +383,14 @@ class Miner(BaseNode, Trainer):
         val = tensor.item()
         start_window = None if val == -1 else int(val)
         assert start_window is not None
-        self.start_window = start_window
+        # For fresh TP testing, if start_window is way behind, use current_window
+        if start_window < self.current_window - 5:
+            tplr.logger.info(
+                f"start_window ({start_window}) is far behind current_window ({self.current_window}), using current_window"
+            )
+            self.start_window = self.current_window
+        else:
+            self.start_window = start_window
 
         # global_step tracks actual outer steps performed (starts at 0)
         self.global_step = 0
