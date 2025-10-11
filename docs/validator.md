@@ -38,8 +38,7 @@ This guide will help you set up and run a validator for **τemplar**. Validators
 ## Prerequisites
 
 - **NVIDIA GPU** with CUDA support
-  - **Minimum H200 required** (141GB VRAM)
-  - Recommended: 1x H200 GPU for validators
+  - **Minimum required: 4x H200 GPUs**
 - **Ubuntu** (or Ubuntu-based Linux distribution)
 - **Docker** and **Docker Compose**
 - **Git**
@@ -356,13 +355,11 @@ DEBUG=false
 ### Hardware Requirements
 
 - **GPU Requirements**:
-  - **Minimum: NVIDIA H200 with 141GB VRAM** (as defined in min_compute.yml)
-  - Recommended: 1x H200 GPU for validators
-  - **Minimum CPU**: 32 cores, 3.5 GHz
-  - **Minimum RAM**: 800 GB
+  - **Minimum required: 4x H200 GPUs** (as defined in min_compute.yml)
+  - **Minimum CPU**: 64 cores, 3.5 GHz (recommended: 128 cores, 4.0 GHz)
+  - **Minimum RAM**: 1200 GB (recommended: 1500 GB)
   - **Minimum Network**: 1024 Mbps download/upload bandwidth
-- **Storage**: 200GB+ recommended for model and evaluation data
-- **RAM**: 32GB+ recommended
+- **Storage**: 1000GB minimum, 2000GB recommended for model and evaluation data
 - **Network**: High-bandwidth, stable connection for state synchronization
 
 ### Network Options

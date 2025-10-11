@@ -505,7 +505,7 @@ class Validator(BaseNode, Trainer):
             tplr.neurons.instantiate_slashing_multiplier()
         )
         self.naughty_peers = {}
-        self.naughty_peer_timeout = 200
+        self.naughty_peer_timeout = 20
 
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
@@ -537,6 +537,9 @@ class Validator(BaseNode, Trainer):
         self.excluded_from_gather: set[int] = set()
         self.exclusion_start_window: dict[int, int] = {}
 
+        # Track consecutive missing gradients for escalating slashing
+        self.consecutive_missing_gradient_count: dict[int, int] = {}
+
     def reset_peer(self, uid: int) -> None:
         """
         Generally based on peer behavior, reset their scores
@@ -555,6 +558,7 @@ class Validator(BaseNode, Trainer):
         self.inactive_scores.pop(uid, None)
         self.peer_eval_history.pop(uid, None)
         self.consecutive_negative_count.pop(uid, None)
+        self.consecutive_missing_gradient_count.pop(uid, None)
         self.excluded_from_gather.discard(uid)
         self.exclusion_start_window.pop(uid, None)
         return
@@ -1455,6 +1459,19 @@ class Validator(BaseNode, Trainer):
             if self.is_master:
                 await self.slash_for_poor_sync()
                 self.slash_for_missing_gradients(skipped_uids, success_rate)
+
+                # Reset consecutive missing gradient count for successful gather peers
+                for uid in actual_gather_uids:
+                    if uid in self.consecutive_missing_gradient_count:
+                        prev_count = self.consecutive_missing_gradient_count[uid]
+                        if prev_count > 0:
+                            tplr.log_with_context(
+                                level="info",
+                                message=f"UID {uid} successfully gathered gradient, resetting consecutive missing count from {prev_count} to 0",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                            )
+                        self.consecutive_missing_gradient_count[uid] = 0
 
             # Add check for empty peers (evaluating all peer uids)
             # Only master checks and broadcasts the decision
@@ -2387,6 +2404,18 @@ class Validator(BaseNode, Trainer):
                     )
 
                 # 16. Log evaluation metrics once all evaluations are done
+                # Calculate global negative evaluation statistics
+                total_negative_evals = sum(
+                    1
+                    for uid in self.evaluated_uids
+                    if 0 <= uid < self.gradient_scores.numel()
+                    and self.gradient_scores[uid].item() < 0
+                )
+                total_excluded_peers = len(self.excluded_from_gather)
+                total_with_consecutive_negative = sum(
+                    1 for count in self.consecutive_negative_count.values() if count > 0
+                )
+
                 threshold_pct = int(round(self.hparams.idx_overlap_threshold * 100))
                 evaluation_metrics = {
                     "validator/loss/own/before": avg_loss_before_per_batch_own,
@@ -2422,8 +2451,14 @@ class Validator(BaseNode, Trainer):
                     "validator/gather/intended_mean_final": mean_final_intended,
                     "validator/gather/actual_mean_final": mean_final_actual,
                     "validator/gather/reserve_used": reserve_used,
-                    "validator/gather/peers_positive_ratio": gather_peers_positive_ratio
+                    "validator/gather/num_peers": len(actual_gather_uids),
+                    "validator/gather/positive_peers": gather_peers_above_threshold,
+                    "validator/gather/positive_peers_ratio": gather_peers_positive_ratio
                     * 100,
+                    # ── negative evaluation global metrics ──────────────────
+                    "validator/negative_eval/total_negative": total_negative_evals,
+                    "validator/negative_eval/total_excluded": total_excluded_peers,
+                    "validator/negative_eval/total_with_consecutive": total_with_consecutive_negative,
                 }
                 self.wandb.log(evaluation_metrics, step=self.global_step)
 
@@ -3889,32 +3924,72 @@ class Validator(BaseNode, Trainer):
         self, skipped_uids: list[int], success_rate: float
     ) -> None:
         """
-        Slash peers that failed to submit gradients during gather.
+        Slash peers that failed to submit gradients during gather with escalating penalties.
 
         Args:
             skipped_uids: List of UIDs that were skipped during gather
             success_rate: Success rate of the gather operation
         """
-        gather_peers_slash_rate = (
-            0
-            if success_rate < self.hparams.gather_peers_slash_threshold
-            else self.missing_gradient_slash_rate
-        )
-
         for uid in skipped_uids:
-            tplr.log_with_context(
-                level="info",
-                message=f"No gradient gathered from UID {uid}. Slashing moving average score by {1 - gather_peers_slash_rate:.2%}.",
-                sync_window=self.sync_window,
-                current_window=self.current_window,
-            )
             if 0 <= uid < self.final_scores.size(0):
                 old_score = self.final_scores[uid].item()
 
+                # Increment consecutive missing gradient count
+                if uid not in self.consecutive_missing_gradient_count:
+                    self.consecutive_missing_gradient_count[uid] = 0
+                self.consecutive_missing_gradient_count[uid] += 1
+
+                consecutive_count = self.consecutive_missing_gradient_count[uid]
+
+                # Check for mega slash (3+ consecutive misses)
+                if consecutive_count >= 3:
+                    tplr.log_with_context(
+                        level="warning",
+                        message=f"UID {uid} missed gradient in gather {consecutive_count}"
+                        " times consecutively. MEGA SLASH: adding to naughty list for "
+                        f"{self.naughty_peer_timeout} windows"
+                        + (
+                            " and resetting peer."
+                            if old_score > 0
+                            else " (score non-positive, not resetting)."
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    # Always add to naughty list
+                    self.naughty_peers[uid] = self.naughty_peer_timeout
+                    # Only reset if score is positive
+                    if old_score > 0:
+                        self.reset_peer(uid)
+                    self.evaluated_uids.add(uid)
+                    self.peers_last_eval_window[uid] = self.sync_window
+                    continue
+
+                # Determine slash multiplier based on success rate and consecutive count
+                if success_rate < self.hparams.gather_peers_slash_threshold:
+                    slash_multiplier = 0.0  # Set to 0 if success rate is low
+                else:
+                    # Use escalating penalties based on consecutive misses
+                    if consecutive_count == 1:
+                        slash_multiplier = 0.75
+                    elif consecutive_count == 2:
+                        slash_multiplier = 0.25
+                    else:
+                        slash_multiplier = (
+                            0.0  # Shouldn't reach here due to mega slash above
+                        )
+
+                tplr.log_with_context(
+                    level="info",
+                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. Success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
+
                 # Only reduce positive scores
                 if self.final_scores[uid] > 0:
-                    self.final_scores[uid] *= gather_peers_slash_rate
-                    self.binary_moving_averages[uid] *= gather_peers_slash_rate
+                    self.final_scores[uid] *= slash_multiplier
+                    self.binary_moving_averages[uid] *= slash_multiplier
 
                     # Set to zero if score drops below threshold
                     score_threshold = self.score_zero_threshold
@@ -3930,7 +4005,7 @@ class Validator(BaseNode, Trainer):
                     new_score = self.final_scores[uid].item()
                     tplr.log_with_context(
                         level="info",
-                        message=f"Reduced score of UID {uid} from {old_score:.4f} to {new_score:.4f} due to missing gradient in gather.",
+                        message=f"Reduced score of UID {uid} from {old_score:.4f} to {new_score:.4f} due to missing gradient in gather (consecutive miss #{consecutive_count}).",
                         sync_window=self.sync_window,
                         current_window=self.current_window,
                     )
