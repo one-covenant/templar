@@ -752,10 +752,13 @@ class Validator(BaseNode, Trainer):
         avg_abs_diff = float(sync_result.get("avg_abs_diff", 99.0))
         max_diff = float(sync_result.get("max_diff", 99.0))
         avg_steps_behind = float(sync_result.get("avg_steps_behind", 99.0))
+        interquartile_mean_steps_behind = float(
+            sync_result.get("interquartile_mean_steps_behind", 99.0)
+        )
         max_steps_behind = float(sync_result.get("max_steps_behind", 99.0))
         tplr.log_with_context(
             level="info",
-            message=f"Sync average steps behind: {avg_steps_behind:.3f}",
+            message=f"Sync average steps behind: {avg_steps_behind:.3f}, interquartile mean: {interquartile_mean_steps_behind:.3f}",
             sync_window=self.sync_window,
             current_window=self.current_window,
             eval_uid=eval_uid,
@@ -768,6 +771,7 @@ class Validator(BaseNode, Trainer):
                     f"validator/sync/avg_abs_diff/{eval_uid}": avg_abs_diff,
                     f"validator/sync/sync_max_diff/{eval_uid}": max_diff,
                     f"validator/sync/avg_steps_behind/{eval_uid}": avg_steps_behind,
+                    f"validator/sync/interquartile_mean_steps_behind/{eval_uid}": interquartile_mean_steps_behind,
                     f"validator/sync/max_steps_behind/{eval_uid}": max_steps_behind,
                 },
                 step=self.global_step,
@@ -785,6 +789,7 @@ class Validator(BaseNode, Trainer):
                     "avg_abs_diff": avg_abs_diff,
                     "max_diff": max_diff,
                     "avg_steps_behind": avg_steps_behind,
+                    "interquartile_mean_steps_behind": interquartile_mean_steps_behind,
                     "max_steps_behind": max_steps_behind,
                 },
                 with_system_metrics=True,
