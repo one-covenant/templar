@@ -1,3 +1,4 @@
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -36,8 +37,23 @@ def validator_instance(monkeypatch):
     # Add new attributes for consecutive negative tracking
     validator.consecutive_negative_count = {}
     validator.consecutive_missing_gradient_count = {}
+    validator.missing_gradient_history = {}
+    validator.missing_gradient_history_limit = 8
     validator.excluded_from_gather = set()
     validator.exclusion_start_window = {}
+    validator.eval_history_limit = 20
+    validator.score_zero_threshold = 1e-4
+    validator.evaluated_uids = set()
+    validator.peers_last_eval_window = {}
+    validator.global_step = 0
+    validator.missing_gradient_penalty_score = -99.0
+
+    # Mock wandb
+    validator.wandb = SimpleNamespace()
+    validator.wandb.log = lambda *args, **kwargs: None
+
+    # Mock methods
+    validator.record_missing_gradient_for_openskill = lambda uid: None
 
     # Mock comms and metagraph
     validator.comms = SimpleNamespace()
@@ -168,3 +184,133 @@ def test_check_deregistered_uids(validator_instance):
     updated_peers = validator.check_deregistered_uids(idx_overlap_peers)
     assert 6 not in updated_peers
     assert 6 not in validator.naughty_peers
+
+
+def test_slash_for_missing_gradients_escalating(validator_instance):
+    """Test escalating penalties for missing gradients: 0.75, 0.5, 0"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.gather_peers_slash_threshold = 0.4
+
+    uid = 1
+    success_rate = 0.5  # Above threshold
+
+    # First miss: should multiply by 0.75
+    validator.slash_for_missing_gradients([uid], success_rate)
+    assert validator.final_scores[uid] == pytest.approx(0.75, rel=1e-3)
+    assert validator.consecutive_missing_gradient_count[uid] == 1
+
+    # Second miss: should multiply by 0.5
+    validator.slash_for_missing_gradients([uid], success_rate)
+    assert validator.final_scores[uid] == pytest.approx(0.75 * 0.5, rel=1e-3)
+    assert validator.consecutive_missing_gradient_count[uid] == 2
+
+    # Third miss: should multiply by 0
+    validator.slash_for_missing_gradients([uid], success_rate)
+    assert validator.final_scores[uid] == 0.0
+    assert validator.consecutive_missing_gradient_count[uid] == 3
+
+
+def test_slash_for_missing_gradients_mega_slash(validator_instance):
+    """Test mega slash when >50% of last 8 windows have missing gradients"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.gather_peers_slash_threshold = 0.4
+
+    uid = 2
+    success_rate = 0.5
+
+    # Simulate 5 missing and 3 successful gradients (5/8 = 62.5% > 50%)
+    validator.missing_gradient_history[uid] = deque(
+        [True, False, True, True, False, True, False, True], maxlen=8
+    )
+    validator.consecutive_missing_gradient_count[uid] = 1
+
+    # Next miss should trigger mega slash
+    validator.slash_for_missing_gradients([uid], success_rate)
+
+    # Should be in naughty list
+    assert uid in validator.naughty_peers
+    assert validator.naughty_peers[uid] == validator.naughty_peer_timeout
+
+    # Should be reset (score should be 0)
+    assert validator.final_scores[uid] == 0.0
+
+
+def test_slash_for_missing_gradients_below_threshold(validator_instance):
+    """Test that peers aren't mega slashed when below 50% threshold"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.gather_peers_slash_threshold = 0.4
+
+    uid = 3
+    success_rate = 0.5
+
+    # Simulate 4 missing and 4 successful gradients (4/8 = 50%, not > 50%)
+    validator.missing_gradient_history[uid] = deque(
+        [True, False, True, False, True, False, True, False], maxlen=8
+    )
+    validator.consecutive_missing_gradient_count[uid] = 1
+
+    # Next miss should NOT trigger mega slash (after append, deque becomes
+    # [False, True, False, True, False, True, False, True] which is 4/8 = 50%)
+    validator.slash_for_missing_gradients([uid], success_rate)
+
+    # Should NOT be in naughty list (mega slash not triggered)
+    assert uid not in validator.naughty_peers
+
+    # Should have normal slash applied (0.5 for second consecutive miss)
+    assert validator.final_scores[uid] == pytest.approx(0.5, rel=1e-3)
+
+
+def test_track_negative_evaluation_slashing(validator_instance):
+    """Test slashing when >50% of last 8 evaluations are negative"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+
+    uid = 4
+    validator.final_scores[uid] = 1.0
+
+    # Simulate 5 negative and 3 positive evaluations in last 8
+    # (5/8 = 62.5% > 50%)
+    validator.peer_eval_history[uid] = deque(
+        [True, False, True, True, False, True, False, True],
+        maxlen=validator.eval_history_limit,
+    )
+    validator.gradient_scores[uid] = -0.1  # Set current evaluation to negative
+
+    # Track the negative evaluation - should trigger slashing
+    validator.track_negative_evaluation(uid)
+
+    # Should be slashed by 75% (multiplied by 0.25)
+    # But the history already had 5 negatives, now we added one more (6 total)
+    # Actually, track_negative_evaluation appends the current evaluation
+    # So now we have 6 negatives out of 9 total
+    # But we only check last 8, which would be the last 8 in the deque
+    # Let me recalculate: after append, we have [True, False, True, True, False, True, False, True, True]
+    # Last 8 would be [False, True, True, False, True, False, True, True] = 5/8 = 62.5%
+    # So it should trigger slashing
+    assert validator.final_scores[uid] < 1.0
+    assert validator.final_scores[uid] == pytest.approx(0.25, rel=1e-3)
+
+
+def test_track_negative_evaluation_no_slash_below_threshold(validator_instance):
+    """Test that peers aren't slashed when below 50% negative threshold"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+
+    uid = 5
+    validator.final_scores[uid] = 1.0
+
+    # Simulate 4 negative and 4 positive evaluations in last 8 (4/8 = 50%, not > 50%)
+    validator.peer_eval_history[uid] = deque(
+        [True, False, True, False, True, False, True, False],
+        maxlen=validator.eval_history_limit,
+    )
+    validator.gradient_scores[uid] = 0.1  # Set current evaluation to positive
+
+    # Track the positive evaluation - should NOT trigger slashing
+    validator.track_negative_evaluation(uid)
+
+    # Score should remain 1.0 (no slashing)
+    assert validator.final_scores[uid] == 1.0
