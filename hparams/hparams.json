@@ -17,7 +17,7 @@
     "use_dct": false,
     "binary_score_ma_alpha": 0.05,
     "moving_average_window": 5,
-    "model_size": "70B",
+    "model_size": "2B",
     "weight_decay": 0.1,
     "validator_offset": 1,
     "checkpoint_frequency": 10,
@@ -99,7 +99,7 @@
 
     "float8_recipe_name": null,
     
-    "tie_embeddings": false,
+    "tie_embeddings": true,
 
     "activation_checkpoint": {
       "mode": "selective",

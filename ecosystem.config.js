@@ -8,7 +8,7 @@ const RANDOM_SUFFIX = execSync(
   .toString()
   .trim();
 
-const PROJECT_NAME = `TP-1B`;
+const PROJECT_NAME = `TP-2B`;
 
 module.exports = {
   apps: [
@@ -17,7 +17,7 @@ module.exports = {
       name            : "TM1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -34,16 +34,16 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        TP_DEGREE: "2",
-        DP_SHARD: "1",
-        CUDA_VISIBLE_DEVICES: "1,2"
+        DP_SHARD: "2",
+        TP_DEGREE: "1",
+        CUDA_VISIBLE_DEVICES: "0,1"
       }
     },
     {
       name            : "TM2",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -60,9 +60,9 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        TP_DEGREE: "2",
-        DP_SHARD: "1",
-        CUDA_VISIBLE_DEVICES: "3,4"
+        DP_SHARD: "2",
+        TP_DEGREE: "1",
+        CUDA_VISIBLE_DEVICES: "2,3"
       }
     },
 
@@ -71,11 +71,11 @@ module.exports = {
       name            : "TV1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "1",
+        "--nproc_per_node", "2",
         "neurons/validator.py",
         "--wallet.name", "templar_test",
         "--wallet.hotkey", "V1",
@@ -88,9 +88,9 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        TP_DEGREE: "2",
-        DP_SHARD: "1",
-        CUDA_VISIBLE_DEVICES: "0"
+        DP_SHARD: "2",
+        TP_DEGREE: "1",
+        CUDA_VISIBLE_DEVICES: "4,5"
       }
     }
   ]
