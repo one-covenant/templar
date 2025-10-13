@@ -478,7 +478,7 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
         and instance.peers_update_window  # they should be on bucket by now
         + instance.hparams.peer_replacement_frequency
         - window
-        < instance.hparams.peer_list_window_margin
+        <= instance.hparams.peer_list_window_margin
     ):
         result = await instance.comms.get_peer_list()
         if result is None:
