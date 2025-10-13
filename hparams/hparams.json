@@ -99,7 +99,7 @@
 
     "float8_recipe_name": null,
     
-    "tie_embeddings": true,
+    "tie_embeddings": false,
 
     "activation_checkpoint": {
       "mode": "selective",

@@ -2183,7 +2183,7 @@ class Validator(BaseNode, Trainer):
             self.outer_optimizer.zero_grad()
             self.model.zero_grad()
 
-            tplr.neurons.outer_step(
+            grad_stats = tplr.neurons.outer_step(
                 self.model,
                 self.outer_optimizer,
                 gather_result=gather_result,
@@ -2220,11 +2220,9 @@ class Validator(BaseNode, Trainer):
                 )
 
                 # ------ NEW: gradient & weight-norm statistics (outer-step) ------------
-                grad_norms, weight_norms = [], []
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        grad_norms.append(p.grad.data.norm().item())
-                        weight_norms.append(p.data.norm().item())
+                # Use statistics returned from outer_step (captured before freeing grads)
+                grad_norms = grad_stats.get("grad_norms", [])
+                weight_norms = grad_stats.get("weight_norms", [])
 
                 if grad_norms:
                     mean_grad_norm = sum(grad_norms) / len(grad_norms)

@@ -238,12 +238,15 @@ def outer_step(
     use_dct: bool = False,
     wandb_run: Run | None = None,
     global_step: int | None = None,
-) -> None:
+) -> dict[str, list[float]]:
     """
     Memory-minimizing variant:
       - Builds and applies ONE param's grad at a time.
       - Calls optimizer.step() per param (others have grad=None, so they're skipped).
       - Frees all temporaries and grad immediately after each step.
+
+    Returns:
+        Dict containing gradient and weight norm statistics for logging
     """
     model.train()
 
@@ -253,6 +256,10 @@ def outer_step(
     ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
     src_rank = 0
     on_src = is_master or not ddp
+
+    # Collect gradient and weight norms for logging
+    grad_norms: list[float] = []
+    weight_norms: list[float] = []
 
     # Only master reads aggregated payload (others rely on broadcasts).
     # Accept both SimpleNamespace and plain dict payloads.
@@ -338,8 +345,8 @@ def outer_step(
                 min_median_norm = min(min_median_norm, med)
                 max_median_norm = max(max_median_norm, med)
 
-                # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                ref = torch.empty_like(p, device=device, dtype=p.dtype)
+                full_shape = xshapes[name]
+                ref = torch.empty(full_shape, device=device, dtype=p.dtype)
                 decompressed = compressor.batch_decompress(
                     ref,
                     idxs_dev,
@@ -353,6 +360,7 @@ def outer_step(
                 )
 
                 full_grad_src = transformer.decode(decompressed, use_dct=use_dct)
+                full_grad_src = full_grad_src.reshape(p.shape)
                 # Single conversion to target dtype+device to avoid extra temporaries
                 full_grad_src = full_grad_src.to(
                     dtype=p.dtype, device=p.device, non_blocking=True
@@ -422,7 +430,22 @@ def outer_step(
                     torch.cuda.empty_cache()
                 continue
 
-        # ---- apply update immediately for THIS param and free its grad ----
+        # ---- Capture gradient and weight norms before freeing ----
+        if p.grad is not None:
+            # For DTensor, get local shard norm; for regular tensor, get full norm
+            if isinstance(p.grad, DT):
+                grad_norm = p.grad.to_local().data.norm().item()
+            else:
+                grad_norm = p.grad.data.norm().item()
+            grad_norms.append(grad_norm)
+
+            # Capture weight norm
+            if isinstance(p, DT):
+                weight_norm = p.to_local().data.norm().item()
+            else:
+                weight_norm = p.data.norm().item()
+            weight_norms.append(weight_norm)
+
         # ---- apply update immediately for THIS param and free its grad ----
         optimizer.step()
         p.grad = None  # free grad storage right away
@@ -448,6 +471,12 @@ def outer_step(
     optimizer.zero_grad(set_to_none=True)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # Return gradient and weight norm statistics for logging
+    return {
+        "grad_norms": grad_norms,
+        "weight_norms": weight_norms,
+    }
 
 
 async def update_peers(instance: NeuronT, window: int, peer_start: float) -> None:

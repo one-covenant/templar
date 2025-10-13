@@ -8,7 +8,7 @@ const RANDOM_SUFFIX = execSync(
   .toString()
   .trim();
 
-const PROJECT_NAME = `test_${RANDOM_SUFFIX}`;
+const PROJECT_NAME = `TP-1B`;
 
 module.exports = {
   apps: [
@@ -34,6 +34,8 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
+        TP_DEGREE: "2",
+        DP_SHARD: "1",
         CUDA_VISIBLE_DEVICES: "1,2"
       }
     },
@@ -58,6 +60,8 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
+        TP_DEGREE: "2",
+        DP_SHARD: "1",
         CUDA_VISIBLE_DEVICES: "3,4"
       }
     },
@@ -84,6 +88,8 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
+        TP_DEGREE: "2",
+        DP_SHARD: "1",
         CUDA_VISIBLE_DEVICES: "0"
       }
     }

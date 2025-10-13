@@ -1,0 +1,31 @@
+{
+    "vocab_size": 262144,
+    "hidden_size": 2048,
+    "num_hidden_layers": 16,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "intermediate_size": 8192,
+    "activation_function": "swiGLU",
+    "max_position_embeddings": 2048,
+    
+    "batch_size": 64,
+    "inner_steps": 20,
+    "outer_learning_rate": 0.1,
+    "blocks_per_window": 50,
+    
+    "offload_optimizer_states": false,
+    
+    "checkpoint_init_version": null,
+    "checkpoint_init_window": null,
+    
+    "optimizer": {
+        "type": "adamw",
+        "adamw": {
+            "learning_rate": 3e-4
+        }
+    },
+    
+    "torchtitan": {
+        "tie_embeddings": false
+    }
+}
