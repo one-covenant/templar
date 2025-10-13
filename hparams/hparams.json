@@ -60,7 +60,7 @@
       "learning_rate": 1.17e-4,
       "scheduler": {
         "warmup_steps": 1500,
-        "t_max": 140000,
+        "t_max": 160000,
         "eta_min_factor": 0.1
       }
     },
@@ -73,7 +73,7 @@
       "learning_rate": 2e-3,
       "scheduler": {
         "warmup_steps": 1500,
-        "t_max": 140000,
+        "t_max": 160000,
         "eta_min_factor": 0.1
       }
     }
