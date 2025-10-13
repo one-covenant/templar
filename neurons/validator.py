@@ -499,6 +499,9 @@ class Validator(BaseNode, Trainer):
         self.inactive_scores = {}  # {uid: (last_active_window, last_score)}
         self.inactivity_slash_rate = 0.25  # 25% slash per window
         self.missing_gradient_slash_rate = 0.75
+        self.missing_gradient_penalty_score = getattr(
+            self.hparams, "missing_gradient_penalty_score", -99.0
+        )
         self.score_zero_threshold = 1e-4
         self.sync_score_slash_rate = 0.75
         self.idx_similarity_slashing_rate = (
@@ -540,6 +543,10 @@ class Validator(BaseNode, Trainer):
         # Track consecutive missing gradients for escalating slashing
         self.consecutive_missing_gradient_count: dict[int, int] = {}
 
+        # Track last 8 missing gradient occurrences for mega slash logic
+        self.missing_gradient_history: dict[int, Deque[bool]] = {}
+        self.missing_gradient_history_limit = 8  # Track last 8 windows
+
     def reset_peer(self, uid: int) -> None:
         """
         Generally based on peer behavior, reset their scores
@@ -559,6 +566,7 @@ class Validator(BaseNode, Trainer):
         self.peer_eval_history.pop(uid, None)
         self.consecutive_negative_count.pop(uid, None)
         self.consecutive_missing_gradient_count.pop(uid, None)
+        self.missing_gradient_history.pop(uid, None)
         self.excluded_from_gather.discard(uid)
         self.exclusion_start_window.pop(uid, None)
         return
@@ -650,6 +658,40 @@ class Validator(BaseNode, Trainer):
         negative_freq = (neg_count / total) if total else 0.0
         consecutive_negs = self.consecutive_negative_count.get(eval_uid, 0)
 
+        # --- slash for >50% negative in last 8 evaluations
+        if total >= 8:
+            last_8 = list(window)[-8:]  # Get last 8 evaluations
+            neg_count_last_8 = sum(last_8)
+            neg_ratio_last_8 = neg_count_last_8 / 8
+
+            if neg_ratio_last_8 > 0.5:
+                old_score = self.final_scores[eval_uid].item()
+                if old_score > 0:
+                    # Apply 75% slash (multiply by 0.25)
+                    self.final_scores[eval_uid] *= 0.25
+                    self.binary_moving_averages[eval_uid] *= 0.25
+
+                    # Set to zero if score drops below threshold
+                    score_threshold = self.score_zero_threshold
+                    if self.final_scores[eval_uid] < score_threshold:
+                        tplr.log_with_context(
+                            level="info",
+                            message=f"UID {eval_uid} final_score {self.final_scores[eval_uid]:.8f} below threshold {score_threshold:.8f}, setting to 0.0",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+                        self.final_scores[eval_uid] = 0.0
+
+                    new_score = self.final_scores[eval_uid].item()
+                    tplr.log_with_context(
+                        level="warning",
+                        message=f"UID {eval_uid} has {neg_count_last_8}/8 negative evaluations ({neg_ratio_last_8:.1%}) in last 8 windows. "
+                        f"Slashing score from {old_score:.4f} to {new_score:.4f}",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                        eval_uid=eval_uid,
+                    )
+
         # --- logging (consider rate limiting in practice)
         tplr.log_with_context(
             level="info",
@@ -710,10 +752,13 @@ class Validator(BaseNode, Trainer):
         avg_abs_diff = float(sync_result.get("avg_abs_diff", 99.0))
         max_diff = float(sync_result.get("max_diff", 99.0))
         avg_steps_behind = float(sync_result.get("avg_steps_behind", 99.0))
+        interquartile_mean_steps_behind = float(
+            sync_result.get("interquartile_mean_steps_behind", 99.0)
+        )
         max_steps_behind = float(sync_result.get("max_steps_behind", 99.0))
         tplr.log_with_context(
             level="info",
-            message=f"Sync average steps behind: {avg_steps_behind:.3f}",
+            message=f"Sync average steps behind: {avg_steps_behind:.3f}, interquartile mean: {interquartile_mean_steps_behind:.3f}",
             sync_window=self.sync_window,
             current_window=self.current_window,
             eval_uid=eval_uid,
@@ -726,6 +771,7 @@ class Validator(BaseNode, Trainer):
                     f"validator/sync/avg_abs_diff/{eval_uid}": avg_abs_diff,
                     f"validator/sync/sync_max_diff/{eval_uid}": max_diff,
                     f"validator/sync/avg_steps_behind/{eval_uid}": avg_steps_behind,
+                    f"validator/sync/interquartile_mean_steps_behind/{eval_uid}": interquartile_mean_steps_behind,
                     f"validator/sync/max_steps_behind/{eval_uid}": max_steps_behind,
                 },
                 step=self.global_step,
@@ -743,6 +789,7 @@ class Validator(BaseNode, Trainer):
                     "avg_abs_diff": avg_abs_diff,
                     "max_diff": max_diff,
                     "avg_steps_behind": avg_steps_behind,
+                    "interquartile_mean_steps_behind": interquartile_mean_steps_behind,
                     "max_steps_behind": max_steps_behind,
                 },
                 with_system_metrics=True,
@@ -1462,6 +1509,15 @@ class Validator(BaseNode, Trainer):
 
                 # Reset consecutive missing gradient count for successful gather peers
                 for uid in actual_gather_uids:
+                    # Track successful gradient submission in history
+                    if uid not in self.missing_gradient_history:
+                        self.missing_gradient_history[uid] = deque(
+                            maxlen=self.missing_gradient_history_limit
+                        )
+                    self.missing_gradient_history[uid].append(
+                        False
+                    )  # False = not missing
+
                     if uid in self.consecutive_missing_gradient_count:
                         prev_count = self.consecutive_missing_gradient_count[uid]
                         if prev_count > 0:
@@ -3076,6 +3132,21 @@ class Validator(BaseNode, Trainer):
                 )
         return
 
+    def record_missing_gradient_for_openskill(self, uid: int) -> None:
+        """Record a missing/invalid gradient in OpenSkill scoring with penalty score.
+
+        Args:
+            uid: The UID of the peer with missing/invalid gradient
+        """
+        # Add to current window scores for OpenSkill rating with penalty score
+        if not hasattr(self, "current_window_scores"):
+            self.current_window_scores = {}
+        self.current_window_scores[uid] = self.missing_gradient_penalty_score
+
+        # Initialize OpenSkill rating if needed
+        if uid not in self.openskill_ratings:
+            self.openskill_ratings[uid] = self.openskill_model.rating(name=str(uid))
+
     def slash_for_missing_gradient(self, eval_uid: int) -> None:
         """Slash a peer for not submitting a gradient.
 
@@ -3129,6 +3200,9 @@ class Validator(BaseNode, Trainer):
 
         # Ensure the UID is included in evaluated_uids only when penalized
         self.evaluated_uids.add(eval_uid)
+
+        # Record missing gradient for OpenSkill scoring
+        self.record_missing_gradient_for_openskill(eval_uid)
 
         # Log updated scores
         tplr.log_with_context(
@@ -3189,6 +3263,9 @@ class Validator(BaseNode, Trainer):
 
         # Include in evaluated UIDs so it gets logged in metrics
         self.evaluated_uids.add(eval_uid)
+
+        # Record invalid gradient for OpenSkill scoring
+        self.record_missing_gradient_for_openskill(eval_uid)
 
         # Log to WandB
         self.wandb.log(
@@ -3934,6 +4011,13 @@ class Validator(BaseNode, Trainer):
             if 0 <= uid < self.final_scores.size(0):
                 old_score = self.final_scores[uid].item()
 
+                # Track missing gradient in history
+                if uid not in self.missing_gradient_history:
+                    self.missing_gradient_history[uid] = deque(
+                        maxlen=self.missing_gradient_history_limit
+                    )
+                self.missing_gradient_history[uid].append(True)  # True = missing
+
                 # Increment consecutive missing gradient count
                 if uid not in self.consecutive_missing_gradient_count:
                     self.consecutive_missing_gradient_count[uid] = 0
@@ -3941,29 +4025,37 @@ class Validator(BaseNode, Trainer):
 
                 consecutive_count = self.consecutive_missing_gradient_count[uid]
 
-                # Check for mega slash (3+ consecutive misses)
-                if consecutive_count >= 3:
-                    tplr.log_with_context(
-                        level="warning",
-                        message=f"UID {uid} missed gradient in gather {consecutive_count}"
-                        " times consecutively. MEGA SLASH: adding to naughty list for "
-                        f"{self.naughty_peer_timeout} windows"
-                        + (
-                            " and resetting peer."
-                            if old_score > 0
-                            else " (score non-positive, not resetting)."
-                        ),
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                    )
-                    # Always add to naughty list
-                    self.naughty_peers[uid] = self.naughty_peer_timeout
-                    # Only reset if score is positive
-                    if old_score > 0:
-                        self.reset_peer(uid)
-                    self.evaluated_uids.add(uid)
-                    self.peers_last_eval_window[uid] = self.sync_window
-                    continue
+                # Check for mega slash (>50% missing in last 8 windows)
+                history = self.missing_gradient_history[uid]
+                if len(history) >= 8:
+                    missing_count = sum(history)  # True counts as 1
+                    missing_ratio = missing_count / len(history)
+
+                    if missing_ratio > 0.5:
+                        tplr.log_with_context(
+                            level="warning",
+                            message=f"UID {uid} missed gradient in {missing_count}/{len(history)} "
+                            f"of last {len(history)} windows ({missing_ratio:.1%}). "
+                            f"MEGA SLASH: adding to naughty list for {self.naughty_peer_timeout} windows"
+                            + (
+                                " and resetting peer."
+                                if old_score > 0
+                                else " (score non-positive, not resetting)."
+                            ),
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+                        # Always add to naughty list
+                        self.naughty_peers[uid] = self.naughty_peer_timeout
+                        # Only reset if score is positive
+                        if old_score > 0:
+                            self.reset_peer(uid)
+                        self.evaluated_uids.add(uid)
+                        self.peers_last_eval_window[uid] = self.sync_window
+
+                        # Record missing gradient for OpenSkill scoring
+                        self.record_missing_gradient_for_openskill(uid)
+                        continue
 
                 # Determine slash multiplier based on success rate and consecutive count
                 if success_rate < self.hparams.gather_peers_slash_threshold:
@@ -3973,11 +4065,9 @@ class Validator(BaseNode, Trainer):
                     if consecutive_count == 1:
                         slash_multiplier = 0.75
                     elif consecutive_count == 2:
-                        slash_multiplier = 0.25
+                        slash_multiplier = 0.5  # Changed from 0.25
                     else:
-                        slash_multiplier = (
-                            0.0  # Shouldn't reach here due to mega slash above
-                        )
+                        slash_multiplier = 0.0
 
                 tplr.log_with_context(
                     level="info",
@@ -4018,6 +4108,9 @@ class Validator(BaseNode, Trainer):
                     )
                 self.evaluated_uids.add(uid)
                 self.peers_last_eval_window[uid] = self.sync_window
+
+                # Record missing gradient for OpenSkill scoring
+                self.record_missing_gradient_for_openskill(uid)
             else:
                 tplr.log_with_context(
                     level="info",

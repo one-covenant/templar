@@ -478,7 +478,7 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
         and instance.peers_update_window  # they should be on bucket by now
         + instance.hparams.peer_replacement_frequency
         - window
-        < instance.hparams.peer_list_window_margin
+        <= instance.hparams.peer_list_window_margin
     ):
         result = await instance.comms.get_peer_list()
         if result is None:
@@ -1138,9 +1138,17 @@ async def compare_model_with_debug_dict(
     if not step_ratio_list:  # nothing compared
         median_steps = math.inf
         max_steps = math.inf
+        interquartile_mean_steps = math.inf
     else:
         all_steps = torch.cat([t.flatten() for t in step_ratio_list])
         median_steps = all_steps.median().item()
+
+        # Calculate interquartile mean (mean of values between Q1 and Q3)
+        q1 = all_steps.quantile(0.25).item()
+        q3 = all_steps.quantile(0.75).item()
+        # Filter values in the interquartile range
+        iqr_mask = (all_steps >= q1) & (all_steps <= q3)
+        interquartile_mean_steps = all_steps[iqr_mask].mean().item()
 
     return {
         "success": True,
@@ -1149,6 +1157,7 @@ async def compare_model_with_debug_dict(
         "avg_abs_diff": avg_abs_diff,
         "max_diff": max_diff,
         "avg_steps_behind": median_steps,
+        "interquartile_mean_steps_behind": interquartile_mean_steps,
         "max_steps_behind": max_steps,
         "param_count": param_count,
         "learning_rate": learning_rate,

@@ -17,6 +17,7 @@
     "use_dct": false,
     "binary_score_ma_alpha": 0.05,
     "moving_average_window": 5,
+    "missing_gradient_penalty_score": -99.0,
     "model_size": "70B",
     "weight_decay": 0.1,
     "validator_offset": 1,
@@ -41,8 +42,8 @@
     "eval_lr_factor": 0.2,
     "openskill_beta": 7,
     "openskill_tau": 0.1,
-    "checkpoint_init_version": "2.1.6",
-    "checkpoint_init_window": 57634,
+    "checkpoint_init_version": "2.1.7",
+    "checkpoint_init_window": 57825,
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
@@ -59,7 +60,7 @@
       "learning_rate": 1.17e-4,
       "scheduler": {
         "warmup_steps": 1500,
-        "t_max": 140000,
+        "t_max": 160000,
         "eta_min_factor": 0.1
       }
     },
@@ -72,7 +73,7 @@
       "learning_rate": 2e-3,
       "scheduler": {
         "warmup_steps": 1500,
-        "t_max": 140000,
+        "t_max": 160000,
         "eta_min_factor": 0.1
       }
     }
