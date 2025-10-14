@@ -1733,115 +1733,165 @@ class Comms(ChainManager):
 
                     # ---------- Begin Compressed Indices and Values Check ----------
                     valid_response = True
-                    for param_name, tensor in state_dict_resp.items():
-                        received_compressed_params.add(param_name)
+                    try:
+                        for param_name, tensor in state_dict_resp.items():
+                            received_compressed_params.add(param_name)
 
-                        # ----------------------------------------------------------
-                        # (1)  Validate quantisation parameters themselves
-                        # ----------------------------------------------------------
-                        if param_name.endswith("quant_params"):
-                            shift, scale, offset, lookup, dtype = tensor
-                            if (
-                                (not torch.isfinite(shift))
-                                or isinstance(scale, float)
-                                and (
-                                    not math.isfinite(scale)
-                                    or abs(scale) < 1e-12
-                                    or abs(scale) > 1e4
-                                )
-                            ):
-                                tplr.logger.warning(
-                                    f"Bad quant‑params in {param_name} from UID {uid}; "
-                                    f"shift={shift}, scale={scale}"
-                                )
-                                valid_response = False
-                                break
-                            if torch.is_tensor(lookup) and (
-                                not torch.isfinite(lookup).all()
-                            ):
-                                tplr.logger.warning(
-                                    f"Lookup table contains non‑finite values in {param_name} "
-                                    f"from UID {uid}"
-                                )
-                                valid_response = False
-                                break
-
-                        if param_name.endswith("idxs"):
-                            base_name = param_name[:-4]
-                            totalk_value = totalks.get(base_name)
-                            if totalk_value is None:
-                                tplr.logger.warning(
-                                    f"Missing totalk for parameter {base_name} from UID {uid}, skipping UID."
-                                )
-                                valid_response = False
-                                break
-                            # totalks stores integers, not tensors
-                            totalk = (
-                                totalk_value
-                                if isinstance(totalk_value, int)
-                                else totalk_value.numel()
-                            )
-                            # Get corresponding vals tensor for 12-bit unpacking
-                            vals_tensor = state_dict_resp.get(base_name + "vals", None)
-                            try:
-                                self.check_compressed_indices(
-                                    param_name,
-                                    tensor,
-                                    totalk,
-                                    allowed_topk=self.hparams.topk_compression,
-                                    vals=vals_tensor,
-                                )
-                            except Exception as e:
-                                tplr.logger.warning(
-                                    f"Compressed indices check failed for parameter {param_name} from UID {uid}: {e}"
-                                )
-                                valid_response = False
-                                break
-                        # Check if values are valid (not NaN, not Inf) - validate without dequantizing
-                        elif param_name.endswith("vals"):
-                            # Only move to device for validation if needed
-                            if tensor.dtype == torch.uint8:
-                                # For quantized values, do a quick check on the raw bytes
-                                if tensor.nelement() == 0:
-                                    tplr.logger.warning(
-                                        f"Empty tensor in {param_name} from UID {uid}, skipping"
-                                    )
-                                    valid_response = False
-                                    break
-                            else:
-                                # For non-quantized tensors, check for NaN/Inf
-                                tensor_to_check = tensor.to(device)
+                            # ----------------------------------------------------------
+                            # (1)  Validate quantisation parameters themselves
+                            # ----------------------------------------------------------
+                            if param_name.endswith("quant_params"):
+                                shift, scale, offset, lookup, dtype = tensor
                                 if (
-                                    torch.isnan(tensor_to_check).any()
-                                    or torch.isinf(tensor_to_check).any()
+                                    (not torch.isfinite(shift))
+                                    or isinstance(scale, float)
+                                    and (
+                                        not math.isfinite(scale)
+                                        or abs(scale) < 1e-12
+                                        or abs(scale) > 1e4
+                                    )
                                 ):
                                     tplr.logger.warning(
-                                        f"NaN/Inf in {param_name} from UID {uid}, skipping"
+                                        f"Bad quant‑params in {param_name} from UID {uid}; "
+                                        f"shift={shift}, scale={scale}"
                                     )
                                     valid_response = False
                                     break
-                                # Clean up temporary tensor
-                                del tensor_to_check
+                                if torch.is_tensor(lookup) and (
+                                    not torch.isfinite(lookup).all()
+                                ):
+                                    tplr.logger.warning(
+                                        f"Lookup table contains non‑finite values in {param_name} "
+                                        f"from UID {uid}"
+                                    )
+                                    valid_response = False
+                                    break
 
-                            # ------------------------------------------------------
-                            # (2)  Only validate quantization params exist, don't dequantize
-                            # ------------------------------------------------------
-                            qparams = state_dict_resp.get(
-                                param_name[:-4] + "quant_params", None
-                            )
-                            if qparams is None and tensor.dtype == torch.uint8:
-                                tplr.logger.warning(
-                                    f"Missing quant_params for quantized {param_name} from UID {uid}"
+                            if param_name.endswith("idxs"):
+                                base_name = param_name[:-4]
+                                # [TP FIX] Strip rank suffix for totalk lookup
+                                # Gradients have _rank0, _rank1 suffixes but totalks uses base names
+                                import re
+                                totalk_lookup_name = re.sub(r'_rank\d+$', '', base_name)
+                                totalk_value = totalks.get(totalk_lookup_name)
+                                if totalk_value is None:
+                                    tplr.logger.warning(
+                                        f"Missing totalk for parameter {base_name} from UID {uid}, skipping UID."
+                                    )
+                                    valid_response = False
+                                    break
+                                # totalks stores integers, not tensors
+                                totalk = (
+                                    totalk_value
+                                    if isinstance(totalk_value, int)
+                                    else totalk_value.numel()
                                 )
-                                valid_response = False
-                                break
+                                # Get corresponding vals tensor for 12-bit unpacking
+                                vals_tensor = state_dict_resp.get(base_name + "vals", None)
+                                try:
+                                    self.check_compressed_indices(
+                                        param_name,
+                                        tensor,
+                                        totalk,
+                                        allowed_topk=self.hparams.topk_compression,
+                                        vals=vals_tensor,
+                                    )
+                                except Exception as e:
+                                    tplr.logger.warning(
+                                        f"Compressed indices check failed for parameter {param_name} from UID {uid}: {e}"
+                                    )
+                                    valid_response = False
+                                    break
+                            # Check if values are valid (not NaN, not Inf) - validate without dequantizing
+                            elif param_name.endswith("vals"):
+                                # Only move to device for validation if needed
+                                if tensor.dtype == torch.uint8:
+                                    # For quantized values, do a quick check on the raw bytes
+                                    if tensor.nelement() == 0:
+                                        tplr.logger.warning(
+                                            f"Empty tensor in {param_name} from UID {uid}, skipping"
+                                        )
+                                        valid_response = False
+                                        break
+                                else:
+                                    # For non-quantized tensors, check for NaN/Inf
+                                    tensor_to_check = tensor.to(device)
+                                    if (
+                                        torch.isnan(tensor_to_check).any()
+                                        or torch.isinf(tensor_to_check).any()
+                                    ):
+                                        tplr.logger.warning(
+                                            f"NaN/Inf in {param_name} from UID {uid}, skipping"
+                                        )
+                                        valid_response = False
+                                        break
+                                    # Clean up temporary tensor
+                                    del tensor_to_check
 
-                    missing_params = (
-                        expected_compressed_params - received_compressed_params
-                    )
-                    if missing_params:
-                        tplr.logger.warning(
-                            f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
+                                # ------------------------------------------------------
+                                # (2)  Only validate quantization params exist, don't dequantize
+                                # ------------------------------------------------------
+                                # Note: param_name already has rank suffix, so quant_params key will too
+                                qparams = state_dict_resp.get(
+                                    param_name[:-4] + "quant_params", None
+                                )
+                                if qparams is None and tensor.dtype == torch.uint8:
+                                    tplr.logger.warning(
+                                        f"Missing quant_params for quantized {param_name} from UID {uid}"
+                                    )
+                                    valid_response = False
+                                    break
+
+                        # [TP FIX + BACKWARD COMPAT] For TP, be flexible about rank suffixes
+                        # Check if we're missing parameters, but account for backward compatibility
+                        import os
+                        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+                        
+                        missing_params = expected_compressed_params - received_compressed_params
+                        
+                        if tp_degree > 1 and missing_params:
+                            # For TP, try backwards compatibility: check if non-suffixed versions exist
+                            # This handles gradients from FSDP miners or older TP implementations
+                            actually_missing = set()
+                            for param in missing_params:
+                                # Check if this is a rank-suffixed param
+                                if "_rank" in param and ("idxs" in param or "vals" in param or "quant_params" in param):
+                                    # Extract base param name (before _rankN)
+                                    base_param = param.split("_rank")[0]
+                                    # Check if non-suffixed version exists
+                                    if param.endswith("idxs"):
+                                        non_suffixed = base_param + "idxs"
+                                    elif param.endswith("vals"):
+                                        non_suffixed = base_param + "vals"
+                                    elif param.endswith("quant_params"):
+                                        non_suffixed = base_param + "quant_params"
+                                    else:
+                                        non_suffixed = None
+                                    
+                                    if non_suffixed and non_suffixed not in received_compressed_params:
+                                        actually_missing.add(param)
+                                    # else: non-suffixed version exists, so not actually missing
+                                else:
+                                    actually_missing.add(param)
+                            
+                            missing_params = actually_missing
+                    
+                        if missing_params:
+                            tplr.logger.warning(
+                                f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
+                            )
+                            tplr.logger.info(
+                                f"UID {uid} received {len(received_compressed_params)} params, "
+                                f"expected {len(expected_compressed_params)} params"
+                            )
+                            # Log a sample of what was received
+                            sample_received = list(received_compressed_params)[:5]
+                            tplr.logger.info(f"Sample received params: {sample_received}")
+                            valid_response = False
+                    except Exception as validation_error:
+                        tplr.logger.error(
+                            f"UID {uid}: Validation exception: {validation_error}",
+                            exc_info=True
                         )
                         valid_response = False
 

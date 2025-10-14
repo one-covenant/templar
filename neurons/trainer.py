@@ -19,6 +19,7 @@
 # Standard library
 import asyncio
 import concurrent.futures
+import os
 import time
 from contextlib import nullcontext
 from typing import Iterable
@@ -91,11 +92,25 @@ class Trainer:
 
             Returns: The names of all expected keys from a miner
         """
+        # [TP FIX] For TP, expect rank-suffixed parameter names
+        # Note: Backward compatibility is handled in validation logic, not here
+        import os
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        
         expected_compressed_params = set()
         for param_name, _ in self.model.named_parameters():
-            expected_compressed_params.add(param_name + "idxs")
-            expected_compressed_params.add(param_name + "vals")
-            expected_compressed_params.add(param_name + "quant_params")
+            if tp_degree > 1:
+                # For TP, each rank uploads its shard with rank suffix
+                for rank_i in range(tp_degree):
+                    rank_suffix_param = f"{param_name}_rank{rank_i}"
+                    expected_compressed_params.add(rank_suffix_param + "idxs")
+                    expected_compressed_params.add(rank_suffix_param + "vals")
+                    expected_compressed_params.add(rank_suffix_param + "quant_params")
+            else:
+                # For FSDP/DDP, no rank suffix
+                expected_compressed_params.add(param_name + "idxs")
+                expected_compressed_params.add(param_name + "vals")
+                expected_compressed_params.add(param_name + "quant_params")
 
         return expected_compressed_params
 
@@ -119,6 +134,7 @@ class Trainer:
                 device=str(self.device),
                 world_size=self.world_size,
             )
+            
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
@@ -824,9 +840,15 @@ class Trainer:
                         # mean loss of this accumulation step for logging
                         from torch.distributed import ReduceOp
 
+                        # [DEBUG] Log local loss before reduction
+                        local_loss_before_reduce = loss_item
+                        
                         log_loss = dist_helper.ddp_reduce(
                             loss_item, op=ReduceOp.AVG, device=self.device
                         )
+                        
+                        # [DEBUG] Compute gradient norm before clipping
+                        grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float('inf'))
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                         if not null_round:
@@ -852,10 +874,22 @@ class Trainer:
                             dist_helper.ddp_reduce(accum_batch_size, device=self.device)
                         )
                         if self.is_master:
+                            # [DEBUG] Enhanced logging
+                            rank_info = ""
+                            if self.world_size > 1:
+                                import torch.distributed as dist
+                                rank = dist.get_rank() if dist.is_initialized() else 0
+                                rank_info = f" [Rank {rank}]"
+                            
+                            # Convert grad_norm to scalar (handles both Tensor and DTensor)
+                            grad_norm_scalar = float(grad_norm_before_clip.item() if hasattr(grad_norm_before_clip, 'item') else grad_norm_before_clip)
+                            
                             tplr.logger.info(
                                 f"Inner Step {inner_step_count}, "
                                 f"Batch {batch_count}, loss: {log_loss:.4f}, "
-                                f"accum: {accum_batch_size}/{self.hparams.batch_size}"
+                                f"local_loss: {local_loss_before_reduce:.4f}, "
+                                f"grad_norm: {grad_norm_scalar:.4f}, "
+                                f"accum: {accum_batch_size}/{self.hparams.batch_size}{rank_info}"
                             )
                         if window_entry_loss == 0.0:
                             total_batches_first_step = int(

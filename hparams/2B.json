@@ -23,5 +23,9 @@
         "adamw": {
             "learning_rate": 3e-3
         }
-    }
+    },
+    
+    "torchtitan": {
+    "tie_embeddings": false
+  }
 }

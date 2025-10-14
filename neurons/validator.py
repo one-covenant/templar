@@ -1455,10 +1455,38 @@ class Validator(BaseNode, Trainer):
                         positive_ratio_pct=gather_peers_positive_ratio * 100,
                     )
 
-            # Only master evaluates miner sync and applies slashing
+            # [FIX] Sync all ranks BEFORE master does async slashing work to avoid deadlock
+            tplr.log_with_context(
+                level="info",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
+            if self.world_size > 1 and dist.is_initialized():
+                dist.barrier()
+            
+            # Only master evaluates miner sync and applies slashing (can be slow/async)
             if self.is_master:
-                await self.slash_for_poor_sync()
-                self.slash_for_missing_gradients(skipped_uids, success_rate)
+                # Skip slashing for the first 20 global steps to avoid delays during warmup
+                if self.global_step >= 20:
+                    tplr.log_with_context(
+                        level="info",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    await self.slash_for_poor_sync()
+                    tplr.log_with_context(
+                        level="info",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    self.slash_for_missing_gradients(skipped_uids, success_rate)
+                else:
+                    tplr.log_with_context(
+                        level="info",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    self.slash_for_missing_gradients(skipped_uids, success_rate)
 
                 # Reset consecutive missing gradient count for successful gather peers
                 for uid in actual_gather_uids:
@@ -1472,12 +1500,23 @@ class Validator(BaseNode, Trainer):
                                 current_window=self.current_window,
                             )
                         self.consecutive_missing_gradient_count[uid] = 0
+                
+                tplr.log_with_context(
+                    level="info",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
 
             # Add check for empty peers (evaluating all peer uids)
             # Only master checks and broadcasts the decision
             has_peers = True
             if self.is_master:
                 has_peers = len(self.comms.eval_peers) > 0
+                tplr.log_with_context(
+                    level="info",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
                 if not has_peers:
                     tplr.log_with_context(
                         level="warning",
@@ -1486,9 +1525,20 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                     )
 
-            # Barrier before evaluation starts
+            # Barrier before broadcasting eval decision
+            tplr.log_with_context(
+                level="info",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
             if self.world_size > 1 and dist.is_initialized():
                 dist.barrier()
+
+            tplr.log_with_context(
+                level="info",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
 
             # Broadcast the decision to all ranks
             has_peers_tensor = torch.tensor(
@@ -1496,6 +1546,12 @@ class Validator(BaseNode, Trainer):
             )
             dist_helper.broadcast(has_peers_tensor, src=0)
             has_peers = has_peers_tensor.item()
+
+            tplr.log_with_context(
+                level="info",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
 
             if not has_peers:
                 continue
@@ -3165,6 +3221,15 @@ class Validator(BaseNode, Trainer):
 
         old_score = self.final_scores[eval_uid].item()
 
+        # Log the actual error for debugging
+        tplr.log_with_context(
+            level="warning",
+            message=f"Invalid gradient from UID {eval_uid}: {type(error).__name__}: {str(error)}",
+            sync_window=self.sync_window,
+            current_window=self.current_window,
+            eval_uid=eval_uid,
+        )
+
         if old_score > 0:
             # Reset positive scores to zero explicitly
             self.final_scores[eval_uid] = 0.0
@@ -3234,13 +3299,44 @@ class Validator(BaseNode, Trainer):
         Raises:
             ValueError: If any gradient data is invalid
         """
+        # [TP FIX + BACKWARD COMPAT] Check if TP is enabled to use rank-suffixed keys
+        # But also support FSDP (non-suffixed) format for gradual migration
+        import os
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        
         for n, p in model.named_parameters():
-            idxs_key = n + "idxs"
-            vals_key = n + "vals"
-            quant_key = n + "quant_params"
-            idxs = eval_state_dict.get(idxs_key, None)
-            vals = eval_state_dict.get(vals_key, None)
-            quant_params = eval_state_dict.get(quant_key, None)
+            # [BACKWARD COMPAT] Try TP format first, then fall back to FSDP format
+            idxs, vals, quant_params = None, None, None
+            idxs_key, vals_key, quant_key = None, None, None
+            
+            if tp_degree > 1:
+                # Try TP format (rank-suffixed)
+                param_base = f"{n}_rank{self.local_rank}"
+                idxs_key = param_base + "idxs"
+                vals_key = param_base + "vals"
+                quant_key = param_base + "quant_params"
+                idxs = eval_state_dict.get(idxs_key, None)
+                vals = eval_state_dict.get(vals_key, None)
+                quant_params = eval_state_dict.get(quant_key, None)
+                
+                # Fall back to FSDP format (non-suffixed) for backward compatibility
+                if idxs is None or vals is None or quant_params is None:
+                    param_base = n
+                    idxs_key = param_base + "idxs"
+                    vals_key = param_base + "vals"
+                    quant_key = param_base + "quant_params"
+                    idxs = eval_state_dict.get(idxs_key, None)
+                    vals = eval_state_dict.get(vals_key, None)
+                    quant_params = eval_state_dict.get(quant_key, None)
+            else:
+                # FSDP/DDP: use non-suffixed keys
+                param_base = n
+                idxs_key = param_base + "idxs"
+                vals_key = param_base + "vals"
+                quant_key = param_base + "quant_params"
+                idxs = eval_state_dict.get(idxs_key, None)
+                vals = eval_state_dict.get(vals_key, None)
+                quant_params = eval_state_dict.get(quant_key, None)
 
             if idxs is not None and vals is not None and quant_params is not None:
                 # Handle 12-bit packed format: (packed_tensor, original_shape)
@@ -3298,6 +3394,10 @@ class Validator(BaseNode, Trainer):
         clip_norm = True  # Always true in the repo 8/13/2025
         # If all validations pass, apply the gradients
 
+        # [TP FIX] Check if TP is enabled to use rank-suffixed keys
+        import os
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        
         for n, p in model.named_parameters():
             src_rank = 0
             on_src = self.is_master or not dist_helper.is_distributed()
@@ -3307,12 +3407,38 @@ class Validator(BaseNode, Trainer):
 
             # Build the full dense grad on the source rank only (or always in single GPU)
             if on_src:
-                idxs_key = n + "idxs"
-                vals_key = n + "vals"
-                quant_key = n + "quant_params"
-                idxs = eval_state_dict.get(idxs_key, None)
-                vals = eval_state_dict.get(vals_key, None)
-                quant_params = eval_state_dict.get(quant_key, None)
+                # [TP FIX + BACKWARD COMPAT] Try TP format first, then fall back to FSDP format
+                idxs, vals, quant_params = None, None, None
+                idxs_key, vals_key, quant_key = None, None, None
+                
+                if tp_degree > 1:
+                    # Try TP format (rank-suffixed)
+                    param_base = f"{n}_rank{self.local_rank}"
+                    idxs_key = param_base + "idxs"
+                    vals_key = param_base + "vals"
+                    quant_key = param_base + "quant_params"
+                    idxs = eval_state_dict.get(idxs_key, None)
+                    vals = eval_state_dict.get(vals_key, None)
+                    quant_params = eval_state_dict.get(quant_key, None)
+                    
+                    # Fall back to FSDP format (non-suffixed) for backward compatibility
+                    if idxs is None or vals is None or quant_params is None:
+                        param_base = n
+                        idxs_key = param_base + "idxs"
+                        vals_key = param_base + "vals"
+                        quant_key = param_base + "quant_params"
+                        idxs = eval_state_dict.get(idxs_key, None)
+                        vals = eval_state_dict.get(vals_key, None)
+                        quant_params = eval_state_dict.get(quant_key, None)
+                else:
+                    # FSDP/DDP: use non-suffixed keys
+                    param_base = n
+                    idxs_key = param_base + "idxs"
+                    vals_key = param_base + "vals"
+                    quant_key = param_base + "quant_params"
+                    idxs = eval_state_dict.get(idxs_key, None)
+                    vals = eval_state_dict.get(vals_key, None)
+                    quant_params = eval_state_dict.get(quant_key, None)
 
                 if clip_norm:
                     if vals is None or quant_params is None:

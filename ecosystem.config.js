@@ -34,8 +34,8 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        DP_SHARD: "2",
-        TP_DEGREE: "1",
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
         CUDA_VISIBLE_DEVICES: "0,1"
       }
     },
@@ -60,8 +60,8 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        DP_SHARD: "2",
-        TP_DEGREE: "1",
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
         CUDA_VISIBLE_DEVICES: "2,3"
       }
     },
@@ -88,8 +88,8 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        DP_SHARD: "2",
-        TP_DEGREE: "1",
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
         CUDA_VISIBLE_DEVICES: "4,5"
       }
     }

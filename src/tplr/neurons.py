@@ -123,7 +123,10 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             grp_g = get_mesh_group(g)
             barrier(grp_g)
             assert g is not None
+            local_grad_norm = g.to_local().norm().item()
             grad_full = g.full_tensor().to(p.device)
+            full_grad_norm = grad_full.norm().item()
+            if dist.get_rank() == 0 and n in ["layers.0.attention.wq.weight", "output.weight"]:
             barrier(grp_g)
         else:
             if g is None and not p_is_dt:
@@ -264,6 +267,7 @@ def outer_step(
     # Only master reads aggregated payload (others rely on broadcasts).
     # Accept both SimpleNamespace and plain dict payloads.
     src_sd: dict | None = None
+    num_contributors = 1  # Default to 1 if no gather_result
     if (
         on_src
         and gather_result is not None
@@ -271,6 +275,12 @@ def outer_step(
     ):
         sd = gather_result.state_dict
         src_sd = vars(sd).copy() if isinstance(sd, SimpleNamespace) else dict(sd)
+        # Get number of miners that successfully contributed gradients
+        # This is needed to scale gradients correctly since scatter_reduce with "mean"
+        # averages overlapping indices, reducing gradient magnitude
+        num_contributors = len(getattr(gather_result, "uids", []))
+        if num_contributors == 0:
+            num_contributors = 1  # Safety fallback
 
     # compact flag broadcast
     def _bcast_flag(v: int) -> int:
@@ -365,6 +375,7 @@ def outer_step(
                 full_grad_src = full_grad_src.to(
                     dtype=p.dtype, device=p.device, non_blocking=True
                 )
+                # No scaling needed with reduce="sum" - overlapping indices are already summed
             finally:
                 # Free intermediate pieces ASAP (existence-guarded)
                 try:
@@ -385,6 +396,10 @@ def outer_step(
                 if on_src
                 else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
+            if on_src and name in ["layers.0.attention.wq.weight", "output.weight"]:
+                src_grad_norm = full_grad_src.norm().item()
+                param_norm_before = p.to_local().norm().item()
+            
             new_grad = distribute_tensor(
                 src_tensor,
                 device_mesh=p.device_mesh,
@@ -403,6 +418,9 @@ def outer_step(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
+
+            if name in ["layers.0.attention.wq.weight", "output.weight"]:
+                distributed_local_norm = local_view.norm().item()
 
             p.grad = new_grad  # DTensor grad
             del new_grad, local_view
@@ -447,7 +465,25 @@ def outer_step(
             weight_norms.append(weight_norm)
 
         # ---- apply update immediately for THIS param and free its grad ----
+        if name in ["layers.0.attention.wq.weight", "output.weight"]:
+            if isinstance(p, DT):
+                param_before = p.to_local().data.clone()
+            else:
+                param_before = p.data.clone()
+        
         optimizer.step()
+        
+        if name in ["layers.0.attention.wq.weight", "output.weight"]:
+            if isinstance(p, DT):
+                param_after = p.to_local().data
+                param_change = (param_after - param_before).norm().item()
+                param_after_norm = param_after.norm().item()
+            else:
+                param_after = p.data
+                param_change = (param_after - param_before).norm().item()
+                param_after_norm = param_after.norm().item()
+            del param_before
+        
         p.grad = None  # free grad storage right away
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -471,6 +507,12 @@ def outer_step(
     optimizer.zero_grad(set_to_none=True)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    if grad_norms and on_src:
+        import statistics
+        grad_mean = statistics.mean(grad_norms)
+        grad_median = statistics.median(grad_norms)
+        weight_mean = statistics.mean(weight_norms) if weight_norms else 0
 
     # Return gradient and weight norm statistics for logging
     return {
@@ -530,9 +572,10 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
     # Update peers, if it's time
     if instance.next_peers is not None and window >= instance.peers_update_window:
         # ── atomic switch ─────────────────────────────────────────────
-        instance.comms.peers = instance.next_peers
+        # Filter out self from peer list to avoid gathering own gradients
+        instance.comms.peers = [uid for uid in instance.next_peers if uid != instance.uid]
         instance.comms.reserve_peers = (
-            instance.next_reserve_peers
+            [uid for uid in instance.next_reserve_peers if uid != instance.uid]
             if instance.next_reserve_peers is not None
             else []
         )
@@ -540,6 +583,10 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
             f"{window - instance.peers_update_window} windows late"
             if window - instance.peers_update_window > 0
             else "on time"
+        )
+        tplr.logger.info(
+            f"[PEER_DEBUG] UID {instance.uid}: next_peers={instance.next_peers}, "
+            f"filtered peers={instance.comms.peers}"
         )
         tplr.logger.info(
             f"{tplr.P(window, tplr.T() - peer_start)} Updated peers "
@@ -1127,7 +1174,10 @@ async def compare_model_with_debug_dict(
 
         # --- grab the slice we care about --------------------------------
         if isinstance(p, DT):
-            curr_slice = p.to_local().data.flatten()[index_range[0] : index_range[1]]
+            # [TP FIX] Use full_tensor() to compare with published debug values
+            # This is safe here because the validator calls this comparison sequentially per miner
+            full_param = p.full_tensor()
+            curr_slice = full_param.data.flatten()[index_range[0] : index_range[1]]
         else:
             curr_slice = p.data.flatten()[index_range[0] : index_range[1]]
 

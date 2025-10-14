@@ -232,8 +232,26 @@ class Miner(BaseNode, Trainer):
         self.totalks = {}
         model_iterator = self.model.named_parameters()
 
+        # [TP FIX] Make parameter ownership TP-aware
+        # In TP, all ranks in the same TP group must own the SAME parameters
+        # Only shard parameter ownership across DP dimension
+        import os
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        
+        if tp_degree > 1:
+            # Calculate DP rank (which TP group this rank belongs to)
+            dp_rank = self.rank // tp_degree
+            dp_world_size = self.world_size // tp_degree
+            tplr.logger.info(
+                f"[TP Ownership] TP={tp_degree}, rank={self.rank}, "
+                f"dp_rank={dp_rank}, dp_world_size={dp_world_size}"
+            )
+        else:
+            dp_rank = self.rank
+            dp_world_size = self.world_size
+
         for idx, (n, p) in enumerate(model_iterator):
-            if idx % self.world_size == self.rank:
+            if idx % dp_world_size == dp_rank:
                 # this rank "owns" the parameter
                 self.owned_params.add(n)
                 # For DTensors, create error feedback based on full tensor since TP is not supported
@@ -596,9 +614,33 @@ class Miner(BaseNode, Trainer):
             processed_state_dict = {}
             if self.is_master:
                 assert gathered is not None
+                # [TP FIX] Add rank suffix to avoid parameter name collisions in TP
+                import os
+                tp_degree = int(os.environ.get("TP_DEGREE", 1))
+                
                 for i, shard in enumerate(gathered):
                     if shard is not None:
-                        gradient.update(shard)
+                        if tp_degree > 1:
+                            # Add rank suffix to all parameter names to avoid overwriting
+                            # Insert rank suffix BEFORE the final suffix (idxs/vals/quant_params)
+                            for key, value in shard.items():
+                                if key != "metadata":  # Don't add suffix to metadata
+                                    # Insert rank suffix before the last suffix
+                                    if key.endswith("idxs"):
+                                        new_key = key[:-4] + f"_rank{i}idxs"
+                                    elif key.endswith("vals"):
+                                        new_key = key[:-4] + f"_rank{i}vals"
+                                    elif key.endswith("quant_params"):
+                                        new_key = key[:-12] + f"_rank{i}quant_params"
+                                    else:
+                                        # Fallback for any other keys
+                                        new_key = f"{key}_rank{i}"
+                                    gradient[new_key] = value
+                                else:
+                                    gradient[key] = value
+                        else:
+                            # FSDP/DDP: no collisions, can use simple update
+                            gradient.update(shard)
                         gathered[i] = None  # Free memory immediately after using shard
 
                 # dataset metadata
@@ -758,26 +800,28 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
+            # [TP FIX] Create debug dict with all ranks participating in collective ops
+            # All ranks must call full_tensor() for DTensors, then only master uploads
+            debug_dict = {}
+            
+            # Add model parameters debug info (all ranks participate)
+            for name, param in self.model.named_parameters():
+                if param is not None:
+                    if isinstance(param, DT):
+                        # All ranks participate in full_tensor() collective operation
+                        full_param = param.full_tensor()
+                        if self.is_master and full_param.numel() >= 2:
+                            debug_dict[name + "_debug"] = (
+                                full_param.flatten()[10:12].detach().cpu().tolist()
+                            )
+                    else:
+                        if self.is_master and param.numel() >= 2:
+                            debug_dict[name + "_debug"] = (
+                                param.flatten()[10:12].detach().cpu().tolist()
+                            )
+
+            # Only master uploads the debug dictionary
             if self.is_master:
-                # Add debug data including successfully gathered peers
-                debug_dict = {}
-
-                # Add model parameters debug info
-                for name, param in self.model.named_parameters():
-                    if param is not None:
-                        # Handle DTensor vs regular tensor
-                        if isinstance(param, DT):
-                            local_param = param.to_local()
-                            if local_param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    local_param.flatten()[10:12].detach().cpu().tolist()
-                                )
-                        else:
-                            if param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    param.flatten()[10:12].detach().cpu().tolist()
-                                )
-
                 # Add successful peers information
                 if gather_result is not None:
                     debug_dict["successful_peers"] = sorted(

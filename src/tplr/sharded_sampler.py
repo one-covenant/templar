@@ -15,6 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import os
 import time
 from abc import ABC, abstractmethod
 
@@ -76,7 +77,34 @@ class _BaseWindowSampler(Sampler, ABC):
         self.uid, self.window = uid, window
 
         global_indices = self._global_indices()
-        self._local = global_indices[self.rank :: self.world_size].tolist()
+        
+        # [TP FIX] Make sampler TP-aware: only shard across DP dimension
+        # With TP, all ranks in the same TP group must see the SAME data
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        
+        if tp_degree > 1 and self.world_size >= tp_degree:
+            # Calculate DP rank (which TP group this rank belongs to)
+            # Example: TP=2, ranks [0,1] are TP group 0, ranks [2,3] are TP group 1
+            dp_rank = self.rank // tp_degree
+            dp_world_size = self.world_size // tp_degree
+            
+            # [FIX] Handle edge case: if world_size < tp_degree (e.g., digest calculation with world_size=1)
+            # then dp_world_size would be 0, causing "slice step cannot be zero"
+            # In this case, fall back to no sharding (use all indices)
+            if dp_world_size == 0:
+                self._local = global_indices.tolist()
+            else:
+                # Shard only across DP dimension (all ranks in same TP group get same data)
+                self._local = global_indices[dp_rank :: dp_world_size].tolist()
+            
+            if self.rank == 0:
+                tplr.logger.info(
+                    f"[TP Sampler] TP={tp_degree}, rank={self.rank}, dp_rank={dp_rank}, "
+                    f"dp_world_size={dp_world_size}, got {len(self._local)} indices"
+                )
+        else:
+            # Original behavior: shard across all ranks (for FSDP/DDP)
+            self._local = global_indices[self.rank :: self.world_size].tolist()
 
     def __iter__(self):
         return iter(self._local)
