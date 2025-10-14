@@ -2239,7 +2239,7 @@ class Validator(BaseNode, Trainer):
             self.outer_optimizer.zero_grad()
             self.model.zero_grad()
 
-            tplr.neurons.outer_step(
+            gradient_fingerprint = tplr.neurons.outer_step(
                 self.model,
                 self.outer_optimizer,
                 gather_result=gather_result,
@@ -2255,7 +2255,16 @@ class Validator(BaseNode, Trainer):
                 global_step=self.global_step,
             )
             self.global_step += 1  # Increment only when we actually do an outer step
-            tplr.logger.info(f"Applied outer step #{self.global_step}")
+
+            if gradient_fingerprint is not None and self.is_master:
+                tplr.logger.info(
+                    f"Applied outer step #{self.global_step} | "
+                    f"Fingerprint: global_l2={gradient_fingerprint['global_l2_norm']:.6f}, "
+                    f"params={len(gradient_fingerprint['param_norms'])}, "
+                    f"elements={gradient_fingerprint['total_elements']}"
+                )
+            else:
+                tplr.logger.info(f"Applied outer step #{self.global_step}")
 
             # Add barrier after model update to ensure all ranks complete the update
             tplr.log_with_context(
@@ -2316,18 +2325,26 @@ class Validator(BaseNode, Trainer):
 
             # ↳ WandB
             if self.is_master:
-                self.wandb.log(
-                    {
-                        "gradient/mean_grad_norm": mean_grad_norm,
-                        "gradient/max_grad_norm": max_grad_norm,
-                        "gradient/min_grad_norm": min_grad_norm,
-                        "gradient/median_grad_norm": median_grad_norm,
-                        "gradient/grad_norm_std": grad_norm_std,
-                        "gradient/mean_weight_norm": mean_weight_norm,
-                        "gradient/grad_to_weight_ratio": grad_to_weight_ratio,
-                    },
-                    step=self.global_step,
-                )
+                wandb_metrics = {
+                    "gradient/mean_grad_norm": mean_grad_norm,
+                    "gradient/max_grad_norm": max_grad_norm,
+                    "gradient/min_grad_norm": min_grad_norm,
+                    "gradient/median_grad_norm": median_grad_norm,
+                    "gradient/grad_norm_std": grad_norm_std,
+                    "gradient/mean_weight_norm": mean_weight_norm,
+                    "gradient/grad_to_weight_ratio": grad_to_weight_ratio,
+                }
+
+                # Add gradient fingerprint metrics if available
+                if gradient_fingerprint is not None:
+                    wandb_metrics["gradient_fingerprint/global_l2_norm"] = (
+                        gradient_fingerprint["global_l2_norm"]
+                    )
+                    wandb_metrics["gradient_fingerprint/total_elements"] = (
+                        gradient_fingerprint["total_elements"]
+                    )
+
+                self.wandb.log(wandb_metrics, step=self.global_step)
 
                 # ↳ InfluxDB (metrics_logger)
                 self.metrics_logger.log(

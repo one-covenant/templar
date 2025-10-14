@@ -238,12 +238,15 @@ def outer_step(
     use_dct: bool = False,
     wandb_run: Run | None = None,
     global_step: int | None = None,
-) -> None:
+) -> dict | None:
     """
     Memory-minimizing variant:
       - Builds and applies ONE param's grad at a time.
       - Calls optimizer.step() per param (others have grad=None, so they're skipped).
       - Frees all temporaries and grad immediately after each step.
+
+    Returns:
+      Fingerprint dict containing gradient statistics (master rank only), or None.
     """
     model.train()
 
@@ -275,6 +278,16 @@ def outer_step(
     # optional stats
     min_median_norm = float("inf")
     max_median_norm = float("-inf")
+
+    # Initialize fingerprint accumulator (master rank only)
+    fingerprint: dict | None = None
+    if on_src:
+        fingerprint = {
+            "param_norms": {},
+            "param_means": {},
+            "total_norm_sq": 0.0,
+            "total_elements": 0,
+        }
 
     def _idx_to_device(obj, dev: str):
         """
@@ -357,6 +370,14 @@ def outer_step(
                 full_grad_src = full_grad_src.to(
                     dtype=p.dtype, device=p.device, non_blocking=True
                 )
+
+                # Accumulate fingerprint statistics for this parameter
+                if fingerprint is not None:
+                    param_norm = torch.norm(full_grad_src, p=2).item()
+                    fingerprint["param_norms"][name] = param_norm
+                    fingerprint["total_norm_sq"] += param_norm**2
+                    fingerprint["total_elements"] += full_grad_src.numel()
+                    fingerprint["param_means"][name] = full_grad_src.mean().item()
             finally:
                 # Free intermediate pieces ASAP (existence-guarded)
                 try:
@@ -448,6 +469,12 @@ def outer_step(
     optimizer.zero_grad(set_to_none=True)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # Compute final fingerprint (master rank only)
+    if on_src and fingerprint is not None:
+        fingerprint["global_l2_norm"] = math.sqrt(fingerprint["total_norm_sq"])
+        return fingerprint
+    return None
 
 
 async def update_peers(instance: NeuronT, window: int, peer_start: float) -> None:

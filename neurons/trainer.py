@@ -947,7 +947,7 @@ class Trainer:
         }
 
     def outer_step(self, gather_result, log_wandb: bool = False):
-        tplr.neurons.outer_step(
+        return tplr.neurons.outer_step(
             self.model,
             self.outer_optimizer,
             gather_result=gather_result,
@@ -960,5 +960,5 @@ class Trainer:
             world_size=self.world_size,
             use_dct=self.hparams.use_dct,
             wandb_run=self.wandb if self.is_master and log_wandb else None,
+            global_step=self.global_step,
         )
-        return
