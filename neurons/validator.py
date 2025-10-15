@@ -2874,6 +2874,10 @@ class Validator(BaseNode, Trainer):
             if selected_peers is not None and self.is_master:
                 self.last_peer_update_window = self.sync_window
                 gather_peers, reserve_peers = selected_peers
+                
+                self.comms.peers = gather_peers
+                self.comms.reserve_peers = reserve_peers
+                
                 await self.comms.post_peer_list(
                     peers=gather_peers,
                     reserve_peers=reserve_peers,
