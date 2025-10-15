@@ -5,9 +5,9 @@
     "num_attention_heads": 32,
     "num_key_value_heads": 8,
     "intermediate_size": 8192,
-    "sequence_length": 2046,
+    "sequence_length": 2040,
     "activation_function": "swiGLU",
-    "max_position_embeddings": 2046,
+    "max_position_embeddings": 2040,
     
     "batch_size": 64,
     "inner_steps": 16,
