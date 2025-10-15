@@ -8,7 +8,7 @@ const RANDOM_SUFFIX = execSync(
   .toString()
   .trim();
 
-const PROJECT_NAME = `TP-2B`;
+const PROJECT_NAME = `2.1.9+test.tp.2b`;
 
 module.exports = {
   apps: [
