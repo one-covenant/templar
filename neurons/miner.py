@@ -743,15 +743,24 @@ class Miner(BaseNode, Trainer):
             update_start = tplr.T()
 
             # Only perform outer step and increment counter if we have gradients to apply
+            gradient_fingerprint = None
             if should_update:
-                _ = self.outer_step(gather_result)
+                gradient_fingerprint = self.outer_step(gather_result)
                 self.global_step += (
                     1  # Increment only when we actually do an outer step
                 )
                 model_update_time = tplr.T() - update_start
-                tplr.logger.info(
-                    f"{tplr.P(step_window, model_update_time)} Updated model (Outer step #{self.global_step})"
-                )
+                if gradient_fingerprint is not None:
+                    tplr.logger.info(
+                        f"{tplr.P(step_window, model_update_time)} Updated model (Outer step #{self.global_step}) "
+                        f"Fingerprint: global_l2={gradient_fingerprint['global_l2_norm']:.6f}, "
+                        f"params={len(gradient_fingerprint['param_norms'])}, "
+                        f"elements={gradient_fingerprint['total_elements']}"
+                    )
+                else:
+                    tplr.logger.info(
+                        f"{tplr.P(step_window, model_update_time)} Updated model (Outer step #{self.global_step})"
+                    )
             else:
                 model_update_time = 0.0
                 tplr.logger.info(
@@ -777,6 +786,17 @@ class Miner(BaseNode, Trainer):
                                 debug_dict[name + "_debug"] = (
                                     param.flatten()[10:12].detach().cpu().tolist()
                                 )
+
+                # Add gradient fingerprint if available
+                if gradient_fingerprint is not None:
+                    debug_dict["gradient_fingerprint"] = {
+                        "global_l2_norm": gradient_fingerprint["global_l2_norm"],
+                        "total_elements": gradient_fingerprint["total_elements"],
+                        # Store only first 5 param norms to avoid bloat
+                        "sample_param_norms": dict(
+                            list(gradient_fingerprint["param_norms"].items())[:5]
+                        ),
+                    }
 
                 # Add successful peers information
                 if gather_result is not None:
@@ -863,6 +883,15 @@ class Miner(BaseNode, Trainer):
                     # Add Adam optimizer metrics (prefixed with miner/)
                     for key, value in adam_metrics.items():
                         wandb_metrics[f"miner/{key}"] = value
+
+                    # Add gradient fingerprint metrics if available
+                    if gradient_fingerprint is not None:
+                        wandb_metrics["miner/gradient_fingerprint/global_l2_norm"] = (
+                            gradient_fingerprint["global_l2_norm"]
+                        )
+                        wandb_metrics["miner/gradient_fingerprint/total_elements"] = (
+                            gradient_fingerprint["total_elements"]
+                        )
 
                     self.wandb.log(wandb_metrics, step=self.global_step)
 

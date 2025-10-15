@@ -2239,7 +2239,7 @@ class Validator(BaseNode, Trainer):
             self.outer_optimizer.zero_grad()
             self.model.zero_grad()
 
-            tplr.neurons.outer_step(
+            gradient_fingerprint = tplr.neurons.outer_step(
                 self.model,
                 self.outer_optimizer,
                 gather_result=gather_result,
@@ -2255,7 +2255,16 @@ class Validator(BaseNode, Trainer):
                 global_step=self.global_step,
             )
             self.global_step += 1  # Increment only when we actually do an outer step
-            tplr.logger.info(f"Applied outer step #{self.global_step}")
+
+            if gradient_fingerprint is not None and self.is_master:
+                tplr.logger.info(
+                    f"Applied outer step #{self.global_step} | "
+                    f"Fingerprint: global_l2={gradient_fingerprint['global_l2_norm']:.6f}, "
+                    f"params={len(gradient_fingerprint['param_norms'])}, "
+                    f"elements={gradient_fingerprint['total_elements']}"
+                )
+            else:
+                tplr.logger.info(f"Applied outer step #{self.global_step}")
 
             # Add barrier after model update to ensure all ranks complete the update
             tplr.log_with_context(
@@ -2316,18 +2325,26 @@ class Validator(BaseNode, Trainer):
 
             # ↳ WandB
             if self.is_master:
-                self.wandb.log(
-                    {
-                        "gradient/mean_grad_norm": mean_grad_norm,
-                        "gradient/max_grad_norm": max_grad_norm,
-                        "gradient/min_grad_norm": min_grad_norm,
-                        "gradient/median_grad_norm": median_grad_norm,
-                        "gradient/grad_norm_std": grad_norm_std,
-                        "gradient/mean_weight_norm": mean_weight_norm,
-                        "gradient/grad_to_weight_ratio": grad_to_weight_ratio,
-                    },
-                    step=self.global_step,
-                )
+                wandb_metrics = {
+                    "gradient/mean_grad_norm": mean_grad_norm,
+                    "gradient/max_grad_norm": max_grad_norm,
+                    "gradient/min_grad_norm": min_grad_norm,
+                    "gradient/median_grad_norm": median_grad_norm,
+                    "gradient/grad_norm_std": grad_norm_std,
+                    "gradient/mean_weight_norm": mean_weight_norm,
+                    "gradient/grad_to_weight_ratio": grad_to_weight_ratio,
+                }
+
+                # Add gradient fingerprint metrics if available
+                if gradient_fingerprint is not None:
+                    wandb_metrics["gradient_fingerprint/global_l2_norm"] = (
+                        gradient_fingerprint["global_l2_norm"]
+                    )
+                    wandb_metrics["gradient_fingerprint/total_elements"] = (
+                        gradient_fingerprint["total_elements"]
+                    )
+
+                self.wandb.log(wandb_metrics, step=self.global_step)
 
                 # ↳ InfluxDB (metrics_logger)
                 self.metrics_logger.log(
@@ -4025,37 +4042,38 @@ class Validator(BaseNode, Trainer):
 
                 consecutive_count = self.consecutive_missing_gradient_count[uid]
 
-                # Check for mega slash (>50% missing in last 8 windows)
+                # Calculate miss statistics from history (used for both mega slash and logging)
                 history = self.missing_gradient_history[uid]
-                if len(history) >= 8:
-                    missing_count = sum(history)  # True counts as 1
-                    missing_ratio = missing_count / len(history)
+                missing_count = sum(history)  # True counts as 1
+                missing_ratio = missing_count / len(history) if len(history) > 0 else 0
+                miss_percentage = missing_ratio * 100
 
-                    if missing_ratio > 0.5:
-                        tplr.log_with_context(
-                            level="warning",
-                            message=f"UID {uid} missed gradient in {missing_count}/{len(history)} "
-                            f"of last {len(history)} windows ({missing_ratio:.1%}). "
-                            f"MEGA SLASH: adding to naughty list for {self.naughty_peer_timeout} windows"
-                            + (
-                                " and resetting peer."
-                                if old_score > 0
-                                else " (score non-positive, not resetting)."
-                            ),
-                            sync_window=self.sync_window,
-                            current_window=self.current_window,
-                        )
-                        # Always add to naughty list
-                        self.naughty_peers[uid] = self.naughty_peer_timeout
-                        # Only reset if score is positive
-                        if old_score > 0:
-                            self.reset_peer(uid)
-                        self.evaluated_uids.add(uid)
-                        self.peers_last_eval_window[uid] = self.sync_window
+                # Check for mega slash (>50% missing in last 8 windows)
+                if len(history) >= 8 and missing_ratio >= 0.5:
+                    tplr.log_with_context(
+                        level="warning",
+                        message=f"UID {uid} missed gradient in {missing_count}/{len(history)} "
+                        f"of last {len(history)} windows ({missing_ratio:.1%}). "
+                        f"MEGA SLASH: adding to naughty list for {self.naughty_peer_timeout} windows"
+                        + (
+                            " and resetting peer."
+                            if old_score > 0
+                            else " (score non-positive, not resetting)."
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    # Always add to naughty list
+                    self.naughty_peers[uid] = self.naughty_peer_timeout
+                    # Only reset if score is positive
+                    if old_score > 0:
+                        self.reset_peer(uid)
+                    self.evaluated_uids.add(uid)
+                    self.peers_last_eval_window[uid] = self.sync_window
 
-                        # Record missing gradient for OpenSkill scoring
-                        self.record_missing_gradient_for_openskill(uid)
-                        continue
+                    # Record missing gradient for OpenSkill scoring
+                    self.record_missing_gradient_for_openskill(uid)
+                    continue
 
                 # Determine slash multiplier based on success rate and consecutive count
                 if success_rate < self.hparams.gather_peers_slash_threshold:
@@ -4071,7 +4089,9 @@ class Validator(BaseNode, Trainer):
 
                 tplr.log_with_context(
                     level="info",
-                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. Success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
+                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. "
+                    f"Miss rate: {miss_percentage:.1f}% ({missing_count}/{len(history)} recent windows). "
+                    f"Gather success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
                     sync_window=self.sync_window,
                     current_window=self.current_window,
                 )

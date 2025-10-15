@@ -246,14 +246,14 @@ def test_slash_for_missing_gradients_below_threshold(validator_instance):
     uid = 3
     success_rate = 0.5
 
-    # Simulate 4 missing and 4 successful gradients (4/8 = 50%, not > 50%)
+    # Simulate 2 missing and 5 successful gradients (2/7 initially)
+    # After appending one more miss, becomes 3/8 = 37.5% < 50%
     validator.missing_gradient_history[uid] = deque(
-        [True, False, True, False, True, False, True, False], maxlen=8
+        [True, False, False, False, True, False, False], maxlen=8
     )
     validator.consecutive_missing_gradient_count[uid] = 1
 
-    # Next miss should NOT trigger mega slash (after append, deque becomes
-    # [False, True, False, True, False, True, False, True] which is 4/8 = 50%)
+    # Next miss should NOT trigger mega slash (3/8 = 37.5% < 50%)
     validator.slash_for_missing_gradients([uid], success_rate)
 
     # Should NOT be in naughty list (mega slash not triggered)
