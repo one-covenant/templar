@@ -1078,9 +1078,17 @@ async def catchup_with_aggregation_server(
 
         dist_helper.safe_barrier("catchup_post_window", instance.local_rank)
 
-        # If the chain progressed while we were busy, extend the target.
+        # If the chain progressed while we were busy, extend the target, but cap it
+        # to prevent infinite catch-up if we're falling behind faster than we can catch up
+        MAX_CATCHUP_WINDOWS = 5
         if instance.current_window > target_w:
-            target_w = instance.current_window
+            old_target = target_w
+            target_w = min(instance.current_window, start_w + MAX_CATCHUP_WINDOWS)
+            if target_w != instance.current_window:
+                tplr.logger.warning(
+                    f"Chain at window {instance.current_window}, but capping catch-up target "
+                    f"from {old_target} to {target_w} (max {MAX_CATCHUP_WINDOWS} windows ahead)"
+                )
 
     # Final aggressive memory cleanup
     gc.collect()
