@@ -1183,7 +1183,7 @@ async def compare_model_with_debug_dict(
         "avg_l2_norm": avg_l2_norm,
         "avg_abs_diff": avg_abs_diff,
         "max_diff": max_diff,
-        "avg_steps_behind": median_steps,
+        "avg_steps_behind": interquartile_mean_steps,
         "interquartile_mean_steps_behind": interquartile_mean_steps,
         "max_steps_behind": max_steps,
         "param_count": param_count,
