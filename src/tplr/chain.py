@@ -400,6 +400,8 @@ class ChainManager:
                 logger.warning("No gather peers either. Skipping update.")
                 return
 
+        self.peers = list(active_peers)
+        
         # ---------------------------------------------------------------
         # Convert self.eval_peers into a dict while retaining old counts
         # for peers still active with stake <= 1000.
@@ -412,5 +414,6 @@ class ChainManager:
 
         logger.debug(f"Filtered eval peers: {list(self.eval_peers.keys())}")
 
+        logger.info(f"Total gather peers: {len(self.peers)}")
         logger.info(f"Total evaluation peers: {len(self.eval_peers)}")
         logger.info(f"Total inactive peers: {len(self.inactive_peers)}")
