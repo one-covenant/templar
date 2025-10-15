@@ -21,7 +21,7 @@ module.exports = {
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "3",
+        "--nproc_per_node", "2",
         "neurons/miner.py",
         "--wallet.name", "templar_test",
         "--wallet.hotkey", "M1",
@@ -35,8 +35,8 @@ module.exports = {
         ...process.env,
         PROJECT_NAME,
         DP_SHARD: "1",
-        TP_DEGREE: "3",
-        CUDA_VISIBLE_DEVICES: "0,1,2"
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "0,1"
       }
     },
     {
@@ -47,7 +47,7 @@ module.exports = {
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "3",
+        "--nproc_per_node", "2",
         "neurons/miner.py",
         "--wallet.name", "templar_test",
         "--wallet.hotkey", "M2",
@@ -61,8 +61,8 @@ module.exports = {
         ...process.env,
         PROJECT_NAME,
         DP_SHARD: "1",
-        TP_DEGREE: "3",
-        CUDA_VISIBLE_DEVICES: "3,4,5"
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "2,3"
       }
     },
 
@@ -90,7 +90,7 @@ module.exports = {
         PROJECT_NAME,
         DP_SHARD: "1",
         TP_DEGREE: "2",
-        CUDA_VISIBLE_DEVICES: "6,7",
+        CUDA_VISIBLE_DEVICES: "4,5",
         MAX_CATCHUP_WINDOWS: "5"
       }
     }
