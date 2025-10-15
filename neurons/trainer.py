@@ -121,34 +121,6 @@ class Trainer:
                 world_size=self.world_size,
             )
             
-            # [TP_DEBUG] Log model initialization details
-            import torch.distributed as dist
-            if dist.is_initialized():
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-                
-                # Check if using TP
-                tp_degree = int(os.environ.get("TP_DEGREE", 1))
-                dp_shard = int(os.environ.get("DP_SHARD", world_size))
-                
-                tplr.logger.info(
-                    f"[TP_DEBUG Init] Rank {rank}/{world_size}, TP_DEGREE={tp_degree}, "
-                    f"DP_SHARD={dp_shard}, role={role}"
-                )
-                
-                # Sample a few parameters to check DTensor setup
-                for name, param in list(self.model.named_parameters())[:3]:
-                    param_type = type(param).__name__
-                    if hasattr(param, 'device_mesh'):
-                        tplr.logger.info(
-                            f"[TP_DEBUG Init] {name}: {param_type}, shape={param.shape}, "
-                            f"device_mesh={param.device_mesh}"
-                        )
-                    else:
-                        tplr.logger.info(
-                            f"[TP_DEBUG Init] {name}: {param_type}, shape={param.shape} (not DTensor)"
-                        )
-            
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
@@ -787,17 +759,6 @@ class Trainer:
                     labels = torch.where(
                         labels == self.tokenizer.pad_token_id, -100, labels
                     )
-                    
-                    # [TP_DEBUG] Log input data hash to verify both shards see same data
-                    if batch_count <= 2 and self.is_master:  # Only first few batches
-                        import torch.distributed as dist
-                        if dist.is_initialized():
-                            rank = dist.get_rank()
-                            input_hash = int(input_ids.sum().item()) % 1000000
-                            tplr.logger.info(
-                                f"[TP_DEBUG Data] Rank {rank}, Batch {batch_count}, "
-                                f"input_hash={input_hash}, shape={input_ids.shape}"
-                            )
 
                 # ------------------------------------------------------------------ #
                 # 3. Forward + backward
@@ -810,17 +771,6 @@ class Trainer:
 
                     loss = calculated_loss / self.sampler.grad_accum_steps
                     loss_item = calculated_loss.detach().item()
-                    
-                    # [TP_DEBUG] Log forward pass outputs
-                    if batch_count <= 2 and self.is_master:
-                        import torch.distributed as dist
-                        if dist.is_initialized():
-                            rank = dist.get_rank()
-                            output_norm = outputs.float().norm().item()
-                            tplr.logger.info(
-                                f"[TP_DEBUG Forward] Rank {rank}, Batch {batch_count}, "
-                                f"loss={loss_item:.4f}, output_norm={output_norm:.4f}"
-                            )
 
                 # -------------------------------------------------------------- #
                 # 3-a.  Back-prop with no_sync() on non-final micro-batches
@@ -838,22 +788,6 @@ class Trainer:
                         sync_ctx = nullcontext()
                     with sync_ctx:
                         self.scaler.scale(loss).backward()
-                    
-                    # [TP_DEBUG] Log gradients after backward
-                    if batch_count <= 2 and final_micro_batch and self.is_master:
-                        import torch.distributed as dist
-                        if dist.is_initialized():
-                            rank = dist.get_rank()
-                            # Check gradients on a few key parameters
-                            grad_info = []
-                            for name, param in list(self.model.named_parameters())[:5]:
-                                if param.grad is not None:
-                                    grad_norm = param.grad.float().norm().item()
-                                    grad_info.append(f"{name}={grad_norm:.4f}")
-                            tplr.logger.info(
-                                f"[TP_DEBUG Backward] Rank {rank}, Batch {batch_count}, "
-                                f"grads: {', '.join(grad_info)}"
-                            )
 
                 total_loss += loss_item
                 local_loss_sum += loss_item  # defer collective
