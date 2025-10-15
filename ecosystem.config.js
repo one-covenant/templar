@@ -90,7 +90,8 @@ module.exports = {
         PROJECT_NAME,
         DP_SHARD: "1",
         TP_DEGREE: "2",
-        CUDA_VISIBLE_DEVICES: "4,5"
+        CUDA_VISIBLE_DEVICES: "4,5",
+        MAX_CATCHUP_WINDOWS: "5"
       }
     }
   ]
