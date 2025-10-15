@@ -232,13 +232,9 @@ class Miner(BaseNode, Trainer):
         self.totalks = {}
         model_iterator = self.model.named_parameters()
 
-        # [TP FIX] Make parameter ownership TP-aware
         # In TP, all ranks in the same TP group must own the SAME parameters
-        # Only shard parameter ownership across DP dimension
-        import os
         tp_degree = int(os.environ.get("TP_DEGREE", 1))
-        
-        if tp_degree > 1:
+        if tp_degree > 1 and self.world_size >= tp_degree and (self.world_size % tp_degree == 0):
             # Calculate DP rank (which TP group this rank belongs to)
             dp_rank = self.rank // tp_degree
             dp_world_size = self.world_size // tp_degree
@@ -776,7 +772,6 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
-            # [TP FIX] Create debug dict with all ranks participating in collective ops
             # All ranks must call full_tensor() for DTensors, then only master uploads
             debug_dict = {}
             
