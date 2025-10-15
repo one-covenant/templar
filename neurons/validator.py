@@ -3003,7 +3003,6 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
-            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 

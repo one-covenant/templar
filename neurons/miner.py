@@ -781,15 +781,17 @@ class Miner(BaseNode, Trainer):
                     if isinstance(param, DT):
                         # All ranks participate in full_tensor() collective operation
                         full_param = param.full_tensor()
-                        if self.is_master and full_param.numel() >= 2:
-                            debug_dict[name + "_debug"] = (
-                                full_param.flatten()[10:12].detach().cpu().tolist()
-                            )
+                        if self.is_master and full_param.numel() > 0:
+                            flat = full_param.flatten()
+                            # Sample last 2 elements if available, else last 1
+                            sample = flat[-2:] if flat.numel() >= 2 else flat[:1]
+                            debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
                     else:
-                        if self.is_master and param.numel() >= 2:
-                            debug_dict[name + "_debug"] = (
-                                param.flatten()[10:12].detach().cpu().tolist()
-                            )
+                        if self.is_master and param.numel() > 0:
+                            flat = param.flatten()
+                            # Sample last 2 elements if available, else last 1
+                            sample = flat[-2:] if flat.numel() >= 2 else flat[:1]
+                            debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
 
             # Only master uploads the debug dictionary
             if self.is_master:

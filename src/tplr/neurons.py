@@ -817,8 +817,8 @@ async def catchup_with_aggregation_server(
             cmp = await compare_model_with_debug_dict(
                 instance.model,
                 debug_dict,
-                param_avg_change={},  # Empty since we haven't started tracking yet
                 learning_rate=instance.hparams.learning_rate,
+                param_avg_change={},  # Empty since we haven't started tracking yet
             )
             if cmp["success"]:
                 tplr.logger.info(
@@ -1066,7 +1066,6 @@ async def catchup_with_aggregation_server(
                     model=instance.model,
                     debug_dict=debug_dict if debug_dict is not None else {},
                     learning_rate=lr,
-                    index_range=(0, 2),
                     param_avg_change=param_avg_change if param_avg_change else {},
                 )
 
@@ -1126,7 +1125,6 @@ async def compare_model_with_debug_dict(
     param_avg_change: dict[str, torch.Tensor] | None = None,
     *,
     min_step_size: float = 1e-9,
-    index_range: tuple[int, int] = (0, 2),
 ) -> dict[str, bool | float | int]:
     """
     Compare weights with published debug snippets and return sync metrics.
@@ -1155,11 +1153,14 @@ async def compare_model_with_debug_dict(
             continue
 
         # --- grab the slice we care about --------------------------------
+        # Match miner's sampling strategy: last 2 elements if available, else last 1
         if isinstance(p, DT):
             full_param = p.full_tensor()
-            curr_slice = full_param.data.flatten()[index_range[0] : index_range[1]]
+            flat = full_param.data.flatten()
+            curr_slice = flat[-2:] if flat.numel() >= 2 else flat[:1]
         else:
-            curr_slice = p.data.flatten()[index_range[0] : index_range[1]]
+            flat = p.data.flatten()
+            curr_slice = flat[-2:] if flat.numel() >= 2 else flat[:1]
 
         debug_slice = torch.tensor(
             debug_dict[key], dtype=p.dtype, device=curr_slice.device
