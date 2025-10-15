@@ -123,10 +123,12 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             grp_g = get_mesh_group(g)
             barrier(grp_g)
             assert g is not None
+            # DEBUG: Log gradient magnitude before full_tensor
             local_grad_norm = g.to_local().norm().item()
             grad_full = g.full_tensor().to(p.device)
             full_grad_norm = grad_full.norm().item()
             if dist.get_rank() == 0 and n in ["layers.0.attention.wq.weight", "output.weight"]:
+                print(f"[TP_DEBUG prepare_gradient] {n}: local_norm={local_grad_norm:.6f}, full_norm={full_grad_norm:.6f}, ratio={full_grad_norm/local_grad_norm if local_grad_norm > 0 else 0:.2f}")
             barrier(grp_g)
         else:
             if g is None and not p_is_dt:
@@ -396,9 +398,11 @@ def outer_step(
                 if on_src
                 else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
+            # DEBUG: Log aggregated gradient norm before distribute
             if on_src and name in ["layers.0.attention.wq.weight", "output.weight"]:
                 src_grad_norm = full_grad_src.norm().item()
                 param_norm_before = p.to_local().norm().item()
+                print(f"[TP_DEBUG outer_step PRE] {name}: num_contributors={num_contributors}, src_grad_norm={src_grad_norm:.6f}, param_norm_before={param_norm_before:.6f}")
             
             new_grad = distribute_tensor(
                 src_tensor,
@@ -419,8 +423,10 @@ def outer_step(
                     torch.cuda.empty_cache()
                 continue
 
+            # DEBUG: Log distributed gradient norm
             if name in ["layers.0.attention.wq.weight", "output.weight"]:
                 distributed_local_norm = local_view.norm().item()
+                print(f"[TP_DEBUG outer_step DIST] {name} rank={dist.get_rank()}: distributed_local_norm={distributed_local_norm:.6f}")
 
             p.grad = new_grad  # DTensor grad
             del new_grad, local_view
@@ -465,6 +471,7 @@ def outer_step(
             weight_norms.append(weight_norm)
 
         # ---- apply update immediately for THIS param and free its grad ----
+        # DEBUG: Capture param norm before step
         if name in ["layers.0.attention.wq.weight", "output.weight"]:
             if isinstance(p, DT):
                 param_before = p.to_local().data.clone()
@@ -473,6 +480,7 @@ def outer_step(
         
         optimizer.step()
         
+        # DEBUG: Log parameter change after step
         if name in ["layers.0.attention.wq.weight", "output.weight"]:
             if isinstance(p, DT):
                 param_after = p.to_local().data
@@ -482,6 +490,7 @@ def outer_step(
                 param_after = p.data
                 param_change = (param_after - param_before).norm().item()
                 param_after_norm = param_after.norm().item()
+            print(f"[TP_DEBUG outer_step POST] {name} rank={dist.get_rank()}: param_change={param_change:.6f}, param_after_norm={param_after_norm:.6f}, change_ratio={param_change/param_after_norm if param_after_norm > 0 else 0:.8f}")
             del param_before
         
         p.grad = None  # free grad storage right away
@@ -508,11 +517,13 @@ def outer_step(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # DEBUG: Log overall gradient statistics
     if grad_norms and on_src:
         import statistics
         grad_mean = statistics.mean(grad_norms)
         grad_median = statistics.median(grad_norms)
         weight_mean = statistics.mean(weight_norms) if weight_norms else 0
+        print(f"[TP_DEBUG outer_step SUMMARY] num_contributors={num_contributors}, grad_mean={grad_mean:.6f}, grad_median={grad_median:.6f}, weight_mean={weight_mean:.6f}, g/w={grad_mean/weight_mean if weight_mean > 0 else 0:.8f}, num_params={len(grad_norms)}")
 
     # Return gradient and weight norm statistics for logging
     return {

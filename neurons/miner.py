@@ -614,33 +614,9 @@ class Miner(BaseNode, Trainer):
             processed_state_dict = {}
             if self.is_master:
                 assert gathered is not None
-                # [TP FIX] Add rank suffix to avoid parameter name collisions in TP
-                import os
-                tp_degree = int(os.environ.get("TP_DEGREE", 1))
-                
                 for i, shard in enumerate(gathered):
                     if shard is not None:
-                        if tp_degree > 1:
-                            # Add rank suffix to all parameter names to avoid overwriting
-                            # Insert rank suffix BEFORE the final suffix (idxs/vals/quant_params)
-                            for key, value in shard.items():
-                                if key != "metadata":  # Don't add suffix to metadata
-                                    # Insert rank suffix before the last suffix
-                                    if key.endswith("idxs"):
-                                        new_key = key[:-4] + f"_rank{i}idxs"
-                                    elif key.endswith("vals"):
-                                        new_key = key[:-4] + f"_rank{i}vals"
-                                    elif key.endswith("quant_params"):
-                                        new_key = key[:-12] + f"_rank{i}quant_params"
-                                    else:
-                                        # Fallback for any other keys
-                                        new_key = f"{key}_rank{i}"
-                                    gradient[new_key] = value
-                                else:
-                                    gradient[key] = value
-                        else:
-                            # FSDP/DDP: no collisions, can use simple update
-                            gradient.update(shard)
+                        gradient.update(shard)
                         gathered[i] = None  # Free memory immediately after using shard
 
                 # dataset metadata
