@@ -4042,37 +4042,38 @@ class Validator(BaseNode, Trainer):
 
                 consecutive_count = self.consecutive_missing_gradient_count[uid]
 
-                # Check for mega slash (>50% missing in last 8 windows)
+                # Calculate miss statistics from history (used for both mega slash and logging)
                 history = self.missing_gradient_history[uid]
-                if len(history) >= 8:
-                    missing_count = sum(history)  # True counts as 1
-                    missing_ratio = missing_count / len(history)
+                missing_count = sum(history)  # True counts as 1
+                missing_ratio = missing_count / len(history) if len(history) > 0 else 0
+                miss_percentage = missing_ratio * 100
 
-                    if missing_ratio > 0.5:
-                        tplr.log_with_context(
-                            level="warning",
-                            message=f"UID {uid} missed gradient in {missing_count}/{len(history)} "
-                            f"of last {len(history)} windows ({missing_ratio:.1%}). "
-                            f"MEGA SLASH: adding to naughty list for {self.naughty_peer_timeout} windows"
-                            + (
-                                " and resetting peer."
-                                if old_score > 0
-                                else " (score non-positive, not resetting)."
-                            ),
-                            sync_window=self.sync_window,
-                            current_window=self.current_window,
-                        )
-                        # Always add to naughty list
-                        self.naughty_peers[uid] = self.naughty_peer_timeout
-                        # Only reset if score is positive
-                        if old_score > 0:
-                            self.reset_peer(uid)
-                        self.evaluated_uids.add(uid)
-                        self.peers_last_eval_window[uid] = self.sync_window
+                # Check for mega slash (>50% missing in last 8 windows)
+                if len(history) >= 8 and missing_ratio >= 0.5:
+                    tplr.log_with_context(
+                        level="warning",
+                        message=f"UID {uid} missed gradient in {missing_count}/{len(history)} "
+                        f"of last {len(history)} windows ({missing_ratio:.1%}). "
+                        f"MEGA SLASH: adding to naughty list for {self.naughty_peer_timeout} windows"
+                        + (
+                            " and resetting peer."
+                            if old_score > 0
+                            else " (score non-positive, not resetting)."
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    # Always add to naughty list
+                    self.naughty_peers[uid] = self.naughty_peer_timeout
+                    # Only reset if score is positive
+                    if old_score > 0:
+                        self.reset_peer(uid)
+                    self.evaluated_uids.add(uid)
+                    self.peers_last_eval_window[uid] = self.sync_window
 
-                        # Record missing gradient for OpenSkill scoring
-                        self.record_missing_gradient_for_openskill(uid)
-                        continue
+                    # Record missing gradient for OpenSkill scoring
+                    self.record_missing_gradient_for_openskill(uid)
+                    continue
 
                 # Determine slash multiplier based on success rate and consecutive count
                 if success_rate < self.hparams.gather_peers_slash_threshold:
@@ -4088,7 +4089,9 @@ class Validator(BaseNode, Trainer):
 
                 tplr.log_with_context(
                     level="info",
-                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. Success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
+                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. "
+                    f"Miss rate: {miss_percentage:.1f}% ({missing_count}/{len(history)} recent windows). "
+                    f"Gather success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
                     sync_window=self.sync_window,
                     current_window=self.current_window,
                 )
