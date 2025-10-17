@@ -799,45 +799,51 @@ async def catchup_with_aggregation_server(
     log_memory_usage("Initial memory state")
 
     # Verify checkpoint loaded correctly before applying any gradients
-    if checkpoint_current_window > 0 and instance.is_master:
-        tplr.logger.info(
-            f"Verifying checkpoint state at window {checkpoint_current_window}"
-        )
-        debug_fetch = await instance.comms.get(
-            uid=str(leader_uid),
-            window=checkpoint_current_window,
-            key="debug",
-            local=False,
-            stale_retention=10,
-        )
-
-        if debug_fetch.success and isinstance(debug_fetch.data, dict):
-            debug_dict = debug_fetch.data  # validator's payload
-
-            cmp = await compare_model_with_debug_dict(
-                instance.model,
-                debug_dict,
-                learning_rate=instance.hparams.learning_rate,
-                param_avg_change={},  # Empty since we haven't started tracking yet
+    # Skip verification in multi-rank mode to avoid distributed synchronization issues
+    if checkpoint_current_window > 0 and instance.world_size == 1:
+        if instance.is_master:
+            tplr.logger.info(
+                f"Verifying checkpoint state at window {checkpoint_current_window}"
             )
-            if cmp["success"]:
-                tplr.logger.info(
-                    f"✓ Checkpoint verification: model matches window {checkpoint_current_window} "
-                    f"(l2_norm={cmp['l2_norm']:.4f}, avg_steps_behind={cmp['avg_steps_behind']:.3f})"
+            debug_fetch = await instance.comms.get(
+                uid=str(leader_uid),
+                window=checkpoint_current_window,
+                key="debug",
+                local=False,
+                stale_retention=10,
+            )
+
+            if debug_fetch.success and isinstance(debug_fetch.data, dict):
+                debug_dict = debug_fetch.data  # validator's payload
+                
+                cmp = await compare_model_with_debug_dict(
+                    instance.model,
+                    debug_dict,
+                    learning_rate=instance.hparams.learning_rate,
+                    param_avg_change={},  # Empty since we haven't started tracking yet
                 )
-                if cmp["l2_norm"] > 0.1:  # Threshold for acceptable difference
+                if cmp["success"]:
+                    tplr.logger.info(
+                        f"✓ Checkpoint verification: model matches window {checkpoint_current_window} "
+                        f"(l2_norm={cmp['l2_norm']:.4f}, avg_steps_behind={cmp['avg_steps_behind']:.3f})"
+                    )
+                    if cmp["l2_norm"] > 0.1:  # Threshold for acceptable difference
+                        tplr.logger.warning(
+                            f"⚠️ Large L2 norm difference detected: {cmp['l2_norm']:.4f}. "
+                            f"Checkpoint may not have loaded correctly."
+                        )
+                else:
                     tplr.logger.warning(
-                        f"⚠️ Large L2 norm difference detected: {cmp['l2_norm']:.4f}. "
-                        f"Checkpoint may not have loaded correctly."
+                        f"⚠️ Could not verify checkpoint state for window {checkpoint_current_window}"
                     )
             else:
-                tplr.logger.warning(
-                    f"⚠️ Could not verify checkpoint state for window {checkpoint_current_window}"
+                tplr.logger.info(
+                    f"No debug dict available for window {checkpoint_current_window}, skipping verification"
                 )
-        else:
-            tplr.logger.info(
-                f"No debug dict available for window {checkpoint_current_window}, skipping verification"
-            )
+    elif checkpoint_current_window > 0 and instance.world_size > 1:
+        tplr.logger.info(
+            f"Skipping checkpoint verification in multi-rank mode (world_size={instance.world_size})"
+        )
 
     prev_param_state: dict[str, torch.Tensor] = {}
     param_avg_change: dict[str, torch.Tensor] = {}

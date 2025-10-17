@@ -9,10 +9,10 @@
     "activation_function": "swiGLU",
     "max_position_embeddings": 2048,
     
-    "batch_size": 64,
-    "inner_steps": 16,
-    "outer_learning_rate": 0.4,
-    "blocks_per_window": 16,
+    "batch_size": 32,
+    "inner_steps": 8,
+    "outer_learning_rate": 0.1,
+    "blocks_per_window": 8,
     
     "offload_optimizer_states": false,
     
@@ -22,7 +22,7 @@
     "optimizer": {
         "type": "adamw",
         "adamw": {
-            "learning_rate": 3e-3
+            "learning_rate": 3e-4
         }
     },
     

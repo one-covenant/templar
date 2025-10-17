@@ -65,6 +65,32 @@ module.exports = {
         CUDA_VISIBLE_DEVICES: "2,3"
       }
     },
+    {
+      name            : "TM3",
+      exec_mode       : "fork",
+      exec_interpreter: "none",
+      script          : ".venv/bin/torchrun",
+      args: [
+        "--standalone",
+        "--nnodes", "1",
+        "--nproc_per_node", "2",
+        "neurons/miner.py",
+        "--wallet.name", "templar_test",
+        "--wallet.hotkey", "M3",
+        "--device", "cuda",
+        "--subtensor.network", "local",
+        "--netuid", "2",
+        "--use_wandb",
+        "--project", PROJECT_NAME
+      ],
+      env: {
+        ...process.env,
+        PROJECT_NAME,
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "4,5"
+      }
+    },
 
     /*──────────────────────── Validator ──────────────────────*/
     {
@@ -90,7 +116,7 @@ module.exports = {
         PROJECT_NAME,
         DP_SHARD: "1",
         TP_DEGREE: "2",
-        CUDA_VISIBLE_DEVICES: "4,5",
+        CUDA_VISIBLE_DEVICES: "6,7",
         MAX_CATCHUP_WINDOWS: "5"
       }
     }

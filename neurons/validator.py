@@ -1100,25 +1100,43 @@ class Validator(BaseNode, Trainer):
             from_bootstrap,
             aggregator_device="cpu",
         )
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} completed catch-up")
 
         current_shard = self.global_step // self.outer_steps_per_shard
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} about to initialize datasets")
         _ = await self.dataset_manager.initialize_datasets(current_shard)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} completed dataset initialization")
 
         # Synchronize all ranks after dataset initialization
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} entering dataset_init_complete barrier")
         dist_helper.safe_barrier("dataset_init_complete", self.local_rank)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} passed dataset_init_complete barrier")
 
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} about to set_dataloader")
         self.set_dataloader(validator=True)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} completed set_dataloader")
 
         if self.is_master:
+            tplr.logger.info(f"[STARTUP_DEBUG] Master starting commitment fetcher and background tasks")
             self.comms.start_commitment_fetcher()
             self.comms.start_background_tasks()
+            tplr.logger.info(f"[STARTUP_DEBUG] Master completed starting background tasks")
+        else:
+            tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank} (non-master) skipping background tasks")
+        
         ts_value = 0.0
         time_min = None
         self.last_peer_update_window = None
         self.last_peer_post_window = None
+        loop_iteration = 0
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} about to enter main while loop")
         while not self.stop_event.is_set():
+            loop_iteration += 1
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} starting loop iteration {loop_iteration}, sync_window={self.sync_window}"
+            )
             # 1. Wait until the chain has moved `validator_offset` windows ahead
             if self.is_master:
                 tplr.log_with_context(
@@ -1331,6 +1349,9 @@ class Validator(BaseNode, Trainer):
             skip_window = bool(skip_tensor.item())
 
             if skip_window:
+                tplr.logger.info(
+                    f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} skipping window due to skip_window=True, continuing to next iteration"
+                )
                 continue
 
             # --------------------------------------------------------------+
@@ -1473,8 +1494,17 @@ class Validator(BaseNode, Trainer):
             
             # Only master evaluates miner sync and applies slashing (can be slow/async)
             if self.is_master:
+                # Skip R2-heavy slashing in distributed mode to avoid async blocking
+                if self.world_size > 1:
+                    tplr.log_with_context(
+                        level="info",
+                        message="[EVAL_DEBUG] Master: Skipping slash_for_poor_sync in distributed mode (world_size > 1)",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    self.slash_for_missing_gradients(skipped_uids, success_rate)
                 # Skip slashing for the first 20 global steps to avoid delays during warmup
-                if self.global_step >= 20:
+                elif self.global_step >= 20:
                     tplr.log_with_context(
                         level="info",
                         message="[EVAL_DEBUG] Master: Starting slash_for_poor_sync",
@@ -1569,6 +1599,9 @@ class Validator(BaseNode, Trainer):
             )
 
             if not has_peers:
+                tplr.logger.info(
+                    f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} has_peers=False, continuing to next iteration"
+                )
                 continue
 
             # Barrier before evaluation starts (soft)
@@ -1718,11 +1751,21 @@ class Validator(BaseNode, Trainer):
                 )
 
             # Process each UID with sliding window loading
-            for eval_uid in evaluation_uids:
+            for idx, eval_uid in enumerate(evaluation_uids):
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} starting UID iteration {idx+1}/{len(evaluation_uids)}, eval_uid={eval_uid}, eval_window={eval_window}, current_window={self.current_window}"
+                )
                 uid_eval_start = time.time()
+                
                 # Check if window has changed before starting evaluation
-                if self.current_window != eval_window:
-                    if self.is_master:
+                # Master checks and broadcasts the decision to all ranks
+                window_changed = False
+                if self.is_master:
+                    window_changed = self.current_window != eval_window
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Master checking window: eval_window={eval_window}, current_window={self.current_window}, window_changed={window_changed}"
+                    )
+                    if window_changed:
                         tplr.log_with_context(
                             level="info",
                             message=f"Window changed during evaluation (was {eval_window},"
@@ -1731,6 +1774,25 @@ class Validator(BaseNode, Trainer):
                             sync_window=self.sync_window,
                             current_window=self.current_window,
                         )
+                
+                # Broadcast window_changed decision to all ranks
+                if self.world_size > 1 and dist.is_initialized():
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} about to broadcast window_changed"
+                    )
+                    window_changed_tensor = torch.tensor(
+                        [1 if window_changed else 0], dtype=torch.int32, device=self.device
+                    )
+                    dist_helper.broadcast(window_changed_tensor, src=0)
+                    window_changed = bool(window_changed_tensor.item())
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} received window_changed={window_changed}"
+                    )
+                
+                if window_changed:
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} breaking eval loop due to window change"
+                    )
                     break
 
                 # Mark this UID as attempted (for counter management)
@@ -2147,20 +2209,20 @@ class Validator(BaseNode, Trainer):
                         eval_uid=eval_uid,
                     )
 
-                    sync_result = await self.evaluate_miner_sync(eval_uid)
-                    sync_score = cast(
-                        float,
-                        sync_result.get("sync_score", 0.0),
+                    # [TEMPORARY FIX] Skip evaluate_miner_sync to avoid R2 hangs in distributed mode
+                    # This is only needed for sync scoring, not critical for TP testing
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Master skipping evaluate_miner_sync for UID {eval_uid} (disabled for distributed testing)"
                     )
-                    self.log_sync_score(eval_uid, sync_result)
-
-                    # Store the sync score for this miner
-                    self.sync_scores[eval_uid] = sync_score
+                    self.sync_scores[eval_uid] = 0.0  # Use default sync score
 
                 self.evaluated_uids.add(eval_uid)
 
                 evaluated_peers += 1
                 uid_eval_time = time.time() - uid_eval_start
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} completed UID {eval_uid} evaluation in {uid_eval_time:.3f}s"
+                )
                 if self.is_master:
                     tplr.log_with_context(
                         level="info",
@@ -2172,8 +2234,18 @@ class Validator(BaseNode, Trainer):
                     )
 
                 # Synchronize all ranks at the end of each evaluation iteration
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} entering end_eval_iter barrier for UID {eval_uid}"
+                )
                 dist_helper.safe_barrier("end_eval_iter", self.local_rank)
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} passed end_eval_iter barrier for UID {eval_uid}, looping back"
+                )
 
+            tplr.logger.info(
+                f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} exited evaluation loop, evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs"
+            )
+            
             del saved_state
             torch.cuda.empty_cache()
             self.sampler._cached_indices.clear()
@@ -2207,7 +2279,13 @@ class Validator(BaseNode, Trainer):
             evaluation_time = tplr.T() - eval_start
 
             # Barrier after evaluation completes
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering post_eval barrier, evaluated {len(uids_attempted_this_window)} UIDs"
+            )
             dist_helper.safe_barrier("post_eval", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed post_eval barrier"
+            )
 
             # Perform logging
             if self.is_master:
@@ -2243,9 +2321,18 @@ class Validator(BaseNode, Trainer):
                 sync_window=self.sync_window,
                 current_window=self.current_window,
             )
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering pre_model_update barrier"
+            )
             dist_helper.safe_barrier("pre_model_update", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed pre_model_update barrier, about to apply outer step"
+            )
 
             # 14. Now, merge the gathered gradients into the model AFTER finishing evaluation
+            tplr.logger.info(
+                f"[OUTER_STEP] Rank {self.rank}/{self.world_size} about to apply outer step #{self.global_step + 1}"
+            )
             self.model.train()
             update_start = tplr.T()
 
@@ -2270,7 +2357,9 @@ class Validator(BaseNode, Trainer):
                 global_step=self.global_step,
             )
             self.global_step += 1  # Increment only when we actually do an outer step
-            tplr.logger.info(f"Applied outer step #{self.global_step}")
+            tplr.logger.info(
+                f"[OUTER_STEP] Rank {self.rank}/{self.world_size} completed outer step #{self.global_step}"
+            )
 
             # Add barrier after model update to ensure all ranks complete the update
             tplr.log_with_context(
@@ -2279,7 +2368,13 @@ class Validator(BaseNode, Trainer):
                 sync_window=self.sync_window,
                 current_window=self.current_window,
             )
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering post_model_update barrier"
+            )
             dist_helper.safe_barrier("post_model_update", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed post_model_update barrier"
+            )
 
             model_update_time = tplr.T() - update_start
             if self.is_master:
@@ -2622,11 +2717,20 @@ class Validator(BaseNode, Trainer):
                 )
 
             # Synchronize all ranks before moving to next window
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering pre_next_window barrier for iteration {loop_iteration}"
+            )
             dist_helper.safe_barrier("pre_next_window", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed pre_next_window barrier"
+            )
 
             # 19. Global step is now incremented only in the outer_step block
 
             torch.cuda.empty_cache()
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} completed loop iteration {loop_iteration}, about to loop back"
+            )
 
     def select_initial_peers(self) -> tuple[list[int], list[int]] | None:
         """
