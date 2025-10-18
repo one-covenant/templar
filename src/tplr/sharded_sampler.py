@@ -15,6 +15,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+import os
 import time
 from abc import ABC, abstractmethod
 
@@ -64,7 +65,18 @@ class _BaseWindowSampler(Sampler, ABC):
         self.world_size = world_size
 
         # grad-accumulation factor (also serves as a symmetry check)
-        denom = micro_bs * world_size
+        # With TP, only count DP dimension for effective batch size
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        if tp_degree > 1 and self.world_size >= tp_degree and self.world_size % tp_degree == 0:
+            effective_dp = self.world_size // tp_degree
+            tplr.logger.info(
+                f"[TP Sampler] rank={self.rank}, TP={tp_degree}, world_size={self.world_size}, "
+                f"effective_dp={effective_dp}, using DP world size for grad_accum_steps"
+            )
+        else:
+            effective_dp = self.world_size
+        
+        denom = micro_bs * effective_dp
         self.grad_accum_steps = batch_size // denom
         self.set_window_uid(uid, window)
 
@@ -76,7 +88,28 @@ class _BaseWindowSampler(Sampler, ABC):
         self.uid, self.window = uid, window
 
         global_indices = self._global_indices()
-        self._local = global_indices[self.rank :: self.world_size].tolist()
+        
+        # With TP, all ranks in the same TP group must see the SAME data
+        tp_degree = int(os.environ.get("TP_DEGREE", 1))
+        
+        # Guard: only apply TP sharding if world_size is divisible by tp_degree
+        if tp_degree > 1 and self.world_size >= tp_degree and self.world_size % tp_degree == 0:
+            # Calculate DP rank (which TP group this rank belongs to)
+            dp_rank = self.rank // tp_degree
+            dp_world_size = self.world_size // tp_degree
+            
+            # Shard only across DP dimension (all ranks in same TP group get same data)
+            self._local = global_indices[dp_rank :: dp_world_size].tolist()
+
+        else:
+            # Original behavior: shard across all ranks (for FSDP/DDP)
+            # Also fallback if TP config is invalid
+            if tp_degree > 1 and self.world_size % tp_degree != 0:
+                tplr.logger.warning(
+                    f"[TP Sampler] Invalid TP config: world_size={self.world_size} not divisible by "
+                    f"TP_DEGREE={tp_degree}. Falling back to non-TP sharding."
+                )
+            self._local = global_indices[self.rank :: self.world_size].tolist()
 
     def __iter__(self):
         return iter(self._local)

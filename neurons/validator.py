@@ -499,9 +499,6 @@ class Validator(BaseNode, Trainer):
         self.inactive_scores = {}  # {uid: (last_active_window, last_score)}
         self.inactivity_slash_rate = 0.25  # 25% slash per window
         self.missing_gradient_slash_rate = 0.75
-        self.missing_gradient_penalty_score = getattr(
-            self.hparams, "missing_gradient_penalty_score", -99.0
-        )
         self.score_zero_threshold = 1e-4
         self.sync_score_slash_rate = 0.75
         self.idx_similarity_slashing_rate = (
@@ -543,10 +540,6 @@ class Validator(BaseNode, Trainer):
         # Track consecutive missing gradients for escalating slashing
         self.consecutive_missing_gradient_count: dict[int, int] = {}
 
-        # Track last 8 missing gradient occurrences for mega slash logic
-        self.missing_gradient_history: dict[int, Deque[bool]] = {}
-        self.missing_gradient_history_limit = 8  # Track last 8 windows
-
     def reset_peer(self, uid: int) -> None:
         """
         Generally based on peer behavior, reset their scores
@@ -566,7 +559,6 @@ class Validator(BaseNode, Trainer):
         self.peer_eval_history.pop(uid, None)
         self.consecutive_negative_count.pop(uid, None)
         self.consecutive_missing_gradient_count.pop(uid, None)
-        self.missing_gradient_history.pop(uid, None)
         self.excluded_from_gather.discard(uid)
         self.exclusion_start_window.pop(uid, None)
         return
@@ -658,40 +650,6 @@ class Validator(BaseNode, Trainer):
         negative_freq = (neg_count / total) if total else 0.0
         consecutive_negs = self.consecutive_negative_count.get(eval_uid, 0)
 
-        # --- slash for >50% negative in last 8 evaluations
-        if total >= 8:
-            last_8 = list(window)[-8:]  # Get last 8 evaluations
-            neg_count_last_8 = sum(last_8)
-            neg_ratio_last_8 = neg_count_last_8 / 8
-
-            if neg_ratio_last_8 > 0.5:
-                old_score = self.final_scores[eval_uid].item()
-                if old_score > 0:
-                    # Apply 75% slash (multiply by 0.25)
-                    self.final_scores[eval_uid] *= 0.25
-                    self.binary_moving_averages[eval_uid] *= 0.25
-
-                    # Set to zero if score drops below threshold
-                    score_threshold = self.score_zero_threshold
-                    if self.final_scores[eval_uid] < score_threshold:
-                        tplr.log_with_context(
-                            level="info",
-                            message=f"UID {eval_uid} final_score {self.final_scores[eval_uid]:.8f} below threshold {score_threshold:.8f}, setting to 0.0",
-                            sync_window=self.sync_window,
-                            current_window=self.current_window,
-                        )
-                        self.final_scores[eval_uid] = 0.0
-
-                    new_score = self.final_scores[eval_uid].item()
-                    tplr.log_with_context(
-                        level="warning",
-                        message=f"UID {eval_uid} has {neg_count_last_8}/8 negative evaluations ({neg_ratio_last_8:.1%}) in last 8 windows. "
-                        f"Slashing score from {old_score:.4f} to {new_score:.4f}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
         # --- logging (consider rate limiting in practice)
         tplr.log_with_context(
             level="info",
@@ -752,13 +710,10 @@ class Validator(BaseNode, Trainer):
         avg_abs_diff = float(sync_result.get("avg_abs_diff", 99.0))
         max_diff = float(sync_result.get("max_diff", 99.0))
         avg_steps_behind = float(sync_result.get("avg_steps_behind", 99.0))
-        interquartile_mean_steps_behind = float(
-            sync_result.get("interquartile_mean_steps_behind", 99.0)
-        )
         max_steps_behind = float(sync_result.get("max_steps_behind", 99.0))
         tplr.log_with_context(
             level="info",
-            message=f"Sync average steps behind: {avg_steps_behind:.3f}, interquartile mean: {interquartile_mean_steps_behind:.3f}",
+            message=f"Sync average steps behind: {avg_steps_behind:.3f}",
             sync_window=self.sync_window,
             current_window=self.current_window,
             eval_uid=eval_uid,
@@ -771,7 +726,6 @@ class Validator(BaseNode, Trainer):
                     f"validator/sync/avg_abs_diff/{eval_uid}": avg_abs_diff,
                     f"validator/sync/sync_max_diff/{eval_uid}": max_diff,
                     f"validator/sync/avg_steps_behind/{eval_uid}": avg_steps_behind,
-                    f"validator/sync/interquartile_mean_steps_behind/{eval_uid}": interquartile_mean_steps_behind,
                     f"validator/sync/max_steps_behind/{eval_uid}": max_steps_behind,
                 },
                 step=self.global_step,
@@ -789,7 +743,6 @@ class Validator(BaseNode, Trainer):
                     "avg_abs_diff": avg_abs_diff,
                     "max_diff": max_diff,
                     "avg_steps_behind": avg_steps_behind,
-                    "interquartile_mean_steps_behind": interquartile_mean_steps_behind,
                     "max_steps_behind": max_steps_behind,
                 },
                 with_system_metrics=True,
@@ -1147,25 +1100,43 @@ class Validator(BaseNode, Trainer):
             from_bootstrap,
             aggregator_device="cpu",
         )
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} completed catch-up")
 
         current_shard = self.global_step // self.outer_steps_per_shard
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} about to initialize datasets")
         _ = await self.dataset_manager.initialize_datasets(current_shard)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} completed dataset initialization")
 
         # Synchronize all ranks after dataset initialization
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} entering dataset_init_complete barrier")
         dist_helper.safe_barrier("dataset_init_complete", self.local_rank)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} passed dataset_init_complete barrier")
 
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} about to set_dataloader")
         self.set_dataloader(validator=True)
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} completed set_dataloader")
 
         if self.is_master:
+            tplr.logger.info(f"[STARTUP_DEBUG] Master starting commitment fetcher and background tasks")
             self.comms.start_commitment_fetcher()
             self.comms.start_background_tasks()
+            tplr.logger.info(f"[STARTUP_DEBUG] Master completed starting background tasks")
+        else:
+            tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank} (non-master) skipping background tasks")
+        
         ts_value = 0.0
         time_min = None
         self.last_peer_update_window = None
         self.last_peer_post_window = None
+        loop_iteration = 0
+        tplr.logger.info(f"[STARTUP_DEBUG] Rank {self.rank}/{self.world_size} about to enter main while loop")
         while not self.stop_event.is_set():
+            loop_iteration += 1
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} starting loop iteration {loop_iteration}, sync_window={self.sync_window}"
+            )
             # 1. Wait until the chain has moved `validator_offset` windows ahead
             if self.is_master:
                 tplr.log_with_context(
@@ -1278,7 +1249,9 @@ class Validator(BaseNode, Trainer):
                 # Apply penalties to all inactive peers
                 _ = self.penalize_inactive_peers()
 
-                sync_block = (self.sync_window + 1) * self.hparams.blocks_per_window
+                # Use the start of the current sync_window as time_min
+                # Gradients for window N should be accepted from when window N began
+                sync_block = self.sync_window * self.hparams.blocks_per_window
                 ts_value = self.query_block_timestamp(sync_block)
                 if ts_value is None:
                     tplr.log_with_context(
@@ -1378,6 +1351,9 @@ class Validator(BaseNode, Trainer):
             skip_window = bool(skip_tensor.item())
 
             if skip_window:
+                tplr.logger.info(
+                    f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} skipping window due to skip_window=True, continuing to next iteration"
+                )
                 continue
 
             # --------------------------------------------------------------+
@@ -1434,6 +1410,12 @@ class Validator(BaseNode, Trainer):
                 tplr.log_with_context(
                     level="info",
                     message=f"Skipped UIDs: {skipped_uids}",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
+                tplr.log_with_context(
+                    level="info",
+                    message="[EVAL_DEBUG] Master: Starting gather metrics computation",
                     sync_window=self.sync_window,
                     current_window=self.current_window,
                 )
@@ -1502,22 +1484,54 @@ class Validator(BaseNode, Trainer):
                         positive_ratio_pct=gather_peers_positive_ratio * 100,
                     )
 
-            # Only master evaluates miner sync and applies slashing
+            # [FIX] Sync all ranks BEFORE master does async slashing work to avoid deadlock
+            tplr.log_with_context(
+                level="info",
+                message=f"[EVAL_DEBUG] Rank {self.rank}/{self.world_size} entering pre-slashing barrier",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
+            if self.world_size > 1 and dist.is_initialized():
+                dist.barrier()
+            
+            # Only master evaluates miner sync and applies slashing (can be slow/async)
             if self.is_master:
-                await self.slash_for_poor_sync()
-                self.slash_for_missing_gradients(skipped_uids, success_rate)
+                # Skip R2-heavy slashing in distributed mode to avoid async blocking
+                if self.world_size > 1:
+                    tplr.log_with_context(
+                        level="info",
+                        message="[EVAL_DEBUG] Master: Skipping slash_for_poor_sync in distributed mode (world_size > 1)",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    self.slash_for_missing_gradients(skipped_uids, success_rate)
+                # Skip slashing for the first 20 global steps to avoid delays during warmup
+                elif self.global_step >= 20:
+                    tplr.log_with_context(
+                        level="info",
+                        message="[EVAL_DEBUG] Master: Starting slash_for_poor_sync",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    await self.slash_for_poor_sync()
+                    tplr.log_with_context(
+                        level="info",
+                        message="[EVAL_DEBUG] Master: Completed slash_for_poor_sync, starting slash_for_missing_gradients",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    self.slash_for_missing_gradients(skipped_uids, success_rate)
+                else:
+                    tplr.log_with_context(
+                        level="info",
+                        message=f"[EVAL_DEBUG] Master: Skipping slashing at global step {self.global_step} (waiting until step 20)",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    self.slash_for_missing_gradients(skipped_uids, success_rate)
 
                 # Reset consecutive missing gradient count for successful gather peers
                 for uid in actual_gather_uids:
-                    # Track successful gradient submission in history
-                    if uid not in self.missing_gradient_history:
-                        self.missing_gradient_history[uid] = deque(
-                            maxlen=self.missing_gradient_history_limit
-                        )
-                    self.missing_gradient_history[uid].append(
-                        False
-                    )  # False = not missing
-
                     if uid in self.consecutive_missing_gradient_count:
                         prev_count = self.consecutive_missing_gradient_count[uid]
                         if prev_count > 0:
@@ -1528,12 +1542,25 @@ class Validator(BaseNode, Trainer):
                                 current_window=self.current_window,
                             )
                         self.consecutive_missing_gradient_count[uid] = 0
+                
+                tplr.log_with_context(
+                    level="info",
+                    message="[EVAL_DEBUG] Master: Completed slashing section",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
 
             # Add check for empty peers (evaluating all peer uids)
             # Only master checks and broadcasts the decision
             has_peers = True
             if self.is_master:
                 has_peers = len(self.comms.eval_peers) > 0
+                tplr.log_with_context(
+                    level="info",
+                    message=f"[EVAL_DEBUG] has_peers check: eval_peers={len(self.comms.eval_peers)}, has_peers={has_peers}",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
                 if not has_peers:
                     tplr.log_with_context(
                         level="warning",
@@ -1542,9 +1569,22 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                     )
 
-            # Barrier before evaluation starts
+            # Barrier before broadcasting eval decision
+            tplr.log_with_context(
+                level="info",
+                message=f"[EVAL_DEBUG] Rank {self.rank}/{self.world_size} entering pre-broadcast barrier",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
             if self.world_size > 1 and dist.is_initialized():
                 dist.barrier()
+
+            tplr.log_with_context(
+                level="info",
+                message=f"[EVAL_DEBUG] Rank {self.rank}/{self.world_size} passed pre-broadcast barrier, broadcasting has_peers={has_peers if self.is_master else 'N/A'}",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
 
             # Broadcast the decision to all ranks
             has_peers_tensor = torch.tensor(
@@ -1553,7 +1593,17 @@ class Validator(BaseNode, Trainer):
             dist_helper.broadcast(has_peers_tensor, src=0)
             has_peers = has_peers_tensor.item()
 
+            tplr.log_with_context(
+                level="info",
+                message=f"[EVAL_DEBUG] Rank {self.rank}/{self.world_size} received has_peers={has_peers}, will {'CONTINUE' if not has_peers else 'PROCEED'} to evaluation",
+                sync_window=self.sync_window,
+                current_window=self.current_window,
+            )
+
             if not has_peers:
+                tplr.logger.info(
+                    f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} has_peers=False, continuing to next iteration"
+                )
                 continue
 
             # Barrier before evaluation starts (soft)
@@ -1703,11 +1753,21 @@ class Validator(BaseNode, Trainer):
                 )
 
             # Process each UID with sliding window loading
-            for eval_uid in evaluation_uids:
+            for idx, eval_uid in enumerate(evaluation_uids):
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} starting UID iteration {idx+1}/{len(evaluation_uids)}, eval_uid={eval_uid}, eval_window={eval_window}, current_window={self.current_window}"
+                )
                 uid_eval_start = time.time()
+                
                 # Check if window has changed before starting evaluation
-                if self.current_window != eval_window:
-                    if self.is_master:
+                # Master checks and broadcasts the decision to all ranks
+                window_changed = False
+                if self.is_master:
+                    window_changed = self.current_window != eval_window
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Master checking window: eval_window={eval_window}, current_window={self.current_window}, window_changed={window_changed}"
+                    )
+                    if window_changed:
                         tplr.log_with_context(
                             level="info",
                             message=f"Window changed during evaluation (was {eval_window},"
@@ -1716,6 +1776,25 @@ class Validator(BaseNode, Trainer):
                             sync_window=self.sync_window,
                             current_window=self.current_window,
                         )
+                
+                # Broadcast window_changed decision to all ranks
+                if self.world_size > 1 and dist.is_initialized():
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} about to broadcast window_changed"
+                    )
+                    window_changed_tensor = torch.tensor(
+                        [1 if window_changed else 0], dtype=torch.int32, device=self.device
+                    )
+                    dist_helper.broadcast(window_changed_tensor, src=0)
+                    window_changed = bool(window_changed_tensor.item())
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} received window_changed={window_changed}"
+                    )
+                
+                if window_changed:
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} breaking eval loop due to window change"
+                    )
                     break
 
                 # Mark this UID as attempted (for counter management)
@@ -2132,20 +2211,20 @@ class Validator(BaseNode, Trainer):
                         eval_uid=eval_uid,
                     )
 
-                    sync_result = await self.evaluate_miner_sync(eval_uid)
-                    sync_score = cast(
-                        float,
-                        sync_result.get("sync_score", 0.0),
+                    # [TEMPORARY FIX] Skip evaluate_miner_sync to avoid R2 hangs in distributed mode
+                    # This is only needed for sync scoring, not critical for TP testing
+                    tplr.logger.info(
+                        f"[EVAL_LOOP] Master skipping evaluate_miner_sync for UID {eval_uid} (disabled for distributed testing)"
                     )
-                    self.log_sync_score(eval_uid, sync_result)
-
-                    # Store the sync score for this miner
-                    self.sync_scores[eval_uid] = sync_score
+                    self.sync_scores[eval_uid] = 0.0  # Use default sync score
 
                 self.evaluated_uids.add(eval_uid)
 
                 evaluated_peers += 1
                 uid_eval_time = time.time() - uid_eval_start
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} completed UID {eval_uid} evaluation in {uid_eval_time:.3f}s"
+                )
                 if self.is_master:
                     tplr.log_with_context(
                         level="info",
@@ -2157,8 +2236,18 @@ class Validator(BaseNode, Trainer):
                     )
 
                 # Synchronize all ranks at the end of each evaluation iteration
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} entering end_eval_iter barrier for UID {eval_uid}"
+                )
                 dist_helper.safe_barrier("end_eval_iter", self.local_rank)
+                tplr.logger.info(
+                    f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} passed end_eval_iter barrier for UID {eval_uid}, looping back"
+                )
 
+            tplr.logger.info(
+                f"[EVAL_LOOP] Rank {self.rank}/{self.world_size} exited evaluation loop, evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs"
+            )
+            
             del saved_state
             torch.cuda.empty_cache()
             self.sampler._cached_indices.clear()
@@ -2192,7 +2281,13 @@ class Validator(BaseNode, Trainer):
             evaluation_time = tplr.T() - eval_start
 
             # Barrier after evaluation completes
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering post_eval barrier, evaluated {len(uids_attempted_this_window)} UIDs"
+            )
             dist_helper.safe_barrier("post_eval", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed post_eval barrier"
+            )
 
             # Perform logging
             if self.is_master:
@@ -2228,9 +2323,18 @@ class Validator(BaseNode, Trainer):
                 sync_window=self.sync_window,
                 current_window=self.current_window,
             )
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering pre_model_update barrier"
+            )
             dist_helper.safe_barrier("pre_model_update", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed pre_model_update barrier, about to apply outer step"
+            )
 
             # 14. Now, merge the gathered gradients into the model AFTER finishing evaluation
+            tplr.logger.info(
+                f"[OUTER_STEP] Rank {self.rank}/{self.world_size} about to apply outer step #{self.global_step + 1}"
+            )
             self.model.train()
             update_start = tplr.T()
 
@@ -2239,7 +2343,7 @@ class Validator(BaseNode, Trainer):
             self.outer_optimizer.zero_grad()
             self.model.zero_grad()
 
-            gradient_fingerprint = tplr.neurons.outer_step(
+            grad_stats = tplr.neurons.outer_step(
                 self.model,
                 self.outer_optimizer,
                 gather_result=gather_result,
@@ -2255,16 +2359,9 @@ class Validator(BaseNode, Trainer):
                 global_step=self.global_step,
             )
             self.global_step += 1  # Increment only when we actually do an outer step
-
-            if gradient_fingerprint is not None and self.is_master:
-                tplr.logger.info(
-                    f"Applied outer step #{self.global_step} | "
-                    f"Fingerprint: global_l2={gradient_fingerprint['global_l2_norm']:.6f}, "
-                    f"params={len(gradient_fingerprint['param_norms'])}, "
-                    f"elements={gradient_fingerprint['total_elements']}"
-                )
-            else:
-                tplr.logger.info(f"Applied outer step #{self.global_step}")
+            tplr.logger.info(
+                f"[OUTER_STEP] Rank {self.rank}/{self.world_size} completed outer step #{self.global_step}"
+            )
 
             # Add barrier after model update to ensure all ranks complete the update
             tplr.log_with_context(
@@ -2273,7 +2370,13 @@ class Validator(BaseNode, Trainer):
                 sync_window=self.sync_window,
                 current_window=self.current_window,
             )
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering post_model_update barrier"
+            )
             dist_helper.safe_barrier("post_model_update", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed post_model_update barrier"
+            )
 
             model_update_time = tplr.T() - update_start
             if self.is_master:
@@ -2285,11 +2388,9 @@ class Validator(BaseNode, Trainer):
                 )
 
                 # ------ NEW: gradient & weight-norm statistics (outer-step) ------------
-                grad_norms, weight_norms = [], []
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        grad_norms.append(p.grad.data.norm().item())
-                        weight_norms.append(p.data.norm().item())
+                # Use statistics returned from outer_step (captured before freeing grads)
+                grad_norms = grad_stats.get("grad_norms", [])
+                weight_norms = grad_stats.get("weight_norms", [])
 
                 if grad_norms:
                     mean_grad_norm = sum(grad_norms) / len(grad_norms)
@@ -2325,26 +2426,18 @@ class Validator(BaseNode, Trainer):
 
             # ↳ WandB
             if self.is_master:
-                wandb_metrics = {
-                    "gradient/mean_grad_norm": mean_grad_norm,
-                    "gradient/max_grad_norm": max_grad_norm,
-                    "gradient/min_grad_norm": min_grad_norm,
-                    "gradient/median_grad_norm": median_grad_norm,
-                    "gradient/grad_norm_std": grad_norm_std,
-                    "gradient/mean_weight_norm": mean_weight_norm,
-                    "gradient/grad_to_weight_ratio": grad_to_weight_ratio,
-                }
-
-                # Add gradient fingerprint metrics if available
-                if gradient_fingerprint is not None:
-                    wandb_metrics["gradient_fingerprint/global_l2_norm"] = (
-                        gradient_fingerprint["global_l2_norm"]
-                    )
-                    wandb_metrics["gradient_fingerprint/total_elements"] = (
-                        gradient_fingerprint["total_elements"]
-                    )
-
-                self.wandb.log(wandb_metrics, step=self.global_step)
+                self.wandb.log(
+                    {
+                        "gradient/mean_grad_norm": mean_grad_norm,
+                        "gradient/max_grad_norm": max_grad_norm,
+                        "gradient/min_grad_norm": min_grad_norm,
+                        "gradient/median_grad_norm": median_grad_norm,
+                        "gradient/grad_norm_std": grad_norm_std,
+                        "gradient/mean_weight_norm": mean_weight_norm,
+                        "gradient/grad_to_weight_ratio": grad_to_weight_ratio,
+                    },
+                    step=self.global_step,
+                )
 
                 # ↳ InfluxDB (metrics_logger)
                 self.metrics_logger.log(
@@ -2626,11 +2719,20 @@ class Validator(BaseNode, Trainer):
                 )
 
             # Synchronize all ranks before moving to next window
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} entering pre_next_window barrier for iteration {loop_iteration}"
+            )
             dist_helper.safe_barrier("pre_next_window", self.local_rank)
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} passed pre_next_window barrier"
+            )
 
             # 19. Global step is now incremented only in the outer_step block
 
             torch.cuda.empty_cache()
+            tplr.logger.info(
+                f"[LOOP_DEBUG] Rank {self.rank}/{self.world_size} completed loop iteration {loop_iteration}, about to loop back"
+            )
 
     def select_initial_peers(self) -> tuple[list[int], list[int]] | None:
         """
@@ -2878,6 +2980,10 @@ class Validator(BaseNode, Trainer):
             if selected_peers is not None and self.is_master:
                 self.last_peer_update_window = self.sync_window
                 gather_peers, reserve_peers = selected_peers
+                
+                self.comms.peers = gather_peers
+                self.comms.reserve_peers = reserve_peers
+                
                 await self.comms.post_peer_list(
                     peers=gather_peers,
                     reserve_peers=reserve_peers,
@@ -3003,7 +3109,6 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
-            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 
@@ -3149,21 +3254,6 @@ class Validator(BaseNode, Trainer):
                 )
         return
 
-    def record_missing_gradient_for_openskill(self, uid: int) -> None:
-        """Record a missing/invalid gradient in OpenSkill scoring with penalty score.
-
-        Args:
-            uid: The UID of the peer with missing/invalid gradient
-        """
-        # Add to current window scores for OpenSkill rating with penalty score
-        if not hasattr(self, "current_window_scores"):
-            self.current_window_scores = {}
-        self.current_window_scores[uid] = self.missing_gradient_penalty_score
-
-        # Initialize OpenSkill rating if needed
-        if uid not in self.openskill_ratings:
-            self.openskill_ratings[uid] = self.openskill_model.rating(name=str(uid))
-
     def slash_for_missing_gradient(self, eval_uid: int) -> None:
         """Slash a peer for not submitting a gradient.
 
@@ -3217,9 +3307,6 @@ class Validator(BaseNode, Trainer):
 
         # Ensure the UID is included in evaluated_uids only when penalized
         self.evaluated_uids.add(eval_uid)
-
-        # Record missing gradient for OpenSkill scoring
-        self.record_missing_gradient_for_openskill(eval_uid)
 
         # Log updated scores
         tplr.log_with_context(
@@ -3280,9 +3367,6 @@ class Validator(BaseNode, Trainer):
 
         # Include in evaluated UIDs so it gets logged in metrics
         self.evaluated_uids.add(eval_uid)
-
-        # Record invalid gradient for OpenSkill scoring
-        self.record_missing_gradient_for_openskill(eval_uid)
 
         # Log to WandB
         self.wandb.log(
@@ -4028,13 +4112,6 @@ class Validator(BaseNode, Trainer):
             if 0 <= uid < self.final_scores.size(0):
                 old_score = self.final_scores[uid].item()
 
-                # Track missing gradient in history
-                if uid not in self.missing_gradient_history:
-                    self.missing_gradient_history[uid] = deque(
-                        maxlen=self.missing_gradient_history_limit
-                    )
-                self.missing_gradient_history[uid].append(True)  # True = missing
-
                 # Increment consecutive missing gradient count
                 if uid not in self.consecutive_missing_gradient_count:
                     self.consecutive_missing_gradient_count[uid] = 0
@@ -4042,19 +4119,13 @@ class Validator(BaseNode, Trainer):
 
                 consecutive_count = self.consecutive_missing_gradient_count[uid]
 
-                # Calculate miss statistics from history (used for both mega slash and logging)
-                history = self.missing_gradient_history[uid]
-                missing_count = sum(history)  # True counts as 1
-                missing_ratio = missing_count / len(history) if len(history) > 0 else 0
-                miss_percentage = missing_ratio * 100
-
-                # Check for mega slash (>50% missing in last 8 windows)
-                if len(history) >= 8 and missing_ratio >= 0.5:
+                # Check for mega slash (3+ consecutive misses)
+                if consecutive_count >= 3:
                     tplr.log_with_context(
                         level="warning",
-                        message=f"UID {uid} missed gradient in {missing_count}/{len(history)} "
-                        f"of last {len(history)} windows ({missing_ratio:.1%}). "
-                        f"MEGA SLASH: adding to naughty list for {self.naughty_peer_timeout} windows"
+                        message=f"UID {uid} missed gradient in gather {consecutive_count}"
+                        " times consecutively. MEGA SLASH: adding to naughty list for "
+                        f"{self.naughty_peer_timeout} windows"
                         + (
                             " and resetting peer."
                             if old_score > 0
@@ -4070,9 +4141,6 @@ class Validator(BaseNode, Trainer):
                         self.reset_peer(uid)
                     self.evaluated_uids.add(uid)
                     self.peers_last_eval_window[uid] = self.sync_window
-
-                    # Record missing gradient for OpenSkill scoring
-                    self.record_missing_gradient_for_openskill(uid)
                     continue
 
                 # Determine slash multiplier based on success rate and consecutive count
@@ -4083,15 +4151,15 @@ class Validator(BaseNode, Trainer):
                     if consecutive_count == 1:
                         slash_multiplier = 0.75
                     elif consecutive_count == 2:
-                        slash_multiplier = 0.5  # Changed from 0.25
+                        slash_multiplier = 0.25
                     else:
-                        slash_multiplier = 0.0
+                        slash_multiplier = (
+                            0.0  # Shouldn't reach here due to mega slash above
+                        )
 
                 tplr.log_with_context(
                     level="info",
-                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. "
-                    f"Miss rate: {miss_percentage:.1f}% ({missing_count}/{len(history)} recent windows). "
-                    f"Gather success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
+                    message=f"No gradient gathered from UID {uid}. Consecutive misses: {consecutive_count}. Success rate: {success_rate:.2%}. Slashing by multiplier {slash_multiplier}",
                     sync_window=self.sync_window,
                     current_window=self.current_window,
                 )
@@ -4128,9 +4196,6 @@ class Validator(BaseNode, Trainer):
                     )
                 self.evaluated_uids.add(uid)
                 self.peers_last_eval_window[uid] = self.sync_window
-
-                # Record missing gradient for OpenSkill scoring
-                self.record_missing_gradient_for_openskill(uid)
             else:
                 tplr.log_with_context(
                     level="info",

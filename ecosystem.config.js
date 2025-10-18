@@ -8,7 +8,7 @@ const RANDOM_SUFFIX = execSync(
   .toString()
   .trim();
 
-const PROJECT_NAME = `test_${RANDOM_SUFFIX}`;
+const PROJECT_NAME = `2.1.9+test.tp.2b`;
 
 module.exports = {
   apps: [
@@ -17,7 +17,7 @@ module.exports = {
       name            : "TM1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -34,14 +34,19 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "1,2"
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "0,1",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     },
     {
       name            : "TM2",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
@@ -58,7 +63,41 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "3,4"
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "2,3",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
+      }
+    },
+    {
+      name            : "TM3",
+      exec_mode       : "fork",
+      exec_interpreter: "none",
+      script          : ".venv/bin/torchrun",
+      args: [
+        "--standalone",
+        "--nnodes", "1",
+        "--nproc_per_node", "2",
+        "neurons/miner.py",
+        "--wallet.name", "templar_test",
+        "--wallet.hotkey", "M3",
+        "--device", "cuda",
+        "--subtensor.network", "local",
+        "--netuid", "2",
+        "--use_wandb",
+        "--project", PROJECT_NAME
+      ],
+      env: {
+        ...process.env,
+        PROJECT_NAME,
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "4,5",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     },
 
@@ -67,11 +106,11 @@ module.exports = {
       name            : "TV1",
       exec_mode       : "fork",
       exec_interpreter: "none",
-      script          : "torchrun",
+      script          : ".venv/bin/torchrun",
       args: [
         "--standalone",
         "--nnodes", "1",
-        "--nproc_per_node", "1",
+        "--nproc_per_node", "2",
         "neurons/validator.py",
         "--wallet.name", "templar_test",
         "--wallet.hotkey", "V1",
@@ -84,7 +123,13 @@ module.exports = {
       env: {
         ...process.env,
         PROJECT_NAME,
-        CUDA_VISIBLE_DEVICES: "0"
+        DP_SHARD: "1",
+        TP_DEGREE: "2",
+        CUDA_VISIBLE_DEVICES: "6,7",
+        MAX_CATCHUP_WINDOWS: "5",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     }
   ]

@@ -19,6 +19,7 @@
 import asyncio
 import gc
 import math
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -238,7 +239,7 @@ def outer_step(
     use_dct: bool = False,
     wandb_run: Run | None = None,
     global_step: int | None = None,
-) -> dict | None:
+) -> dict[str, list[float]]:
     """
     Memory-minimizing variant:
       - Builds and applies ONE param's grad at a time.
@@ -246,7 +247,7 @@ def outer_step(
       - Frees all temporaries and grad immediately after each step.
 
     Returns:
-      Fingerprint dict containing gradient statistics (master rank only), or None.
+        Dict containing gradient and weight norm statistics for logging
     """
     model.train()
 
@@ -256,6 +257,10 @@ def outer_step(
     ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
     src_rank = 0
     on_src = is_master or not ddp
+
+    # Collect gradient and weight norms for logging
+    grad_norms: list[float] = []
+    weight_norms: list[float] = []
 
     # Only master reads aggregated payload (others rely on broadcasts).
     # Accept both SimpleNamespace and plain dict payloads.
@@ -278,16 +283,6 @@ def outer_step(
     # optional stats
     min_median_norm = float("inf")
     max_median_norm = float("-inf")
-
-    # Initialize fingerprint accumulator (master rank only)
-    fingerprint: dict | None = None
-    if on_src:
-        fingerprint = {
-            "param_norms": {},
-            "param_means": {},
-            "total_norm_sq": 0.0,
-            "total_elements": 0,
-        }
 
     def _idx_to_device(obj, dev: str):
         """
@@ -351,8 +346,8 @@ def outer_step(
                 min_median_norm = min(min_median_norm, med)
                 max_median_norm = max(max_median_norm, med)
 
-                # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                ref = torch.empty_like(p, device=device, dtype=p.dtype)
+                full_shape = xshapes[name]
+                ref = torch.empty(full_shape, device=device, dtype=p.dtype)
                 decompressed = compressor.batch_decompress(
                     ref,
                     idxs_dev,
@@ -366,18 +361,11 @@ def outer_step(
                 )
 
                 full_grad_src = transformer.decode(decompressed, use_dct=use_dct)
+                full_grad_src = full_grad_src.reshape(p.shape)
                 # Single conversion to target dtype+device to avoid extra temporaries
                 full_grad_src = full_grad_src.to(
                     dtype=p.dtype, device=p.device, non_blocking=True
                 )
-
-                # Accumulate fingerprint statistics for this parameter
-                if fingerprint is not None:
-                    param_norm = torch.norm(full_grad_src, p=2).item()
-                    fingerprint["param_norms"][name] = param_norm
-                    fingerprint["total_norm_sq"] += param_norm**2
-                    fingerprint["total_elements"] += full_grad_src.numel()
-                    fingerprint["param_means"][name] = full_grad_src.mean().item()
             finally:
                 # Free intermediate pieces ASAP (existence-guarded)
                 try:
@@ -398,6 +386,7 @@ def outer_step(
                 if on_src
                 else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
+
             new_grad = distribute_tensor(
                 src_tensor,
                 device_mesh=p.device_mesh,
@@ -443,9 +432,25 @@ def outer_step(
                     torch.cuda.empty_cache()
                 continue
 
-        # ---- apply update immediately for THIS param and free its grad ----
+        # ---- Capture gradient and weight norms before freeing ----
+        if p.grad is not None:
+            # For DTensor, get local shard norm; for regular tensor, get full norm
+            if isinstance(p.grad, DT):
+                grad_norm = p.grad.to_local().data.norm().item()
+            else:
+                grad_norm = p.grad.data.norm().item()
+            grad_norms.append(grad_norm)
+
+            # Capture weight norm
+            if isinstance(p, DT):
+                weight_norm = p.to_local().data.norm().item()
+            else:
+                weight_norm = p.data.norm().item()
+            weight_norms.append(weight_norm)
+
         # ---- apply update immediately for THIS param and free its grad ----
         optimizer.step()
+        
         p.grad = None  # free grad storage right away
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -470,11 +475,11 @@ def outer_step(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Compute final fingerprint (master rank only)
-    if on_src and fingerprint is not None:
-        fingerprint["global_l2_norm"] = math.sqrt(fingerprint["total_norm_sq"])
-        return fingerprint
-    return None
+    # Return gradient and weight norm statistics for logging
+    return {
+        "grad_norms": grad_norms,
+        "weight_norms": weight_norms,
+    }
 
 
 async def update_peers(instance: NeuronT, window: int, peer_start: float) -> None:
@@ -505,7 +510,7 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
         and instance.peers_update_window  # they should be on bucket by now
         + instance.hparams.peer_replacement_frequency
         - window
-        <= instance.hparams.peer_list_window_margin
+        < instance.hparams.peer_list_window_margin
     ):
         result = await instance.comms.get_peer_list()
         if result is None:
@@ -528,9 +533,10 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
     # Update peers, if it's time
     if instance.next_peers is not None and window >= instance.peers_update_window:
         # ── atomic switch ─────────────────────────────────────────────
-        instance.comms.peers = instance.next_peers
+        # Filter out self from peer list to avoid gathering own gradients
+        instance.comms.peers = [uid for uid in instance.next_peers if uid != instance.uid]
         instance.comms.reserve_peers = (
-            instance.next_reserve_peers
+            [uid for uid in instance.next_reserve_peers if uid != instance.uid]
             if instance.next_reserve_peers is not None
             else []
         )
@@ -539,6 +545,7 @@ async def update_peers(instance: NeuronT, window: int, peer_start: float) -> Non
             if window - instance.peers_update_window > 0
             else "on time"
         )
+
         tplr.logger.info(
             f"{tplr.P(window, tplr.T() - peer_start)} Updated peers "
             f"{late_text} - gather:{len(instance.comms.peers)}, "
@@ -810,8 +817,8 @@ async def catchup_with_aggregation_server(
             cmp = await compare_model_with_debug_dict(
                 instance.model,
                 debug_dict,
-                param_avg_change={},  # Empty since we haven't started tracking yet
                 learning_rate=instance.hparams.learning_rate,
+                param_avg_change={},  # Empty since we haven't started tracking yet
             )
             if cmp["success"]:
                 tplr.logger.info(
@@ -1001,9 +1008,12 @@ async def catchup_with_aggregation_server(
         if instance.is_master and (start_w - checkpoint_current_window) % 5 == 0:
             log_memory_usage(f"After window {start_w} cleanup")
         # ──────────────────────────────────────────────────────────────────────
-        # 3) Debug‑dict comparison to estimate “how many steps behind” we are
+        # 3) Debug‑dict comparison to estimate "how many steps behind" we are
         # ──────────────────────────────────────────────────────────────────────
         try:
+            # [FIX] All ranks must participate in compare_model_with_debug_dict
+            # because it calls full_tensor() on DTensors (collective operation)
+            debug_dict = None
             if instance.is_master:
                 debug_fetch = await instance.comms.get(
                     uid=str(leader_uid),
@@ -1039,16 +1049,27 @@ async def catchup_with_aggregation_server(
                                 )
                         prev_param_state[name] = curr_slice.clone()
 
-                    # --- call shared comparison helper --------------------------
-                    lr = instance.outer_optimizer.param_groups[0]["lr"]
-                    cmp = await compare_model_with_debug_dict(
-                        model=instance.model,
-                        debug_dict=debug_dict,
-                        learning_rate=lr,
-                        index_range=(0, 2),
-                        param_avg_change=param_avg_change,
-                    )
+            # Broadcast whether debug_dict exists so all ranks know whether to skip
+            has_debug_dict = torch.tensor(
+                [1 if debug_dict is not None else 0],
+                dtype=torch.int32,
+                device=instance.config.device,
+            )
+            dist_helper.broadcast(has_debug_dict, src=0)
+            
+            # All ranks call comparison (required for DTensor collectives)
+            # Note: debug_dict is None on non-master ranks, but that's ok - they just
+            # won't find any matching keys, but they'll still participate in full_tensor() calls
+            if has_debug_dict.item():
+                lr = instance.outer_optimizer.param_groups[0]["lr"]
+                cmp = await compare_model_with_debug_dict(
+                    model=instance.model,
+                    debug_dict=debug_dict if debug_dict is not None else {},
+                    learning_rate=lr,
+                    param_avg_change=param_avg_change if param_avg_change else {},
+                )
 
+                if instance.is_master:
                     if cmp["success"]:
                         tplr.logger.info(
                             f"[catch‑up] window {start_w} "
@@ -1059,12 +1080,13 @@ async def catchup_with_aggregation_server(
                         tplr.logger.warning(
                             f"[catch‑up] debug‑dict comparison failed for window {start_w}"
                         )
-                else:
-                    tplr.logger.warning(
-                        f"[catch‑up] no debug‑dict found for window {start_w}"
-                    )
+            elif instance.is_master:
+                tplr.logger.warning(
+                    f"[catch‑up] no debug‑dict found for window {start_w}"
+                )
         except Exception as exc:
-            tplr.logger.warning(f"[catch‑up] debug‑dict processing error: {exc}")
+            if instance.is_master:
+                tplr.logger.warning(f"[catch‑up] debug‑dict processing error: {exc}")
 
         # Increment global_step since we performed an outer step
         instance.global_step += 1
@@ -1072,9 +1094,17 @@ async def catchup_with_aggregation_server(
 
         dist_helper.safe_barrier("catchup_post_window", instance.local_rank)
 
-        # If the chain progressed while we were busy, extend the target.
+        # If the chain progressed while we were busy, extend the target, but cap it
+        # to prevent infinite catch-up if we're falling behind faster than we can catch up
+        max_catchup_windows = int(os.environ.get("MAX_CATCHUP_WINDOWS", 5))
         if instance.current_window > target_w:
-            target_w = instance.current_window
+            old_target = target_w
+            target_w = min(instance.current_window, start_w + max_catchup_windows)
+            if target_w != instance.current_window:
+                tplr.logger.warning(
+                    f"Chain at window {instance.current_window}, but capping catch-up target "
+                    f"from {old_target} to {target_w} (max {max_catchup_windows} windows ahead)"
+                )
 
     # Final aggressive memory cleanup
     gc.collect()
@@ -1095,7 +1125,6 @@ async def compare_model_with_debug_dict(
     param_avg_change: dict[str, torch.Tensor] | None = None,
     *,
     min_step_size: float = 1e-9,
-    index_range: tuple[int, int] = (0, 2),
 ) -> dict[str, bool | float | int]:
     """
     Compare weights with published debug snippets and return sync metrics.
@@ -1124,10 +1153,14 @@ async def compare_model_with_debug_dict(
             continue
 
         # --- grab the slice we care about --------------------------------
+        # Match miner's sampling strategy: last 2 elements if available, else last 1
         if isinstance(p, DT):
-            curr_slice = p.to_local().data.flatten()[index_range[0] : index_range[1]]
+            full_param = p.full_tensor()
+            flat = full_param.data.flatten()
+            curr_slice = flat[-2:] if flat.numel() >= 2 else flat[:1]
         else:
-            curr_slice = p.data.flatten()[index_range[0] : index_range[1]]
+            flat = p.data.flatten()
+            curr_slice = flat[-2:] if flat.numel() >= 2 else flat[:1]
 
         debug_slice = torch.tensor(
             debug_dict[key], dtype=p.dtype, device=curr_slice.device
@@ -1165,17 +1198,9 @@ async def compare_model_with_debug_dict(
     if not step_ratio_list:  # nothing compared
         median_steps = math.inf
         max_steps = math.inf
-        interquartile_mean_steps = math.inf
     else:
         all_steps = torch.cat([t.flatten() for t in step_ratio_list])
         median_steps = all_steps.median().item()
-
-        # Calculate interquartile mean (mean of values between Q1 and Q3)
-        q1 = all_steps.quantile(0.25).item()
-        q3 = all_steps.quantile(0.75).item()
-        # Filter values in the interquartile range
-        iqr_mask = (all_steps >= q1) & (all_steps <= q3)
-        interquartile_mean_steps = all_steps[iqr_mask].mean().item()
 
     return {
         "success": True,
@@ -1183,8 +1208,7 @@ async def compare_model_with_debug_dict(
         "avg_l2_norm": avg_l2_norm,
         "avg_abs_diff": avg_abs_diff,
         "max_diff": max_diff,
-        "avg_steps_behind": interquartile_mean_steps,
-        "interquartile_mean_steps_behind": interquartile_mean_steps,
+        "avg_steps_behind": median_steps,
         "max_steps_behind": max_steps,
         "param_count": param_count,
         "learning_rate": learning_rate,

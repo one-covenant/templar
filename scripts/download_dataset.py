@@ -105,25 +105,28 @@ async def download_files(shard_indices, output_path):
     skipped_files = []
 
     for idx in shard_indices:
-        # Use SharedShardedDataset.locate_shards to get the correct filenames
-        # This returns the full paths as they should be in both S3 and locally
+        # Use SharedShardedDataset.locate_shards to get the correct local filenames
         tokens_file, ids_file = SharedShardedDataset.locate_shards(
             shard_index=idx, custom_path=output_path
         )
 
-        # The S3 keys and local paths should match exactly
-        for file_path in [tokens_file, ids_file]:
-            local_file = Path(file_path)
+        # S3 keys are always under tokenized/ prefix
+        tokens_s3_key = f"tokenized/train_{idx:06d}.npy"
+        ids_s3_key = f"tokenized/sample_ids_{idx:06d}.bin"
+
+        # Check both files
+        for local_path, s3_key in [(tokens_file, tokens_s3_key), (ids_file, ids_s3_key)]:
+            local_file = Path(local_path)
 
             if local_file.exists():
                 file_size = local_file.stat().st_size
                 print(
-                    f"✓ Skipping {file_path} (already exists, size: {file_size:,} bytes)"
+                    f"✓ Skipping {local_path} (already exists, size: {file_size:,} bytes)"
                 )
-                skipped_files.append(file_path)
+                skipped_files.append(local_path)
             else:
-                # Both S3 key and local path are the same
-                files_to_download.append((file_path, file_path))
+                # S3 key is different from local path
+                files_to_download.append((s3_key, local_path))
 
     if not files_to_download:
         print(f"\nAll files for shards {sorted(shard_indices)} already exist locally.")

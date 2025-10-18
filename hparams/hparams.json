@@ -18,7 +18,7 @@
     "binary_score_ma_alpha": 0.05,
     "moving_average_window": 5,
     "missing_gradient_penalty_score": -99.0,
-    "model_size": "70B",
+    "model_size": "2B",
     "weight_decay": 0.1,
     "validator_offset": 1,
     "checkpoint_frequency": 10,
