@@ -1249,7 +1249,9 @@ class Validator(BaseNode, Trainer):
                 # Apply penalties to all inactive peers
                 _ = self.penalize_inactive_peers()
 
-                sync_block = (self.sync_window + 1) * self.hparams.blocks_per_window
+                # Use the start of the current sync_window as time_min
+                # Gradients for window N should be accepted from when window N began
+                sync_block = self.sync_window * self.hparams.blocks_per_window
                 ts_value = self.query_block_timestamp(sync_block)
                 if ts_value is None:
                     tplr.log_with_context(

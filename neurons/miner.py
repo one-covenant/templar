@@ -686,7 +686,9 @@ class Miner(BaseNode, Trainer):
                 del gradient
                 torch.cuda.empty_cache()
 
-            sync_block = self.current_window * self.hparams.blocks_per_window
+            # Use the start of step_window (the window we just trained on) as time_min
+            # Gradients for window N should be accepted from when window N began
+            sync_block = step_window * self.hparams.blocks_per_window
             ts_value = await self.loop.run_in_executor(
                 None, self.query_block_timestamp, sync_block
             )

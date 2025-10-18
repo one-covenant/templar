@@ -36,7 +36,10 @@ module.exports = {
         PROJECT_NAME,
         DP_SHARD: "1",
         TP_DEGREE: "2",
-        CUDA_VISIBLE_DEVICES: "0,1"
+        CUDA_VISIBLE_DEVICES: "0,1",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     },
     {
@@ -62,7 +65,10 @@ module.exports = {
         PROJECT_NAME,
         DP_SHARD: "1",
         TP_DEGREE: "2",
-        CUDA_VISIBLE_DEVICES: "2,3"
+        CUDA_VISIBLE_DEVICES: "2,3",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     },
     {
@@ -88,7 +94,10 @@ module.exports = {
         PROJECT_NAME,
         DP_SHARD: "1",
         TP_DEGREE: "2",
-        CUDA_VISIBLE_DEVICES: "4,5"
+        CUDA_VISIBLE_DEVICES: "4,5",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     },
 
@@ -117,7 +126,10 @@ module.exports = {
         DP_SHARD: "1",
         TP_DEGREE: "2",
         CUDA_VISIBLE_DEVICES: "6,7",
-        MAX_CATCHUP_WINDOWS: "5"
+        MAX_CATCHUP_WINDOWS: "5",
+        TMPDIR: "/ephemeral/tmp",
+        TEMP: "/ephemeral/tmp",
+        TMP: "/ephemeral/tmp"
       }
     }
   ]
