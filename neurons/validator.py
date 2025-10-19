@@ -1158,6 +1158,9 @@ class Validator(BaseNode, Trainer):
 
         self.set_dataloader(validator=True)
 
+        # Track the current shard to avoid double-swapping at initialization
+        last_shard = current_shard
+
         if self.is_master:
             self.comms.start_commitment_fetcher()
             self.comms.start_background_tasks()
@@ -1186,15 +1189,16 @@ class Validator(BaseNode, Trainer):
             # 2. Increment sync window and update peer lists
             window_start = tplr.T()
 
-            # Check if we need to swap dataset based on actual outer steps taken
-            if (
-                self.global_step > 0
-                and self.global_step % self.outer_steps_per_shard == 0
-            ):
-                tplr.logger.info(f"Swapping dataset at window {self.current_window}")
+            # Check if we need to swap dataset based on shard index change
+            current_shard_check = self.global_step // self.outer_steps_per_shard
+            if current_shard_check > last_shard:
+                tplr.logger.info(
+                    f"Swapping dataset after {self.global_step} outer steps at window {self.current_window}"
+                )
                 await self.dataset_manager.swap_datasets()
                 self.set_dataloader(validator=True)
                 dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                last_shard = current_shard_check
 
             self.sync_window += 1
             if self.is_master:

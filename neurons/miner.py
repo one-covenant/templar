@@ -431,6 +431,9 @@ class Miner(BaseNode, Trainer):
         # All workers need to instantiate dataloader
         self.set_dataloader()
 
+        # Track the current shard to avoid double-swapping at initialization
+        last_shard = current_shard
+
         # Put a dummy gradient to mark this miner as active for validators
         if self.is_master:
             tplr.logger.info("Putting dummy gradient to mark miner as active...")
@@ -470,18 +473,16 @@ class Miner(BaseNode, Trainer):
             # Update sampler for current window
             self.sampler.set_window_uid(self.uid, step_window)
 
-            # Check if we need to swap dataset based on actual outer steps taken
-            # Note: Since global_step is incremented AFTER the outer step, we check before incrementing
-            if (
-                self.global_step > 0
-                and self.global_step % self.outer_steps_per_shard == 0
-            ):
+            # Check if we need to swap dataset based on shard index change
+            current_shard_check = self.global_step // self.outer_steps_per_shard
+            if current_shard_check > last_shard:
                 tplr.logger.info(
                     f"Swapping dataset after {self.global_step} outer steps at window {step_window}"
                 )
                 await self.dataset_manager.swap_datasets()
                 self.set_dataloader()
                 dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                last_shard = current_shard_check
 
             data_loading_time = tplr.T() - data_start
             tplr.logger.info(
