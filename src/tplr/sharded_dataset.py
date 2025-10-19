@@ -311,6 +311,9 @@ class ShardedDatasetManager:
         Args:
             current_shard_index: The index of the shard to make active.
         """
+        # Update internal shard index to match the shard being loaded
+        self.shard_index = current_shard_index
+
         self.active_dataset = await self.create_dataset(current_shard_index)
         next_shard = (current_shard_index + 1) % self.max_dataset_idx
 
