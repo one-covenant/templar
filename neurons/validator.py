@@ -3018,11 +3018,11 @@ class Validator(BaseNode, Trainer):
                 "sync_score": 0.0,
             }
 
-        # Calculate sync score using the formula: score = (1-x/5)^2.5
-        # where x is the average steps behind, capped at 5
+        # Calculate sync score using the formula: score = (1-x/3)^2.5
+        # where x is the average steps behind, capped at 3
         avg_steps_behind = comparison_metrics["avg_steps_behind"]
-        x = min(avg_steps_behind, 5.0)
-        sync_score = max(0.0, (1.0 - x / 5.0) ** 2.5)
+        x = min(avg_steps_behind, 3.0)
+        sync_score = max(0.0, (1.0 - x / 3.0) ** 2.5)
 
         # Add the sync score to the metrics
         result = {**comparison_metrics, "sync_score": sync_score}
