@@ -1506,6 +1506,10 @@ class Validator(BaseNode, Trainer):
                         positive_ratio_pct=gather_peers_positive_ratio * 100,
                     )
 
+            # [TP] Sync all ranks before master does async slashing to avoid deadlock
+            if self.world_size > 1 and dist.is_initialized():
+                dist.barrier()
+
             # Only master evaluates miner sync and applies slashing
             if self.is_master:
                 await self.slash_for_poor_sync()
@@ -2374,15 +2378,21 @@ class Validator(BaseNode, Trainer):
                 slice_idx = slice(10, 12)  # indices published in miner debug dict
 
                 for n, p in self.model.named_parameters():
-                    if p.numel() < 12:
-                        continue
-
-                    # Handle DTensor case - get local tensor first
+                    # Handle DTensor case - get full tensor first
                     if isinstance(p, DT):
-                        # For DTensor, use the local tensor
-                        local_p = p.to_local()
-                        curr_cpu = local_p.detach().cpu()
+                        # [TP] For DTensor, use full_tensor() to get the complete parameter
+                        full_p = p.full_tensor()
+                        if full_p.numel() < 12:
+                            continue
+                        # Only master rank processes the full tensor
+                        if self.is_master:
+                            curr_cpu = full_p.detach().cpu()
+                        else:
+                            # Non-master ranks participated in collective but don't process
+                            continue
                     else:
+                        if p.numel() < 12:
+                            continue
                         # move current weights to CPU once
                         curr_cpu = p.detach().cpu()
 
@@ -2407,21 +2417,19 @@ class Validator(BaseNode, Trainer):
             # Add debug data including successfully gathered peers
             debug_dict = {}
 
-            # Add model parameters debug info
+            # Add model parameters debug info (sample from local shard to avoid collectives)
             for name, param in self.model.named_parameters():
-                if (
-                    param is not None and param.numel() >= 2
-                ):  # Check if tensor has at least 2 elements
-                    # Handle DTensor case - get local tensor first
+                if param is not None and self.is_master:
+                    # Use to_local() for DTensor to avoid full_tensor() collective deadlock
                     if isinstance(param, DT):
-                        local_param = param.to_local()
-                        debug_dict[name + "_debug"] = (
-                            local_param.flatten()[:2].detach().cpu().tolist()
-                        )
+                        flat = param.to_local().data.flatten()
                     else:
-                        debug_dict[name + "_debug"] = (
-                            param.flatten()[:2].detach().cpu().tolist()
-                        )
+                        flat = param.data.flatten()
+
+                    if flat.numel() > 0:
+                        # Sample last 2 elements to be consistent with comparison
+                        sample = flat[-2:] if flat.numel() >= 2 else flat[-1:]
+                        debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
 
             # Add successful peers information
             if len(skipped_uids) > 0:
@@ -3867,6 +3875,8 @@ class Validator(BaseNode, Trainer):
         Re-create the *exact* index pool a miner used for (uid, window) and
         return a 128-bit hex digest **plus the expected sample count**.
         """
+        # Use rank=0 to get the first DP rank's indices (representative for all TP ranks)
+        # tp_degree doesn't affect _global_indices(), but pass it for consistency
         miner_sampler = tplr.MinerSampler(
             dataset=self.dataset,
             uid=uid,
@@ -3876,7 +3886,10 @@ class Validator(BaseNode, Trainer):
             batch_size=self.hparams.batch_size,
             target_batch_size=self.hparams.target_batch_size,
             rank=0,
-            world_size=1,
+            world_size=self.world_size,
+            tp_degree=int(
+                os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
+            ),
         )
         idxs = miner_sampler._global_indices()
         ids = miner_sampler.ids_for_indices(idxs.tolist())

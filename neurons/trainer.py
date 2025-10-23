@@ -19,6 +19,7 @@
 # Standard library
 import asyncio
 import concurrent.futures
+import os
 import time
 from contextlib import nullcontext
 from typing import Iterable
@@ -58,6 +59,9 @@ class Trainer:
             micro_bs=self.hparams.micro_batch_size,
             rank=self.rank,
             world_size=self.world_size,
+            tp_degree=int(
+                os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
+            ),
         )
 
         if validator:
@@ -119,6 +123,7 @@ class Trainer:
                 device=str(self.device),
                 world_size=self.world_size,
             )
+
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
@@ -827,7 +832,10 @@ class Trainer:
                         log_loss = dist_helper.ddp_reduce(
                             loss_item, op=ReduceOp.AVG, device=self.device
                         )
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                        grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), float("inf")
+                        )
 
                         if not null_round:
                             # Unscale, clip, then step via GradScaler if using fp16
@@ -842,29 +850,35 @@ class Trainer:
 
                         self.inner_optimizer.zero_grad(set_to_none=True)
 
-                        inner_step_count += 1
+                    inner_step_count += 1
 
-                        # reset local accumulators BEFORE the next micro-batch
-                        local_tokens_sum = 0
-                        local_loss_sum = 0
+                    # reset local accumulators BEFORE the next micro-batch
+                    local_tokens_sum = 0
+                    local_loss_sum = 0
 
-                        accum_batch_size = int(
-                            dist_helper.ddp_reduce(accum_batch_size, device=self.device)
+                    accum_batch_size = int(
+                        dist_helper.ddp_reduce(accum_batch_size, device=self.device)
+                    )
+                    if self.is_master:
+                        # Convert grad_norm to scalar (handles both Tensor and DTensor)
+                        grad_norm_scalar = float(
+                            grad_norm_before_clip.item()
+                            if hasattr(grad_norm_before_clip, "item")
+                            else grad_norm_before_clip
                         )
-                        if self.is_master:
-                            tplr.logger.info(
-                                f"Inner Step {inner_step_count}, "
-                                f"Batch {batch_count}, loss: {log_loss:.4f}, "
-                                f"accum: {accum_batch_size}/{self.hparams.batch_size}"
-                            )
-                        if window_entry_loss == 0.0:
-                            total_batches_first_step = int(
-                                dist_helper.ddp_reduce(batch_count, device=self.device)
-                            )
-                            window_entry_loss = (
-                                global_loss_sum / total_batches_first_step
-                            )
-                        accum_batch_size = 0  # reset on *all* ranks
+
+                        tplr.logger.info(
+                            f"Inner Step {inner_step_count}, "
+                            f"Batch {batch_count}, loss: {log_loss:.4f}, "
+                            f"grad_norm: {grad_norm_scalar:.4f}, "
+                            f"accum: {accum_batch_size}/{self.hparams.batch_size}"
+                        )
+                    if window_entry_loss == 0.0:
+                        total_batches_first_step = int(
+                            dist_helper.ddp_reduce(batch_count, device=self.device)
+                        )
+                        window_entry_loss = global_loss_sum / total_batches_first_step
+                    accum_batch_size = 0  # reset on *all* ranks
 
                     # Step the profiler after optimizer step
                     if prof is not None and hasattr(prof, "step"):

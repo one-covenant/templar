@@ -21,6 +21,7 @@ Unified model creation and initialization for TorchTitan models across
 evaluator, validator, and miner components.
 """
 
+import os
 from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -212,6 +213,70 @@ def create_job_config(
     )
 
 
+def _validate_parallel_config(
+    tp_degree: int,
+    pp_degree: int,
+    cp_degree: int,
+    dp_shard: int,
+    dp_replicate: int,
+    world_size: int,
+    tie_embeddings: bool = False,
+) -> None:
+    """Validate parallel configuration parameters.
+
+    Args:
+        tp_degree: Tensor parallelism degree
+        pp_degree: Pipeline parallelism degree
+        cp_degree: Context parallelism degree
+        dp_shard: Data parallel sharding degree (FSDP)
+        dp_replicate: Data parallel replication degree (DDP)
+        world_size: Total number of processes
+        tie_embeddings: Whether embeddings are tied
+
+    Raises:
+        ValueError: If any validation check fails
+    """
+    # Check 1: All degrees must be positive
+    if tp_degree <= 0:
+        raise ValueError("tp_degree cannot be zero.")
+    if pp_degree <= 0:
+        raise ValueError("pp_degree cannot be zero.")
+    if cp_degree <= 0:
+        raise ValueError("cp_degree cannot be zero.")
+    if dp_shard <= 0:
+        raise ValueError("dp_shard cannot be zero.")
+    if dp_replicate <= 0:
+        raise ValueError("dp_replicate cannot be zero.")
+
+    # Check 2: Cannot use both dp_replicate and dp_shard > 1
+    if dp_replicate > 1 and dp_shard > 1:
+        raise ValueError(
+            "Cannot use both dp_replicate and dp_shard > 1. "
+            "Specify either dp_replicate or dp_shard, but not both."
+        )
+
+    # Check 3: dp_replicate requires all model parallel degrees to be 1
+    if dp_replicate > 1 and (tp_degree > 1 or pp_degree > 1 or cp_degree > 1):
+        raise ValueError(
+            f"dp_replicate ({dp_replicate}) can only be used when "
+            f"tp/pp/cp are all 1, but got tp={tp_degree}, pp={pp_degree}, cp={cp_degree}"
+        )
+
+    # Check 4: world_size must be divisible by total parallel degree
+    total_parallel_degree = dp_replicate * dp_shard * tp_degree * pp_degree * cp_degree
+    if world_size % total_parallel_degree != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be divisible by total parallel degree "
+            f"({dp_replicate} × {dp_shard} × {tp_degree} × {pp_degree} × {cp_degree} = {total_parallel_degree})"
+        )
+
+    # Check 5: Enforce tie_embeddings=false when TP>1
+    if tp_degree > 1 and tie_embeddings:
+        raise ValueError(
+            "torchtitan.tie_embeddings must be false when TP>1 (embedding layers split across TP shards)."
+        )
+
+
 def create_parallel_dims(
     world_size: int,
     hparams: SimpleNamespace,
@@ -251,75 +316,153 @@ def create_parallel_dims(
             world_size=world_size,
         )
     elif role == "validator":
-        # Validator: pipeline parallelism with data parallel replication
-        # Ensure dp_shard is at least 1 to prevent division by zero
-        dp_shard = 4
-        if world_size % dp_shard != 0:
-            raise ValueError(
-                f"World size ({world_size}) must be divisible by "
-                f"dp_shard degree ({dp_shard})"
-            )
-        return ParallelDims(
-            dp_replicate=world_size // dp_shard,
+        # Validator: read all parallel config from hparams (same as miner)
+        # Support environment variable override for tp_degree and dp_shard
+        tt = getattr(hparams, "torchtitan", SimpleNamespace())
+
+        # Allow environment variable to override tp_degree from hparams (safe parse)
+        tp_env = os.getenv("TP_DEGREE")
+        if tp_env is not None:
+            try:
+                tp_degree = int(tp_env)
+            except ValueError:
+                raise ValueError(f"TP_DEGREE must be an integer, got: {tp_env!r}")
+        else:
+            tp_degree = int(getattr(tt, "tp_degree", 1))
+
+        pp_degree = int(getattr(tt, "pp_degree", 1))
+        cp_degree = int(getattr(tt, "cp_degree", 1))
+        dp_replicate = int(getattr(tt, "dp_replicate", 1))
+
+        # Early validation for zero values (before using in calculations)
+        if tp_degree <= 0:
+            raise ValueError("tp_degree cannot be zero.")
+        if pp_degree <= 0:
+            raise ValueError("pp_degree cannot be zero.")
+        if cp_degree <= 0:
+            raise ValueError("cp_degree cannot be zero.")
+        if dp_replicate <= 0:
+            raise ValueError("dp_replicate cannot be zero.")
+
+        # For dp_shard: check if explicitly set in env var or hparams (safe parse)
+        # If neither is set, auto-calculate from world_size for backward compatibility
+        env_dp_shard = os.getenv("DP_SHARD")
+        hparam_dp_shard = getattr(tt, "dp_shard", None)
+
+        if env_dp_shard is not None:
+            # Environment variable takes highest priority (safe parse)
+            try:
+                dp_shard = int(env_dp_shard)
+            except ValueError:
+                raise ValueError(f"DP_SHARD must be an integer, got: {env_dp_shard!r}")
+        elif hparam_dp_shard is not None:
+            # Use hparams value if set
+            dp_shard = int(hparam_dp_shard)
+        else:
+            # Auto-calculate from world_size for backward compatibility
+            # dp_shard = world_size / (tp_degree * pp_degree * cp_degree * dp_replicate)
+            divisor = tp_degree * pp_degree * cp_degree * dp_replicate
+            if world_size % divisor != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) must be divisible by "
+                    f"tp_degree({tp_degree}) * pp_degree({pp_degree}) * cp_degree({cp_degree}) * dp_replicate({dp_replicate})"
+                )
+            dp_shard = world_size // divisor
+
+        # Validate dp_shard is not zero
+        if dp_shard <= 0:
+            raise ValueError("dp_shard cannot be zero.")
+
+        # Validate configuration (includes all checks)
+        tie_embeddings = getattr(tt, "tie_embeddings", True)
+        _validate_parallel_config(
+            tp_degree=tp_degree,
+            pp_degree=pp_degree,
+            cp_degree=cp_degree,
             dp_shard=dp_shard,
-            tp=1,
-            pp=1,
-            cp=1,
+            dp_replicate=dp_replicate,
+            world_size=world_size,
+            tie_embeddings=tie_embeddings,
+        )
+
+        return ParallelDims(
+            dp_replicate=dp_replicate,
+            dp_shard=dp_shard,
+            tp=tp_degree,
+            pp=pp_degree,
+            cp=cp_degree,
             ep=1,
             world_size=world_size,
         )
     else:  # miner
-        # Miner: flexible configuration from hparams
+        # Miner: read all parallel config from hparams (same as validator)
+        # Support environment variable override for tp_degree and dp_shard
         tt = getattr(hparams, "torchtitan", SimpleNamespace())
 
-        tp_degree = int(getattr(tt, "tp_degree", 1))
+        # Allow environment variable to override tp_degree from hparams (safe parse)
+        tp_env = os.getenv("TP_DEGREE")
+        if tp_env is not None:
+            try:
+                tp_degree = int(tp_env)
+            except ValueError:
+                raise ValueError(f"TP_DEGREE must be an integer, got: {tp_env!r}")
+        else:
+            tp_degree = int(getattr(tt, "tp_degree", 1))
+
         pp_degree = int(getattr(tt, "pp_degree", 1))
         cp_degree = int(getattr(tt, "cp_degree", 1))
-        dp_replicate = getattr(tt, "dp_replicate", 1)
-        dp_shard = getattr(tt, "dp_shard", 1)
+        dp_replicate = int(getattr(tt, "dp_replicate", 1))
 
-        # Ensure divisors are not zero before coercion to 1 and modulo operations
-        if dp_replicate == 0:
-            raise ValueError("dp_replicate cannot be zero.")
-        if dp_shard == 0:
-            raise ValueError("dp_shard cannot be zero.")
-        if tp_degree == 0:
+        # Early validation for zero values (before using in calculations)
+        if tp_degree <= 0:
             raise ValueError("tp_degree cannot be zero.")
-        if pp_degree == 0:
+        if pp_degree <= 0:
             raise ValueError("pp_degree cannot be zero.")
-        if cp_degree == 0:
+        if cp_degree <= 0:
             raise ValueError("cp_degree cannot be zero.")
+        if dp_replicate <= 0:
+            raise ValueError("dp_replicate cannot be zero.")
 
-        # Coerce to int after zero checks
-        dp_replicate = int(dp_replicate)
-        dp_shard = int(dp_shard)
-        tp_degree = int(tp_degree)
-        pp_degree = int(pp_degree)
-        cp_degree = int(cp_degree)
+        # For dp_shard: check if explicitly set in env var or hparams (safe parse)
+        # If neither is set, auto-calculate from world_size for backward compatibility
+        env_dp_shard = os.getenv("DP_SHARD")
+        hparam_dp_shard = getattr(tt, "dp_shard", None)
 
-        # Validation
-        if dp_replicate > 1 and dp_shard > 1:
-            raise ValueError(
-                "Specify either torchtitan.dp_replicate or torchtitan.dp_shard, "
-                "but not both."
-            )
+        if env_dp_shard is not None:
+            # Environment variable takes highest priority (safe parse)
+            try:
+                dp_shard = int(env_dp_shard)
+            except ValueError:
+                raise ValueError(f"DP_SHARD must be an integer, got: {env_dp_shard!r}")
+        elif hparam_dp_shard is not None:
+            # Use hparams value if set
+            dp_shard = int(hparam_dp_shard)
+        else:
+            # Auto-calculate from world_size for backward compatibility
+            # dp_shard = world_size / (tp_degree * pp_degree * cp_degree * dp_replicate)
+            divisor = tp_degree * pp_degree * cp_degree * dp_replicate
+            if world_size % divisor != 0:
+                raise ValueError(
+                    f"world_size ({world_size}) must be divisible by "
+                    f"tp_degree({tp_degree}) * pp_degree({pp_degree}) * cp_degree({cp_degree}) * dp_replicate({dp_replicate})"
+                )
+            dp_shard = world_size // divisor
 
-        if dp_replicate > 1 and (tp_degree > 1 or pp_degree > 1 or cp_degree > 1):
-            raise ValueError("dp_replicate can only be used when tp/pp/cp are all 1.")
+        # Validate dp_shard is not zero
+        if dp_shard <= 0:
+            raise ValueError("dp_shard cannot be zero.")
 
-        # Ensure world_size is divisible by the product of all parallel degrees
-        total_parallel_degree = (
-            dp_replicate * dp_shard * tp_degree * pp_degree * cp_degree
+        # Validate configuration (includes all checks)
+        tie_embeddings = getattr(tt, "tie_embeddings", True)
+        _validate_parallel_config(
+            tp_degree=tp_degree,
+            pp_degree=pp_degree,
+            cp_degree=cp_degree,
+            dp_shard=dp_shard,
+            dp_replicate=dp_replicate,
+            world_size=world_size,
+            tie_embeddings=tie_embeddings,
         )
-        if (
-            total_parallel_degree == 0
-        ):  # Should be caught by individual zero checks, but as a safeguard
-            raise ValueError("Product of parallel degrees cannot be zero.")
-        if world_size % total_parallel_degree != 0:
-            raise ValueError(
-                f"world_size ({world_size}) must be divisible by the product of all parallel degrees "
-                f"({dp_replicate}x{dp_shard}x{tp_degree}x{pp_degree}x{cp_degree} = {total_parallel_degree})."
-            )
 
         return ParallelDims(
             dp_replicate=dp_replicate,

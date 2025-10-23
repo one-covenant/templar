@@ -80,12 +80,12 @@
   },
   "offload_optimizer_states": true,
   "torchtitan": {
-    "tp_degree": 1,
+    "tp_degree": 8,
     "pp_degree": 1,
     "cp_degree": 1,
 
     "dp_replicate": 1,
-    "dp_shard": 8,
+    "dp_shard": 1,
 
     "compile": true,
     "enable_cpu_offload": false,
@@ -100,7 +100,7 @@
 
     "float8_recipe_name": null,
     
-    "tie_embeddings": true,
+    "tie_embeddings": false,
 
     "activation_checkpoint": {
       "mode": "selective",
