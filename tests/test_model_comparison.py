@@ -258,7 +258,6 @@ async def test_avg_change_one_step(setup_model):
         debug_dict,
         learning_rate=0.01,  # LR should be ignored here
         param_avg_change=param_avg_change,
-        index_range=(0, 2),
     )
 
     assert res["success"] is True
@@ -286,7 +285,6 @@ async def test_avg_change_half_step(setup_model):
         debug_dict,
         learning_rate=0.01,
         param_avg_change=param_avg_change,
-        index_range=(0, 2),
     )
 
     assert res["avg_steps_behind"] == pytest.approx(2.0, abs=1e-2)
@@ -314,7 +312,6 @@ async def test_avg_change_length_mismatch_fallback(setup_model):
         debug_dict,
         learning_rate=lr,
         param_avg_change=param_avg_change,
-        index_range=(0, 2),
     )
 
     # Fallback should make it behave like LR-based comparison → 1 step

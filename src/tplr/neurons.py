@@ -654,8 +654,8 @@ async def load_checkpoint_with_fallback(
                 # Fallback if we can't get bootstrap start_window
                 ckpt_global_step = 0
                 tplr.logger.info(
-                    f"Bootstrap checkpoint has no global_step and couldn't fetch bootstrap start_window, "
-                    f"setting to 0 (will be corrected during catch-up)"
+                    "Bootstrap checkpoint has no global_step and couldn't fetch bootstrap start_window, "
+                    "setting to 0 (will be corrected during catch-up)"
                 )
         else:
             # For current version checkpoints, calculate from window difference
@@ -1001,9 +1001,12 @@ async def catchup_with_aggregation_server(
         if instance.is_master and (start_w - checkpoint_current_window) % 5 == 0:
             log_memory_usage(f"After window {start_w} cleanup")
         # ──────────────────────────────────────────────────────────────────────
-        # 3) Debug‑dict comparison to estimate “how many steps behind” we are
+        # 3) Debug‑dict comparison to estimate "how many steps behind" we are
         # ──────────────────────────────────────────────────────────────────────
         try:
+            # [TP] All ranks must participate in compare_model_with_debug_dict
+            # because it calls full_tensor() on DTensors (collective operation)
+            debug_dict = None
             if instance.is_master:
                 debug_fetch = await instance.comms.get(
                     uid=str(leader_uid),
@@ -1039,16 +1042,27 @@ async def catchup_with_aggregation_server(
                                 )
                         prev_param_state[name] = curr_slice.clone()
 
-                    # --- call shared comparison helper --------------------------
-                    lr = instance.outer_optimizer.param_groups[0]["lr"]
-                    cmp = await compare_model_with_debug_dict(
-                        model=instance.model,
-                        debug_dict=debug_dict,
-                        learning_rate=lr,
-                        index_range=(0, 2),
-                        param_avg_change=param_avg_change,
-                    )
+            # Broadcast whether debug_dict exists so all ranks know whether to skip
+            has_debug_dict = torch.tensor(
+                [1 if debug_dict is not None else 0],
+                dtype=torch.int32,
+                device=instance.config.device,
+            )
+            dist_helper.broadcast(has_debug_dict, src=0)
 
+            # All ranks call comparison (required for DTensor collectives)
+            # Note: debug_dict is None on non-master ranks, but that's ok - they just
+            # won't find any matching keys, but they'll still participate in full_tensor() calls
+            if has_debug_dict.item():
+                lr = instance.outer_optimizer.param_groups[0]["lr"]
+                cmp = await compare_model_with_debug_dict(
+                    model=instance.model,
+                    debug_dict=debug_dict if debug_dict is not None else {},
+                    learning_rate=lr,
+                    param_avg_change=param_avg_change if param_avg_change else {},
+                )
+
+                if instance.is_master:
                     if cmp["success"]:
                         tplr.logger.info(
                             f"[catch‑up] window {start_w} "
@@ -1059,12 +1073,13 @@ async def catchup_with_aggregation_server(
                         tplr.logger.warning(
                             f"[catch‑up] debug‑dict comparison failed for window {start_w}"
                         )
-                else:
-                    tplr.logger.warning(
-                        f"[catch‑up] no debug‑dict found for window {start_w}"
-                    )
+            elif instance.is_master:
+                tplr.logger.warning(
+                    f"[catch‑up] no debug‑dict found for window {start_w}"
+                )
         except Exception as exc:
-            tplr.logger.warning(f"[catch‑up] debug‑dict processing error: {exc}")
+            if instance.is_master:
+                tplr.logger.warning(f"[catch‑up] debug‑dict processing error: {exc}")
 
         # Increment global_step since we performed an outer step
         instance.global_step += 1
@@ -1095,7 +1110,6 @@ async def compare_model_with_debug_dict(
     param_avg_change: dict[str, torch.Tensor] | None = None,
     *,
     min_step_size: float = 1e-9,
-    index_range: tuple[int, int] = (0, 2),
 ) -> dict[str, bool | float | int]:
     """
     Compare weights with published debug snippets and return sync metrics.
@@ -1124,10 +1138,15 @@ async def compare_model_with_debug_dict(
             continue
 
         # --- grab the slice we care about --------------------------------
+        # Sample from the end of the local shard (matches debug dict generation)
+        # This avoids needing full_tensor() collective for DTensor
         if isinstance(p, DT):
-            curr_slice = p.to_local().data.flatten()[index_range[0] : index_range[1]]
+            flat = p.to_local().data.flatten()
         else:
-            curr_slice = p.data.flatten()[index_range[0] : index_range[1]]
+            flat = p.data.flatten()
+
+        # Always sample last 2 elements to match debug dict generation at [-2:]
+        curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
 
         debug_slice = torch.tensor(
             debug_dict[key], dtype=p.dtype, device=curr_slice.device

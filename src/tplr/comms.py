@@ -96,7 +96,9 @@ class Comms(ChainManager):
         self.wallet = wallet
 
         # Create temp directory for this instance
-        self.temp_dir = os.path.join("/tmp", f"templar_{self.uid}")
+        # Respect TMPDIR environment variable, fallback to /tmp
+        base_tmp = os.getenv("TMPDIR", "/tmp")
+        self.temp_dir = os.path.join(base_tmp, f"templar_{self.uid}")
         os.makedirs(self.temp_dir, exist_ok=True)
         # Get the bucket directly
         self.bucket = self.get_own_bucket("gradients", "write")
@@ -1299,7 +1301,9 @@ class Comms(ChainManager):
         put_start = tplr.T()
 
         # Create per-uid temp directory
-        temp_dir = os.path.join("/tmp", str(self.uid))
+        # Respect TMPDIR environment variable, fallback to /tmp
+        base_tmp = os.getenv("TMPDIR", "/tmp")
+        temp_dir = os.path.join(base_tmp, str(self.uid))
         os.makedirs(temp_dir, exist_ok=True)
         temp_file_path = os.path.join(temp_dir, f"temp_{filename}")
 

@@ -58,9 +58,7 @@ class TestCompareModelWithDebugDict(unittest.TestCase):
         # Debug dict should contain last 2 elements to match to_local() behavior
         debug_dict = {"param1_debug": [2.0, 3.0]}
         result = asyncio.run(
-            compare_model_with_debug_dict(
-                self.model, debug_dict, 0.01, index_range=(0, 2)
-            )
+            compare_model_with_debug_dict(self.model, debug_dict, 0.01)
         )
         self.assertTrue(result["success"])
         self.assertAlmostEqual(result["l2_norm"], 0.0)
@@ -73,9 +71,7 @@ class TestCompareModelWithDebugDict(unittest.TestCase):
         # Debug dict should contain last 2 elements (but with different values)
         debug_dict = {"param1_debug": [2.2, 3.3]}
         result = asyncio.run(
-            compare_model_with_debug_dict(
-                self.model, debug_dict, 0.01, index_range=(0, 2)
-            )
+            compare_model_with_debug_dict(self.model, debug_dict, 0.01)
         )
         self.assertTrue(result["success"])
         self.assertGreater(result["l2_norm"], 0.0)

@@ -2375,32 +2375,21 @@ class Validator(BaseNode, Trainer):
                 )
 
             with torch.no_grad():
-                slice_idx = slice(10, 12)  # indices published in miner debug dict
-
                 for n, p in self.model.named_parameters():
-                    # Handle DTensor case - get full tensor first
+                    # Sample from local shard to avoid collectives (matches debug dict generation)
                     if isinstance(p, DT):
-                        # [TP] For DTensor, use full_tensor() to get the complete parameter
-                        full_p = p.full_tensor()
-                        if full_p.numel() < 12:
-                            continue
-                        # Only master rank processes the full tensor
-                        if self.is_master:
-                            curr_cpu = full_p.detach().cpu()
-                        else:
-                            # Non-master ranks participated in collective but don't process
-                            continue
+                        flat = p.to_local().detach().cpu().flatten()
                     else:
-                        if p.numel() < 12:
-                            continue
-                        # move current weights to CPU once
-                        curr_cpu = p.detach().cpu()
+                        flat = p.detach().cpu().flatten()
+
+                    # Sample last 2 elements (or 1 if that's all there is) to match debug dict generation
+                    if flat.numel() == 0:
+                        continue
+                    curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
 
                     # compute delta only if we have a previous slice
                     if n in self.prev_param_state:
                         prev_slice = self.prev_param_state[n]
-                        curr_slice = curr_cpu.flatten()[slice_idx]
-
                         delta_slice = torch.abs(curr_slice - prev_slice)
 
                         # lazy-init & EMA update
@@ -2412,7 +2401,7 @@ class Validator(BaseNode, Trainer):
                             ).add_(delta_slice * self.param_change_alpha)
 
                     # stash the new slice for next iteration
-                    self.prev_param_state[n] = curr_cpu.flatten()[slice_idx].clone()
+                    self.prev_param_state[n] = curr_slice.clone()
 
             # Add debug data including successfully gathered peers
             debug_dict = {}
@@ -3015,7 +3004,6 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
-            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 

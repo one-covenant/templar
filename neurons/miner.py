@@ -787,7 +787,7 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
-            # [TP] All ranks must call full_tensor() for DTensors, then only master uploads
+            # [TP] Debug sampling avoids collectives: master samples local shards via to_local(), non-masters skip
             debug_dict = {}
 
             # Add model parameters debug info (sample from local shard to avoid collectives)

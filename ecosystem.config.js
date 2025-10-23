@@ -1,4 +1,5 @@
-// ecosystem.config.js
+// ecosystem.config.js - Two TP Miners Configuration
+// 1 Validator + 2 Miners, all using TP
 require('dotenv').config({ path: '.env' });
 
 const { execSync } = require('child_process');
@@ -12,7 +13,7 @@ const PROJECT_NAME = `test_${RANDOM_SUFFIX}`;
 
 module.exports = {
   apps: [
-    /*───────────────────────── Miner ─────────────────────────*/
+    /*───────────────────────── Miners ─────────────────────────*/
     {
       name            : "TM1",
       exec_mode       : "fork",
