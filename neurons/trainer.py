@@ -394,8 +394,9 @@ class Trainer:
 
         # Average loss across all ranks, sum batches for distributed training
         if world_size > 1 and dist_helper.is_distributed():
-            total_loss = dist_helper.ddp_reduce(total_loss, device=device)
-            n_batches = int(dist_helper.ddp_reduce(n_batches, device=device))
+            # TP ranks process same data, so divide by tp_degree
+            total_loss = dist_helper.ddp_reduce(total_loss, device=device) / self.tp_degree
+            n_batches = int(dist_helper.ddp_reduce(n_batches, device=device) / self.tp_degree)
 
         return total_loss, n_batches
 
@@ -817,12 +818,15 @@ class Trainer:
                         tp.record_function("Optimizer Step") if prof else nullcontext()
                     ):
                         # ── one collective for scalar stats per inner step ───────────
+                        # Reduce across all ranks, then divide by tp_degree
+                        # (TP ranks process same data, so we count them only once)
                         global_tokens_step = int(
-                            dist_helper.ddp_reduce(local_tokens_sum, device=self.device)
+                            dist_helper.ddp_reduce(local_tokens_sum, device=self.device) / self.tp_degree
                         )
+                        # Loss needs same treatment - TP ranks have identical loss
                         global_loss_step = dist_helper.ddp_reduce(
                             local_loss_sum, device=self.device
-                        )
+                        ) / self.tp_degree
                         global_tokens += global_tokens_step
                         global_loss_sum += global_loss_step
 
@@ -833,19 +837,19 @@ class Trainer:
                             loss_item, op=ReduceOp.AVG, device=self.device
                         )
 
-                        grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(), float("inf")
-                        )
-
                         if not null_round:
                             # Unscale, clip, then step via GradScaler if using fp16
                             self.scaler.unscale_(self.inner_optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                             self.scaler.step(self.inner_optimizer)
                             self.scaler.update()
                             self.inner_scheduler.step()
                         else:
                             # Spin-up: don't step optimizer/scheduler, just clear gradients
+                            # Still compute grad norm for logging even in null rounds
+                            grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), float("inf")
+                            )
                             self.scaler.update()
 
                         self.inner_optimizer.zero_grad(set_to_none=True)
@@ -856,8 +860,9 @@ class Trainer:
                     local_tokens_sum = 0
                     local_loss_sum = 0
 
+                    # TP ranks have same accumulated batch size, divide by tp_degree
                     accum_batch_size = int(
-                        dist_helper.ddp_reduce(accum_batch_size, device=self.device)
+                        dist_helper.ddp_reduce(accum_batch_size, device=self.device) / self.tp_degree
                     )
                     if self.is_master:
                         # Convert grad_norm to scalar (handles both Tensor and DTensor)
@@ -874,8 +879,9 @@ class Trainer:
                             f"accum: {accum_batch_size}/{self.hparams.batch_size}"
                         )
                     if window_entry_loss == 0.0:
+                        # TP ranks process same batches, divide by tp_degree
                         total_batches_first_step = int(
-                            dist_helper.ddp_reduce(batch_count, device=self.device)
+                            dist_helper.ddp_reduce(batch_count, device=self.device) / self.tp_degree
                         )
                         window_entry_loss = global_loss_sum / total_batches_first_step
                     accum_batch_size = 0  # reset on *all* ranks
@@ -949,7 +955,8 @@ class Trainer:
         # ---------------------------------------------------------------------- #
         # 7. Return aggregated metrics
         # ---------------------------------------------------------------------- #
-        batch_count = int(dist_helper.ddp_reduce(batch_count, device=self.device))
+        # Batch count: TP ranks process same batches, so divide by tp_degree
+        batch_count = int(dist_helper.ddp_reduce(batch_count, device=self.device) / self.tp_degree)
         return {
             "total_loss": global_loss_sum,  # cross-rank sum
             "window_entry_loss": window_entry_loss,

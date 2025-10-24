@@ -328,6 +328,11 @@ class Validator(BaseNode, Trainer):
             use_local_run_hparams=cast(bool, self.config.local)
         )
 
+        # Store parallelization parameters
+        tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
+        # Check environment variable first for runtime override, then hparams
+        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
+
         # Init bittensor objects
         self.wallet = bt.wallet(config=self.config)
         super().__init__()

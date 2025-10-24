@@ -204,7 +204,8 @@ class Miner(BaseNode, Trainer):
 
         # Store parallelization parameters for later use
         tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
-        self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        # Check environment variable first for runtime override, then hparams
+        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
         self.pp_degree = int(getattr(tt, "pp_degree", 1))
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))

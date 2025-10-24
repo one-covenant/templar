@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import bittensor as bt
@@ -231,6 +232,11 @@ class Evaluator:
         # Load hyperparameters
         self.hparams = tplr.load_hparams()
         tplr.logger.info(f"Loaded hparams for {self.hparams.model_size}")
+
+        # Store parallelization parameters
+        tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
+        # Check environment variable first for runtime override, then hparams
+        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
 
         # Initialize distributed using the helper
         dist_helper.init_process_group()
@@ -796,18 +802,19 @@ class Evaluator:
 
         # All-reduce across ranks
         if self.world_size > 1:
+            # TP ranks process same data, so divide by tp_degree after reduction
             total_loss = dist_helper.ddp_reduce(
                 local_loss, op=dist.ReduceOp.SUM, device=self.device
-            )
+            ) / self.tp_degree
             total_tokens = int(
                 dist_helper.ddp_reduce(
                     local_tokens, op=dist.ReduceOp.SUM, device=self.device
-                )
+                ) / self.tp_degree
             )
             total_bytes = int(
                 dist_helper.ddp_reduce(
                     local_bytes, op=dist.ReduceOp.SUM, device=self.device
-                )
+                ) / self.tp_degree
             )
         else:
             total_loss = local_loss
