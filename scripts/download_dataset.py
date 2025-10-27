@@ -100,30 +100,36 @@ async def download_files(shard_indices, output_path):
 
     print(f"Output directory: {output_path.absolute()}")
 
+    # Change to output directory so s3_get_object saves files there
+    # This avoids filling up the root filesystem with temp files
+    original_dir = os.getcwd()
+    os.chdir(output_path)
+
     # Build list of files to download based on shard indices
     files_to_download = []
     skipped_files = []
 
     for idx in shard_indices:
-        # Use SharedShardedDataset.locate_shards to get the correct filenames
-        # This returns the full paths as they should be in both S3 and locally
-        tokens_file, ids_file = SharedShardedDataset.locate_shards(
-            shard_index=idx, custom_path=output_path
-        )
+        # Get just the filenames (we're now in the output directory)
+        filename_tokens = f"train_{idx:06d}.npy"
+        filename_ids = f"sample_ids_{idx:06d}.bin"
 
-        # The S3 keys and local paths should match exactly
-        for file_path in [tokens_file, ids_file]:
-            local_file = Path(file_path)
+        # The S3 keys are under the "tokenized/" prefix
+        for filename in [filename_tokens, filename_ids]:
+            local_file = Path(filename)
 
             if local_file.exists():
                 file_size = local_file.stat().st_size
                 print(
-                    f"✓ Skipping {file_path} (already exists, size: {file_size:,} bytes)"
+                    f"✓ Skipping {filename} (already exists, size: {file_size:,} bytes)"
                 )
-                skipped_files.append(file_path)
+                skipped_files.append(str(local_file))
             else:
-                # Both S3 key and local path are the same
-                files_to_download.append((file_path, file_path))
+                # Construct S3 key from the filename (add tokenized/ prefix)
+                s3_key = f"tokenized/{filename}"
+                # s3_get_object will save to s3_key path (tokenized/train_000000.npy)
+                # We want it at just the filename (train_000000.npy)
+                files_to_download.append((s3_key, filename))
 
     if not files_to_download:
         print(f"\nAll files for shards {sorted(shard_indices)} already exist locally.")
@@ -147,8 +153,9 @@ async def download_files(shard_indices, output_path):
             # Create parent directory if needed
             Path(local_path).parent.mkdir(parents=True, exist_ok=True)
 
-            # Create download task - s3_get_object will save to the key path when load_data=False
-            # We'll need to move it to our desired location afterwards
+            # Create download task
+            # s3_get_object will download using s3_key and save to that path
+            # After download completes, we'll move it to local_path
             task = comms.s3_get_object(
                 key=s3_key,
                 bucket=bucket,
@@ -168,14 +175,35 @@ async def download_files(shard_indices, output_path):
             try:
                 result = await task
                 if result:
-                    # When load_data=False, s3_get_object saves to the key path
-                    # Since our S3 key and local path are the same, the file should be at local_path
-                    if Path(local_path).exists():
-                        file_size = Path(local_path).stat().st_size
-                        print(f"✓ Downloaded {local_path} ({file_size:,} bytes)")
+                    # When load_data=False, s3_get_object returns the path where it saved the file
+                    downloaded_path = Path(result)
+                    target_path = Path(local_path)
+
+                    # Check if file ended up at the target location already
+                    if target_path.exists():
+                        file_size = target_path.stat().st_size
+                        print(f"✓ Downloaded {target_path} ({file_size:,} bytes)")
                         success_count += 1
+                    elif downloaded_path.exists():
+                        # File is at a different location, move it
+                        if downloaded_path != target_path:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(downloaded_path), str(target_path))
+                            # Clean up empty directories
+                            try:
+                                downloaded_path.parent.rmdir()
+                            except:
+                                pass
+
+                        if target_path.exists():
+                            file_size = target_path.stat().st_size
+                            print(f"✓ Downloaded {target_path} ({file_size:,} bytes)")
+                            success_count += 1
+                        else:
+                            print(f"✗ Failed to move {downloaded_path} to {local_path}")
+                            fail_count += 1
                     else:
-                        print(f"✗ Failed to save {local_path}")
+                        print(f"✗ File not found after download: {downloaded_path}")
                         fail_count += 1
                 else:
                     print(f"✗ Failed to download {s3_key}")
@@ -191,6 +219,12 @@ async def download_files(shard_indices, output_path):
             print(f"\nFiles saved to: {output_path.absolute()}")
 
     finally:
+        # Restore original directory
+        try:
+            os.chdir(original_dir)
+        except:
+            pass
+
         await comms.close_all_s3_clients()
 
         # Clean up temp directory if it exists

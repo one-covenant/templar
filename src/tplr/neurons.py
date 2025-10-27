@@ -30,6 +30,14 @@ import torch.nn as nn
 from torch.distributed.tensor import DTensor as DT
 from torch.distributed.tensor import distribute_tensor
 from torch.optim import Optimizer
+
+# Cache DTensor type for fast isinstance checks
+try:
+    from torch.distributed._tensor import DTensor as _DTensor
+
+    _DTENSOR_TYPE = _DTensor
+except ImportError:
+    _DTENSOR_TYPE = DT
 from torch.optim.lr_scheduler import LRScheduler
 from wandb.sdk.wandb_run import Run
 
@@ -61,12 +69,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         return dist.is_available() and dist.is_initialized()
 
     def is_dtensor(x):
-        try:
-            from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
-
-            return isinstance(x, DTensor)
-        except Exception:
-            return type(x).__name__ in {"DTensor", "DistributedTensor", "DT"}
+        """Fast DTensor check using cached type."""
+        return isinstance(x, _DTENSOR_TYPE)
 
     def get_mesh_group(x):
         if not is_dtensor(x):
@@ -118,29 +122,39 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         g = getattr(p, "grad", None)
         g_is_dt = is_dtensor(g)
 
-        # --- 1) Grad full_tensor rendezvous (GFULL) ---
-        if g_is_dt:
-            grp_g = get_mesh_group(g)
-            barrier(grp_g)
-            assert g is not None
-            grad_full = g.full_tensor().to(p.device)
-            barrier(grp_g)
-        else:
-            if g is None and not p_is_dt:
-                continue
-            assert g is not None, f"p.grad is None for {n}"
-            grad_full = g.to(p.device)
+        # Skip if no gradient
+        if g is None and not p_is_dt:
+            continue
+        if g is None:
+            continue
 
-        # Non-owners: after participating in grad collective, drop grad and continue.
+        # Non-owners: drop grad and continue early
         if not owned:
             p.grad = None
             continue
 
-        # --- 3) Momentum buffer update (owner only) ---
+        # --- 1) Get gradient (local shard for DTensor, full for regular) ---
+        # For DTensor: use local shard to avoid expensive full_tensor() collective
+        # This means each TP rank will compress and exchange its own shard
+        shard_metadata = None
+        if g_is_dt:
+            # Use local shard only - no expensive collective!
+            grad_local = g.to_local().to(p.device)
+            # Store metadata for receiver to reconstruct DTensor
+            shard_metadata = {
+                "global_shape": tuple(g.size()),  # Global shape
+                "device_mesh": getattr(g, "device_mesh", None),
+                "placements": getattr(g, "placements", None),
+            }
+            grad_to_compress = grad_local
+        else:
+            grad_to_compress = g.to(p.device)
+
+        # --- 2) Momentum buffer update (owner only) ---
         # Handle DTensor error feedback by creating new regular tensor if needed
         error_feedback = miner.error_feedback[n]
         if error_feedback is None:
-            error_feedback = torch.zeros_like(grad_full, device=p.device)
+            error_feedback = torch.zeros_like(grad_to_compress, device=p.device)
         elif error_feedback.device != p.device:
             # Should already be on GPU from batch load, but handle edge cases
             error_feedback = error_feedback.to(p.device)
@@ -150,7 +164,7 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             error_feedback.zero_()
         else:
             error_feedback.mul_(miner.hparams.momentum_decay)
-            error_feedback.add_(grad_full, alpha=lr)
+            error_feedback.add_(grad_to_compress, alpha=lr)
 
         # --- 4) Encode & compress (owner only) ---
         encoded = miner.transformer.encode(error_feedback, use_dct=use_dct)
@@ -199,6 +213,10 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         xshapes[n] = xshape
         totalks[n] = totalk
 
+        # Store shard metadata for DTensor gradients
+        if shard_metadata is not None:
+            gradient[n + "shard_metadata"] = shard_metadata
+
         # Clear per-param grad
         p.grad = None
 
@@ -208,7 +226,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             miner.error_feedback[name] is not None
             and miner.error_feedback[name].is_cuda
         ):
-            # Copy to the pre-allocated pinned buffer
+            # Copy to the pre-allocated pinned buffer (fast path)
+            # Buffers are now correctly sized for both FSDP and TP
             miner.error_feedback_cpu_buffers[name].copy_(
                 miner.error_feedback[name], non_blocking=True
             )
@@ -218,7 +237,15 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-    gradient["metadata"] = {"window": step_window}
+
+    # Include xshapes and totalks in gradient dict for cross-TP-degree compatibility
+    # This allows validators with different TP degrees to correctly decompress
+    gradient["metadata"] = {
+        "window": step_window,
+        "xshapes": xshapes,
+        "totalks": totalks,
+    }
+
     return gradient, xshapes, totalks
 
 
@@ -307,6 +334,15 @@ def outer_step(
             return tuple(_idx_to_device(x, dev) for x in obj)
         return obj
 
+    # Extract miner's xshapes/totalks from metadata if available (for cross-TP-degree compatibility)
+    miner_xshapes = None
+    miner_totalks = None
+    if on_src and src_sd is not None:
+        metadata = src_sd.get("metadata", {})
+        if isinstance(metadata, dict):
+            miner_xshapes = metadata.get("xshapes")
+            miner_totalks = metadata.get("totalks")
+
     for name, p in model.named_parameters():
         # ---- master decides if this param has an update; others receive a flag ----
         has_update = 0
@@ -316,6 +352,7 @@ def outer_step(
             idxs = src_sd.get(name + "idxs")
             vals = src_sd.get(name + "vals")
             qps = src_sd.get(name + "quant_params")
+            shard_meta = src_sd.get(name + "shard_metadata")
 
             if idxs is not None and vals is not None:
                 if not isinstance(idxs, (list, tuple)):
@@ -327,7 +364,7 @@ def outer_step(
                 if vals_f32:
                     # Ensure indices (or packed tuples) live on the same device as 'ref'
                     idxs_dev = _idx_to_device(idxs, device)
-                    payload = (idxs_dev, vals_f32)
+                    payload = (idxs_dev, vals_f32, shard_meta)
                     has_update = 1
 
         flag_result = _bcast_flag(has_update)
@@ -342,7 +379,7 @@ def outer_step(
         # ------- build the full dense grad on the source rank only -------
         if on_src:
             try:
-                idxs_dev, vals_f32 = payload  # type: ignore[misc]
+                idxs_dev, vals_f32, shard_meta = payload  # type: ignore[misc]
                 # Per-block norms for stats/optional clipping inside batch_decompress
                 block_norms = torch.stack([torch.norm(v, p=2) for v in vals_f32])
 
@@ -351,25 +388,39 @@ def outer_step(
                 min_median_norm = min(min_median_norm, med)
                 max_median_norm = max(max_median_norm, med)
 
-                # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                ref = torch.empty_like(p, device=device, dtype=p.dtype)
+                # Use miner's xshapes/totalks if available (for cross-TP-degree compatibility)
+                # Otherwise fall back to validator's own xshapes/totalks
+                param_xshape = (miner_xshapes or xshapes).get(name, xshapes[name])
+                param_totalk = (miner_totalks or totalks).get(name, totalks[name])
+                # Decompress using the shape that was compressed (shard or full)
+                ref = torch.empty(param_xshape, device=device, dtype=p.dtype)
+
                 decompressed = compressor.batch_decompress(
                     ref,
                     idxs_dev,
                     vals_f32,
-                    xshapes[name],
-                    totalks[name],
+                    param_xshape,
+                    param_totalk,
                     quantize_params=None,
                     block_norms=block_norms,
                     normalise=False,
                     clip_norm=True,
                 )
 
-                full_grad_src = transformer.decode(decompressed, use_dct=use_dct)
-                # Single conversion to target dtype+device to avoid extra temporaries
-                full_grad_src = full_grad_src.to(
-                    dtype=p.dtype, device=p.device, non_blocking=True
-                )
+                decoded_grad = transformer.decode(decompressed, use_dct=use_dct)
+
+                # If this was a shard, we need to handle it differently
+                if shard_meta is not None:
+                    # This is a shard gradient - it will be distributed via DTensor below
+                    # The decoded_grad is the LOCAL SHARD that needs to be distributed
+                    full_grad_src = decoded_grad.to(
+                        dtype=p.dtype, device=p.device, non_blocking=True
+                    )
+                else:
+                    # Regular full gradient
+                    full_grad_src = decoded_grad.to(
+                        dtype=p.dtype, device=p.device, non_blocking=True
+                    )
 
                 # Accumulate fingerprint statistics for this parameter
                 if fingerprint is not None:
@@ -654,8 +705,8 @@ async def load_checkpoint_with_fallback(
                 # Fallback if we can't get bootstrap start_window
                 ckpt_global_step = 0
                 tplr.logger.info(
-                    f"Bootstrap checkpoint has no global_step and couldn't fetch bootstrap start_window, "
-                    f"setting to 0 (will be corrected during catch-up)"
+                    "Bootstrap checkpoint has no global_step and couldn't fetch bootstrap start_window, "
+                    "setting to 0 (will be corrected during catch-up)"
                 )
         else:
             # For current version checkpoints, calculate from window difference
@@ -1001,9 +1052,12 @@ async def catchup_with_aggregation_server(
         if instance.is_master and (start_w - checkpoint_current_window) % 5 == 0:
             log_memory_usage(f"After window {start_w} cleanup")
         # ──────────────────────────────────────────────────────────────────────
-        # 3) Debug‑dict comparison to estimate “how many steps behind” we are
+        # 3) Debug‑dict comparison to estimate "how many steps behind" we are
         # ──────────────────────────────────────────────────────────────────────
         try:
+            # [TP] All ranks must participate in compare_model_with_debug_dict
+            # because it calls full_tensor() on DTensors (collective operation)
+            debug_dict = None
             if instance.is_master:
                 debug_fetch = await instance.comms.get(
                     uid=str(leader_uid),
@@ -1039,16 +1093,27 @@ async def catchup_with_aggregation_server(
                                 )
                         prev_param_state[name] = curr_slice.clone()
 
-                    # --- call shared comparison helper --------------------------
-                    lr = instance.outer_optimizer.param_groups[0]["lr"]
-                    cmp = await compare_model_with_debug_dict(
-                        model=instance.model,
-                        debug_dict=debug_dict,
-                        learning_rate=lr,
-                        index_range=(0, 2),
-                        param_avg_change=param_avg_change,
-                    )
+            # Broadcast whether debug_dict exists so all ranks know whether to skip
+            has_debug_dict = torch.tensor(
+                [1 if debug_dict is not None else 0],
+                dtype=torch.int32,
+                device=instance.config.device,
+            )
+            dist_helper.broadcast(has_debug_dict, src=0)
 
+            # All ranks call comparison (required for DTensor collectives)
+            # Note: debug_dict is None on non-master ranks, but that's ok - they just
+            # won't find any matching keys, but they'll still participate in full_tensor() calls
+            if has_debug_dict.item():
+                lr = instance.outer_optimizer.param_groups[0]["lr"]
+                cmp = await compare_model_with_debug_dict(
+                    model=instance.model,
+                    debug_dict=debug_dict if debug_dict is not None else {},
+                    learning_rate=lr,
+                    param_avg_change=param_avg_change if param_avg_change else {},
+                )
+
+                if instance.is_master:
                     if cmp["success"]:
                         tplr.logger.info(
                             f"[catch‑up] window {start_w} "
@@ -1059,12 +1124,13 @@ async def catchup_with_aggregation_server(
                         tplr.logger.warning(
                             f"[catch‑up] debug‑dict comparison failed for window {start_w}"
                         )
-                else:
-                    tplr.logger.warning(
-                        f"[catch‑up] no debug‑dict found for window {start_w}"
-                    )
+            elif instance.is_master:
+                tplr.logger.warning(
+                    f"[catch‑up] no debug‑dict found for window {start_w}"
+                )
         except Exception as exc:
-            tplr.logger.warning(f"[catch‑up] debug‑dict processing error: {exc}")
+            if instance.is_master:
+                tplr.logger.warning(f"[catch‑up] debug‑dict processing error: {exc}")
 
         # Increment global_step since we performed an outer step
         instance.global_step += 1
@@ -1095,7 +1161,6 @@ async def compare_model_with_debug_dict(
     param_avg_change: dict[str, torch.Tensor] | None = None,
     *,
     min_step_size: float = 1e-9,
-    index_range: tuple[int, int] = (0, 2),
 ) -> dict[str, bool | float | int]:
     """
     Compare weights with published debug snippets and return sync metrics.
@@ -1124,10 +1189,15 @@ async def compare_model_with_debug_dict(
             continue
 
         # --- grab the slice we care about --------------------------------
+        # Sample from the end of the local shard (matches debug dict generation)
+        # This avoids needing full_tensor() collective for DTensor
         if isinstance(p, DT):
-            curr_slice = p.to_local().data.flatten()[index_range[0] : index_range[1]]
+            flat = p.to_local().data.flatten()
         else:
-            curr_slice = p.data.flatten()[index_range[0] : index_range[1]]
+            flat = p.data.flatten()
+
+        # Always sample last 2 elements to match debug dict generation at [-2:]
+        curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
 
         debug_slice = torch.tensor(
             debug_dict[key], dtype=p.dtype, device=curr_slice.device

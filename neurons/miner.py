@@ -28,6 +28,12 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+
+# Set PyTorch CUDA memory allocator to use expandable segments for better FSDP performance
+# This reduces memory fragmentation and improves allocation efficiency for large models
+# Must be set before importing torch
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from types import SimpleNamespace
 from typing import cast
 
@@ -204,7 +210,8 @@ class Miner(BaseNode, Trainer):
 
         # Store parallelization parameters for later use
         tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
-        self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        # Check environment variable first for runtime override, then hparams
+        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
         self.pp_degree = int(getattr(tt, "pp_degree", 1))
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
@@ -244,23 +251,37 @@ class Miner(BaseNode, Trainer):
             # Calculate DP rank (which TP group this rank belongs to)
             dp_rank = self.rank // tp_degree
             dp_world_size = self.world_size // tp_degree
-            tplr.logger.info(
-                f"[TP Ownership] TP={tp_degree}, rank={self.rank}, "
-                f"dp_rank={dp_rank}, dp_world_size={dp_world_size}"
-            )
         else:
             dp_rank = self.rank
             dp_world_size = self.world_size
+
+        # Track error feedback buffer memory
+        total_buffer_memory = 0
+        num_dtensor_params = 0
+        num_regular_params = 0
 
         for idx, (n, p) in enumerate(model_iterator):
             if idx % dp_world_size == dp_rank:
                 # this rank "owns" the parameter
                 self.owned_params.add(n)
-                # For DTensors, create error feedback based on full tensor since TP is not supported
+                # For DTensors, create error feedback based on local shard size
                 self.error_feedback[n] = None
-                self.error_feedback_cpu_buffers[n] = torch.empty(
-                    p.shape, device="cpu", pin_memory=True
-                )
+                # Use local shape for DTensor to avoid allocating full-sized buffers
+                if isinstance(p, DT):
+                    local_shape = p.to_local().shape
+                    self.error_feedback_cpu_buffers[n] = torch.empty(
+                        local_shape, device="cpu", pin_memory=True
+                    )
+                    buffer_size = local_shape.numel() * 4  # float32 = 4 bytes
+                    total_buffer_memory += buffer_size
+                    num_dtensor_params += 1
+                else:
+                    self.error_feedback_cpu_buffers[n] = torch.empty(
+                        p.shape, device="cpu", pin_memory=True
+                    )
+                    buffer_size = p.numel() * 4  # float32 = 4 bytes
+                    total_buffer_memory += buffer_size
+                    num_regular_params += 1
 
             enc = self.transformer.encode(
                 torch.empty(p.shape, dtype=torch.float16, device=self.device),
@@ -272,6 +293,15 @@ class Miner(BaseNode, Trainer):
             )
             self.xshapes[n] = xshape
             self.totalks[n] = totalk
+
+        # Log error feedback buffer memory allocation
+        total_buffer_gb = total_buffer_memory / (1024**3)
+        total_owned_params = num_dtensor_params + num_regular_params
+        tplr.logger.info(
+            f"[Init] Error feedback buffers allocated: {total_buffer_gb:.2f} GB "
+            f"({total_owned_params} owned params: {num_dtensor_params} DTensor, {num_regular_params} regular) "
+            f"[TP={tp_degree}, DP_rank={dp_rank}/{dp_world_size}]"
+        )
 
         tplr.logger.info(
             f"[Init] Compression initialized for {len(self.xshapes)} parameters"
@@ -617,9 +647,36 @@ class Miner(BaseNode, Trainer):
             processed_state_dict = {}
             if self.is_master:
                 assert gathered is not None
-                for i, shard in enumerate(gathered):
+                # For TP: Only use rank 0's shard to avoid shape mismatches
+                # All TP ranks compress their local shards, but we only upload one
+                # to maintain consistency across miners
+                if gathered[0] is not None:
+                    gradient = gathered[0]
+                    gathered[0] = None
+
+                # For non-TP or additional ranks, merge their gradients
+                # (This handles the case where different ranks own different parameters)
+                additional_params_count = 0
+                for i in range(1, len(gathered)):
+                    shard = gathered[i]
                     if shard is not None:
-                        gradient.update(shard)
+                        # Only add parameters that don't already exist
+                        # (avoids overwriting TP shards with different rank shards)
+                        for key, value in shard.items():
+                            if key not in gradient:
+                                gradient[key] = value
+                                if (
+                                    not key.endswith(
+                                        (
+                                            "idxs",
+                                            "vals",
+                                            "quant_params",
+                                            "shard_metadata",
+                                        )
+                                    )
+                                    and key != "metadata"
+                                ):
+                                    additional_params_count += 1
                         gathered[i] = None  # Free memory immediately after using shard
 
                 # dataset metadata
@@ -631,13 +688,15 @@ class Miner(BaseNode, Trainer):
                 sample_count = len(ids)
 
                 # ── attach window + sample receipt ─────────────────────
-                gradient["metadata"] = {
-                    "window": step_window,
-                    "sample_digest": sample_digest,
-                    "sample_count": sample_count,
-                }
-                tplr.logger.info(
-                    f"Attached metadata to gradient: {gradient['metadata']}"
+                # Update metadata instead of replacing it (preserve xshapes/totalks from prepare_gradient_dict)
+                if "metadata" not in gradient:
+                    gradient["metadata"] = {}
+                gradient["metadata"].update(
+                    {
+                        "window": step_window,
+                        "sample_digest": sample_digest,
+                        "sample_count": sample_count,
+                    }
                 )
 
                 tplr.logger.info(
@@ -787,7 +846,7 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
-            # [TP] All ranks must call full_tensor() for DTensors, then only master uploads
+            # [TP] Debug sampling avoids collectives: master samples local shards via to_local(), non-masters skip
             debug_dict = {}
 
             # Add model parameters debug info (sample from local shard to avoid collectives)
@@ -838,6 +897,34 @@ class Miner(BaseNode, Trainer):
                 m.norm().item() for m in self.error_feedback.values()
             ]
             gathered_mom = dist_helper.all_gather_object(local_mom_norms)
+
+            # Track error feedback memory usage (every 10 windows)
+            if self.current_window % 10 == 0:
+                gpu_memory = 0
+                cpu_memory = 0
+                for name in self.error_feedback:
+                    if self.error_feedback[name] is not None:
+                        if self.error_feedback[name].is_cuda:
+                            gpu_memory += (
+                                self.error_feedback[name].numel()
+                                * self.error_feedback[name].element_size()
+                            )
+                        else:
+                            cpu_memory += (
+                                self.error_feedback[name].numel()
+                                * self.error_feedback[name].element_size()
+                            )
+
+                cpu_buffer_memory = sum(
+                    buf.numel() * buf.element_size()
+                    for buf in self.error_feedback_cpu_buffers.values()
+                )
+
+                tplr.logger.info(
+                    f"[Memory] Error feedback: GPU={gpu_memory / (1024**3):.2f}GB, "
+                    f"CPU={cpu_memory / (1024**3):.2f}GB, "
+                    f"CPU buffers={cpu_buffer_memory / (1024**3):.2f}GB"
+                )
 
             momentum_norms = []
             # Log metrics to WandB
