@@ -193,90 +193,38 @@ async def test_different_devices():
 
 @pytest.mark.asyncio
 async def test_custom_index_range(setup_model):
-    """Test that the function uses the specified index_range for parameter comparison."""
+    """Test that the function samples from the last 2 elements of parameters (TP-compatible)."""
     model = setup_model
     learning_rate = 0.01
 
-    # Modify specific indices of model parameters to have different values
-    with torch.no_grad():
-        # Check if parameter is large enough for our test
-        param = model.linear1.weight.data.flatten()
-        if param.numel() > 7:
-            # Set indices 0-2 to 0.1 (default)
-            param[0:2] = 0.1
-            # Set indices 5-7 to 0.5 (different value)
-            param[5:7] = 0.5
-
-    # Create debug dict with exact matches for both default and custom indices
+    # Create debug dict with last 2 elements (matches to_local() behavior)
     debug_dict = {}
     for name, param in model.named_parameters():
         param_flat = param.flatten()
-        num_elements = param_flat.numel()
-        debug_dict[name + "_debug"] = param_flat[:2].detach().cpu().tolist()
+        # Sample last 2 elements to match the new to_local() implementation
+        debug_dict[name + "_debug"] = param_flat[-2:].detach().cpu().tolist()
 
-    # Test with default indices (0, 2) - should be an exact match
-    default_result = await compare_model_with_debug_dict(
-        model, debug_dict, learning_rate
-    )
+    # Test that comparison matches when using last 2 elements
+    result = await compare_model_with_debug_dict(model, debug_dict, learning_rate)
 
-    # Should show exact match because we're checking default indices
-    assert default_result["avg_steps_behind"] == pytest.approx(0.0, abs=1e-6)
+    # Should show exact match because we're using last 2 elements consistently
+    assert result["avg_steps_behind"] == pytest.approx(0.0, abs=1e-6)
 
-    # Skip further tests if the parameters aren't large enough
-    first_param = next(iter(model.parameters()))
-    if first_param.numel() <= 7:
-        pytest.skip("Model parameters too small for advanced index testing")
-
-    # Create a new debug dict for the custom indices test
-    custom_debug_dict = {}
-    for name, param in model.named_parameters():
-        param_flat = param.flatten()
-        num_elements = param_flat.numel()
-
-        # Only include parameters with enough elements for the custom range
-        if num_elements >= 7:
-            # Include values that will match the custom range too
-            values = param_flat[5:7].detach().cpu().tolist()
-            custom_debug_dict[name + "_debug"] = values
-
-    # Test with a custom range that should match
-    matching_result = await compare_model_with_debug_dict(
-        model, custom_debug_dict, learning_rate, index_range=(5, 7)
-    )
-
-    # Should be an exact match
-    assert matching_result["param_count"] > 0  # Ensure we actually compared something
-    assert matching_result["avg_steps_behind"] == pytest.approx(0.0, abs=1e-6)
-
+    # Test with mismatched values to ensure comparison detects differences
     mismatched_debug_dict = {}
     for name, param in model.named_parameters():
-        if name == "linear1.weight":
-            param_flat = param.flatten()
-            if param_flat.numel() >= 7:
-                # mismatch values
-                mismatched_debug_dict[name + "_debug"] = [0.3, 0.3]
+        param_flat = param.flatten()
+        # Create mismatched values (different from actual last 2 elements)
+        if param_flat.numel() >= 2:
+            mismatched_debug_dict[name + "_debug"] = [0.999, 0.999]
 
-    # Test with custom indices (5, 7) - should detect the difference
     mismatched_result = await compare_model_with_debug_dict(
-        model, mismatched_debug_dict, learning_rate, index_range=(5, 7)
+        model, mismatched_debug_dict, learning_rate
     )
 
-    # Verify we actually compared parameters
+    # Should detect the mismatch
     assert mismatched_result["param_count"] > 0
-
-    # Calculate expected difference and verify it matches actual difference
-    expected_diff = (
-        0.5 - 0.3
-    ) / learning_rate  # Difference of 0.2, normalized by learning rate
-
-    # The average steps behind should be greater than 0 (indicating a difference)
     assert mismatched_result["avg_steps_behind"] > 0
-
-    # For parameters we modified, the difference should be close to our expected value
-    # We use a tolerance because the average includes all parameters
-    assert mismatched_result["avg_steps_behind"] == pytest.approx(
-        expected_diff, abs=0.5
-    )
 
 
 # ---------------------------------------------------------------------- #
@@ -310,7 +258,6 @@ async def test_avg_change_one_step(setup_model):
         debug_dict,
         learning_rate=0.01,  # LR should be ignored here
         param_avg_change=param_avg_change,
-        index_range=(0, 2),
     )
 
     assert res["success"] is True
@@ -338,7 +285,6 @@ async def test_avg_change_half_step(setup_model):
         debug_dict,
         learning_rate=0.01,
         param_avg_change=param_avg_change,
-        index_range=(0, 2),
     )
 
     assert res["avg_steps_behind"] == pytest.approx(2.0, abs=1e-2)
@@ -366,7 +312,6 @@ async def test_avg_change_length_mismatch_fallback(setup_model):
         debug_dict,
         learning_rate=lr,
         param_avg_change=param_avg_change,
-        index_range=(0, 2),
     )
 
     # Fallback should make it behave like LR-based comparison → 1 step

@@ -28,6 +28,12 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+
+# Set PyTorch CUDA memory allocator to use expandable segments for better FSDP performance
+# This reduces memory fragmentation and improves allocation efficiency for large models
+# Must be set before importing torch
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Deque, cast
@@ -327,6 +333,11 @@ class Validator(BaseNode, Trainer):
         self.hparams = tplr.load_hparams(
             use_local_run_hparams=cast(bool, self.config.local)
         )
+
+        # Store parallelization parameters
+        tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
+        # Check environment variable first for runtime override, then hparams
+        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
 
         # Init bittensor objects
         self.wallet = bt.wallet(config=self.config)
@@ -1713,17 +1724,9 @@ class Validator(BaseNode, Trainer):
             # Process each UID with sliding window loading
             for eval_uid in evaluation_uids:
                 uid_eval_start = time.time()
+
                 # Check if window has changed before starting evaluation
                 if self.current_window != eval_window:
-                    if self.is_master:
-                        tplr.log_with_context(
-                            level="info",
-                            message=f"Window changed during evaluation (was {eval_window},"
-                            f" now {self.current_window}), exiting evaluation loop early."
-                            f" Evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs.",
-                            sync_window=self.sync_window,
-                            current_window=self.current_window,
-                        )
                     break
 
                 # Mark this UID as attempted (for counter management)
@@ -1864,6 +1867,7 @@ class Validator(BaseNode, Trainer):
 
                 # 9. Apply gradient and compute loss after
                 apply_ok_local = True
+                exception_msg = ""
                 try:
                     gradient_apply_start = tplr.T()
                     self.update_model_with_gradient(
@@ -1883,13 +1887,25 @@ class Validator(BaseNode, Trainer):
                         )
                 except Exception as e:
                     apply_ok_local = False
-                    if self.is_master:
-                        self.slash_for_invalid_gradient(eval_uid, e)
+                    exception_msg = str(e)
 
-                # Reach group consensus before any barrier
+                # Reach group consensus before any barrier - ALL ranks must participate
                 apply_ok_global = dist_helper.all_ok(
                     apply_ok_local, self.device, tag=f"apply_grad_uid_{eval_uid}"
                 )
+
+                # Only call slash AFTER all_ok completes, so all ranks are synchronized
+                if not apply_ok_global and self.is_master:
+                    # Find which rank failed by checking if we had an exception
+                    if not apply_ok_local:
+                        # This rank failed - create a proper exception object
+                        exc = (
+                            Exception(exception_msg)
+                            if exception_msg
+                            else Exception("Unknown error")
+                        )
+                        self.slash_for_invalid_gradient(eval_uid, exc)
+
                 if not apply_ok_global:
                     # Restore and skip in lockstep
                     self._restore_model_state(saved_state)
@@ -2375,32 +2391,21 @@ class Validator(BaseNode, Trainer):
                 )
 
             with torch.no_grad():
-                slice_idx = slice(10, 12)  # indices published in miner debug dict
-
                 for n, p in self.model.named_parameters():
-                    # Handle DTensor case - get full tensor first
+                    # Sample from local shard to avoid collectives (matches debug dict generation)
                     if isinstance(p, DT):
-                        # [TP] For DTensor, use full_tensor() to get the complete parameter
-                        full_p = p.full_tensor()
-                        if full_p.numel() < 12:
-                            continue
-                        # Only master rank processes the full tensor
-                        if self.is_master:
-                            curr_cpu = full_p.detach().cpu()
-                        else:
-                            # Non-master ranks participated in collective but don't process
-                            continue
+                        flat = p.to_local().detach().cpu().flatten()
                     else:
-                        if p.numel() < 12:
-                            continue
-                        # move current weights to CPU once
-                        curr_cpu = p.detach().cpu()
+                        flat = p.detach().cpu().flatten()
+
+                    # Sample last 2 elements (or 1 if that's all there is) to match debug dict generation
+                    if flat.numel() == 0:
+                        continue
+                    curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
 
                     # compute delta only if we have a previous slice
                     if n in self.prev_param_state:
                         prev_slice = self.prev_param_state[n]
-                        curr_slice = curr_cpu.flatten()[slice_idx]
-
                         delta_slice = torch.abs(curr_slice - prev_slice)
 
                         # lazy-init & EMA update
@@ -2412,7 +2417,7 @@ class Validator(BaseNode, Trainer):
                             ).add_(delta_slice * self.param_change_alpha)
 
                     # stash the new slice for next iteration
-                    self.prev_param_state[n] = curr_cpu.flatten()[slice_idx].clone()
+                    self.prev_param_state[n] = curr_slice.clone()
 
             # Add debug data including successfully gathered peers
             debug_dict = {}
@@ -3015,7 +3020,6 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
-            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 
@@ -3406,6 +3410,10 @@ class Validator(BaseNode, Trainer):
         clip_norm = True  # Always true in the repo 8/13/2025
         # If all validations pass, apply the gradients
 
+        # NOTE: For evaluation, we MUST use validator's own xshapes, not miner's xshapes
+        # The miner's xshapes are only used in outer_step for gradient aggregation
+        # Here we need to decompress to match the validator's model shape
+
         for n, p in model.named_parameters():
             src_rank = 0
             on_src = self.is_master or not dist_helper.is_distributed()
@@ -3456,16 +3464,21 @@ class Validator(BaseNode, Trainer):
                         if clip_norm:
                             quant_params = None  # Fast route for decompress
 
-                        # Check if we're in distributed mode
+                        # For evaluation, always use validator's own xshapes to match model shape
+                        param_xshape = self.xshapes[n]
+                        param_totalk = self.totalks[n]
+
                         # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                        ref = torch.empty_like(p, device=self.device, dtype=p.dtype)
+                        ref = torch.empty(
+                            param_xshape, device=self.device, dtype=p.dtype
+                        )
 
                         decompressed = self.compressor.decompress(
                             ref,
                             idxs,
                             vals,
-                            self.xshapes[n],
-                            self.totalks[n],
+                            param_xshape,
+                            param_totalk,
                             cast("QuantParamsT | None", quant_params),
                         )
 
