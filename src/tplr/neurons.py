@@ -141,10 +141,10 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             # Use local shard only - no expensive collective!
             grad_local = g.to_local().to(p.device)
             # Store metadata for receiver to reconstruct DTensor
+            # Only store primitives (not DTensor objects) to avoid pickle issues
             shard_metadata = {
-                "global_shape": tuple(g.size()),  # Global shape
-                "device_mesh": getattr(g, "device_mesh", None),
-                "placements": getattr(g, "placements", None),
+                "is_shard": True,
+                "global_shape": tuple(g.size()),  # Global shape as tuple
             }
             grad_to_compress = grad_local
         else:
@@ -410,7 +410,7 @@ def outer_step(
                 decoded_grad = transformer.decode(decompressed, use_dct=use_dct)
 
                 # If this was a shard, we need to handle it differently
-                if shard_meta is not None:
+                if shard_meta is not None and shard_meta.get("is_shard"):
                     # This is a shard gradient - it will be distributed via DTensor below
                     # The decoded_grad is the LOCAL SHARD that needs to be distributed
                     full_grad_src = decoded_grad.to(

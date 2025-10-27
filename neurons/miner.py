@@ -210,8 +210,18 @@ class Miner(BaseNode, Trainer):
 
         # Store parallelization parameters for later use
         tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
-        # Check environment variable first for runtime override, then hparams
-        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
+        # Check environment override first, parse safely, clamp to ≥1
+        raw_tp = os.environ.get("TP_DEGREE")
+        if raw_tp is not None:
+            try:
+                self.tp_degree = max(1, int(raw_tp))
+            except (ValueError, TypeError):
+                tplr.logger.warning(
+                    f"Invalid TP_DEGREE='{raw_tp}', falling back to hparams"
+                )
+                self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        else:
+            self.tp_degree = int(getattr(tt, "tp_degree", 1))
         self.pp_degree = int(getattr(tt, "pp_degree", 1))
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
@@ -240,17 +250,15 @@ class Miner(BaseNode, Trainer):
         model_iterator = self.model.named_parameters()
 
         # [TP] In TP, all ranks in the same TP group must own the SAME parameters
-        tp_degree = int(
-            os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
-        )
+        # Use already-validated self.tp_degree instead of re-reading environment
         if (
-            tp_degree > 1
-            and self.world_size >= tp_degree
-            and (self.world_size % tp_degree == 0)
+            self.tp_degree > 1
+            and self.world_size >= self.tp_degree
+            and (self.world_size % self.tp_degree == 0)
         ):
             # Calculate DP rank (which TP group this rank belongs to)
-            dp_rank = self.rank // tp_degree
-            dp_world_size = self.world_size // tp_degree
+            dp_rank = self.rank // self.tp_degree
+            dp_world_size = self.world_size // self.tp_degree
         else:
             dp_rank = self.rank
             dp_world_size = self.world_size
@@ -261,18 +269,20 @@ class Miner(BaseNode, Trainer):
         num_regular_params = 0
 
         for idx, (n, p) in enumerate(model_iterator):
-            if idx % dp_world_size == dp_rank:
+            # Guard against ZeroDivisionError in edge cases
+            if dp_world_size > 0 and idx % dp_world_size == dp_rank:
                 # this rank "owns" the parameter
                 self.owned_params.add(n)
                 # For DTensors, create error feedback based on local shard size
                 self.error_feedback[n] = None
                 # Use local shape for DTensor to avoid allocating full-sized buffers
                 if isinstance(p, DT):
-                    local_shape = p.to_local().shape
+                    local = p.to_local()
+                    local_shape = local.shape
                     self.error_feedback_cpu_buffers[n] = torch.empty(
                         local_shape, device="cpu", pin_memory=True
                     )
-                    buffer_size = local_shape.numel() * 4  # float32 = 4 bytes
+                    buffer_size = local.numel() * 4  # float32 = 4 bytes
                     total_buffer_memory += buffer_size
                     num_dtensor_params += 1
                 else:
@@ -300,7 +310,7 @@ class Miner(BaseNode, Trainer):
         tplr.logger.info(
             f"[Init] Error feedback buffers allocated: {total_buffer_gb:.2f} GB "
             f"({total_owned_params} owned params: {num_dtensor_params} DTensor, {num_regular_params} regular) "
-            f"[TP={tp_degree}, DP_rank={dp_rank}/{dp_world_size}]"
+            f"[TP={self.tp_degree}, DP_rank={dp_rank}/{dp_world_size}]"
         )
 
         tplr.logger.info(

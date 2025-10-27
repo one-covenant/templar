@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # Script to abort ongoing multipart uploads in R2 bucket
 
+import asyncio
 import os
 import sys
-import asyncio
 from pathlib import Path
-from dotenv import load_dotenv
+
 from aiobotocore.session import get_session
+from dotenv import load_dotenv
 
 # Find and load the correct .env file
 env_path = Path(__file__).parent / "../.env"

@@ -51,6 +51,15 @@ class Trainer:
     def set_dataloader(self, validator: bool = False) -> None:
         self.dataset = self.dataset_manager.active_dataset
 
+        # Effective TP degree with env override; fallback to hparams (prefer torchtitan.tp_degree)
+        tt = getattr(self.hparams, "torchtitan", None)
+        base_tp = (
+            getattr(tt, "tp_degree", None)
+            if tt
+            else getattr(self.hparams, "tp_degree", 1)
+        )
+        self.tp_degree = max(1, int(os.environ.get("TP_DEGREE", base_tp)))
+
         shared_args = dict(
             dataset=self.dataset,
             uid=self.uid,
@@ -59,9 +68,7 @@ class Trainer:
             micro_bs=self.hparams.micro_batch_size,
             rank=self.rank,
             world_size=self.world_size,
-            tp_degree=int(
-                os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
-            ),
+            tp_degree=self.tp_degree,
         )
 
         if validator:
@@ -517,43 +524,42 @@ class Trainer:
         if self.world_size > 1 and dist_helper.is_distributed():
             from torch.distributed import ReduceOp
 
-            # Sum squared norms across ranks, then sqrt
-            global_grad_norm_sq = dist_helper.ddp_reduce(
-                local_grad_norm_sq, device=self.device
-            )
-            global_param_norm_sq = dist_helper.ddp_reduce(
-                local_param_norm_sq, device=self.device
-            )
-            global_update_norm_sq = dist_helper.ddp_reduce(
-                local_update_norm_sq, device=self.device
-            )
-            global_exp_avg_norm_sq = dist_helper.ddp_reduce(
-                local_exp_avg_norm_sq, device=self.device
-            )
-            global_exp_avg_sq_norm_sq = dist_helper.ddp_reduce(
-                local_exp_avg_sq_norm_sq, device=self.device
+            # Batch all reductions into a single operation for efficiency
+            values_to_reduce = {
+                "grad_norm_sq": local_grad_norm_sq,
+                "param_norm_sq": local_param_norm_sq,
+                "update_norm_sq": local_update_norm_sq,
+                "exp_avg_norm_sq": local_exp_avg_norm_sq,
+                "exp_avg_sq_norm_sq": local_exp_avg_sq_norm_sq,
+                "grad_norm_max": local_grad_norm_max,
+                "update_norm_max": local_update_norm_max,
+                "ratio_sum": local_update_to_param_ratios_sum,
+                "ratio_count": local_ratio_count,
+                "params_with_grad": num_params_with_grad,
+            }
+
+            # Specify which operations use MAX instead of SUM
+            ops = {
+                "grad_norm_max": ReduceOp.MAX,
+                "update_norm_max": ReduceOp.MAX,
+            }
+
+            # Single batched all-reduce instead of 10 separate ones
+            reduced = dist_helper.batched_all_reduce(
+                values_to_reduce, device=self.device, ops=ops
             )
 
-            # Max values across ranks
-            global_grad_norm_max = dist_helper.ddp_reduce(
-                local_grad_norm_max, op=ReduceOp.MAX, device=self.device
-            )
-            global_update_norm_max = dist_helper.ddp_reduce(
-                local_update_norm_max, op=ReduceOp.MAX, device=self.device
-            )
-
-            # For ratio: sum and count across ranks, then divide
-            global_ratio_sum = dist_helper.ddp_reduce(
-                local_update_to_param_ratios_sum, device=self.device
-            )
-            global_ratio_count = int(
-                dist_helper.ddp_reduce(local_ratio_count, device=self.device)
-            )
-
-            # Total params with grad across ranks
-            num_params_with_grad = int(
-                dist_helper.ddp_reduce(num_params_with_grad, device=self.device)
-            )
+            # Extract results
+            global_grad_norm_sq = reduced["grad_norm_sq"]
+            global_param_norm_sq = reduced["param_norm_sq"]
+            global_update_norm_sq = reduced["update_norm_sq"]
+            global_exp_avg_norm_sq = reduced["exp_avg_norm_sq"]
+            global_exp_avg_sq_norm_sq = reduced["exp_avg_sq_norm_sq"]
+            global_grad_norm_max = reduced["grad_norm_max"]
+            global_update_norm_max = reduced["update_norm_max"]
+            global_ratio_sum = reduced["ratio_sum"]
+            global_ratio_count = int(reduced["ratio_count"])
+            num_params_with_grad = int(reduced["params_with_grad"])
         else:
             global_grad_norm_sq = local_grad_norm_sq
             global_param_norm_sq = local_param_norm_sq
@@ -712,6 +718,10 @@ class Trainer:
         local_tokens_sum: int = 0  # local running totals
         local_loss_sum: float = 0.0
 
+        # Timing accumulators for forward and backward passes
+        step_forward_time: float = 0.0
+        step_backward_time: float = 0.0
+
         inner_step_count: int = 0
         loader_iter = iter(loader)
 
@@ -771,6 +781,7 @@ class Trainer:
                 # ------------------------------------------------------------------ #
                 # 3. Forward + backward
                 # ------------------------------------------------------------------ #
+                forward_start = time.time()
                 with tp.record_function("Forward Pass") if prof else nullcontext():
                     with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                         outputs = self.model(input_ids, labels)
@@ -779,10 +790,12 @@ class Trainer:
 
                     loss = calculated_loss / self.sampler.grad_accum_steps
                     loss_item = calculated_loss.detach().item()
+                forward_time = time.time() - forward_start
 
                 # -------------------------------------------------------------- #
                 # 3-a.  Back-prop with no_sync() on non-final micro-batches
                 # -------------------------------------------------------------- #
+                backward_start = time.time()
                 with tp.record_function("Backward Pass") if prof else nullcontext():
                     corrected_accum_steps = max(self.sampler.grad_accum_steps, 1)
                     final_micro_batch = (batch_count + 1) % corrected_accum_steps == 0
@@ -796,6 +809,11 @@ class Trainer:
                         sync_ctx = nullcontext()
                     with sync_ctx:
                         self.scaler.scale(loss).backward()
+                backward_time = time.time() - backward_start
+
+                # Accumulate timing for this step
+                step_forward_time += forward_time
+                step_backward_time += backward_time
 
                 total_loss += loss_item
                 local_loss_sum += loss_item  # defer collective
@@ -822,24 +840,32 @@ class Trainer:
                         tp.record_function("Optimizer Step") if prof else nullcontext()
                     ):
                         # ── one collective for scalar stats per inner step ───────────
-                        # TP ranks process same data, so divide by tp_degree
-                        global_tokens_step = int(
-                            dist_helper.ddp_reduce(local_tokens_sum, device=self.device)
-                            / self.tp_degree
-                        )
-                        global_loss_step = (
-                            dist_helper.ddp_reduce(local_loss_sum, device=self.device)
-                            / self.tp_degree
-                        )
+                        # Batch all scalar reductions for efficiency
+                        if self.world_size > 1:
+                            from torch.distributed import ReduceOp
+
+                            values_to_reduce = {
+                                "tokens_sum": local_tokens_sum,
+                                "loss_sum": local_loss_sum,
+                                "loss_avg": loss_item,
+                            }
+                            ops = {"loss_avg": ReduceOp.AVG}
+
+                            reduced = dist_helper.batched_all_reduce(
+                                values_to_reduce, device=self.device, ops=ops
+                            )
+
+                            # TP ranks process same data, so divide by tp_degree
+                            global_tokens_step = int(reduced["tokens_sum"] / self.tp_degree)
+                            global_loss_step = reduced["loss_sum"] / self.tp_degree
+                            log_loss = reduced["loss_avg"]
+                        else:
+                            global_tokens_step = local_tokens_sum
+                            global_loss_step = local_loss_sum
+                            log_loss = loss_item
+
                         global_tokens += global_tokens_step
                         global_loss_sum += global_loss_step
-
-                        # mean loss of this accumulation step for logging
-                        from torch.distributed import ReduceOp
-
-                        log_loss = dist_helper.ddp_reduce(
-                            loss_item, op=ReduceOp.AVG, device=self.device
-                        )
 
                         if not null_round:
                             # Unscale, clip, then step via GradScaler if using fp16
@@ -863,11 +889,8 @@ class Trainer:
                         local_tokens_sum = 0
                         local_loss_sum = 0
 
-                        # TP ranks have same accumulated batch size, divide by tp_degree
-                        accum_batch_size = int(
-                            dist_helper.ddp_reduce(accum_batch_size, device=self.device)
-                            / self.tp_degree
-                        )
+                        # Note: accum_batch_size is only used for logging, no need to reduce
+                        # TP ranks have same accumulated batch size anyway
                         if self.is_master:
                             # Convert grad_norm to scalar (handles both Tensor and DTensor)
                             grad_norm_scalar = float(
@@ -879,9 +902,14 @@ class Trainer:
                             tplr.logger.info(
                                 f"Inner Step {inner_step_count}, "
                                 f"Batch {batch_count}, loss: {log_loss:.4f}, "
-                                f"grad_norm: {grad_norm_scalar:.4f}, "
+                                f"fwd: {step_forward_time:.2f}s, bwd: {step_backward_time:.2f}s, "
                                 f"accum: {accum_batch_size}/{self.hparams.batch_size}"
                             )
+
+                        # Reset timing accumulators for next inner step
+                        step_forward_time = 0.0
+                        step_backward_time = 0.0
+
                         if window_entry_loss == 0.0:
                             # TP ranks process same batches, divide by tp_degree
                             total_batches_first_step = int(
@@ -946,12 +974,24 @@ class Trainer:
         )
 
         if self.world_size > 1 and dist_helper.is_distributed():
-            total_grad_norm_sq = dist_helper.ddp_reduce(
-                total_grad_norm_sq, device=self.device
+            # Batch final reductions for efficiency
+            values_to_reduce = {
+                "grad_norm_sq": total_grad_norm_sq,
+                "weight_norm_sq": total_weight_norm_sq,
+                "batch_count": batch_count,
+            }
+
+            reduced = dist_helper.batched_all_reduce(
+                values_to_reduce, device=self.device
             )
-            total_weight_norm_sq = dist_helper.ddp_reduce(
-                total_weight_norm_sq, device=self.device
-            )
+
+            total_grad_norm_sq = reduced["grad_norm_sq"]
+            total_weight_norm_sq = reduced["weight_norm_sq"]
+            batch_count = int(reduced["batch_count"] / self.tp_degree)
+        else:
+            # TP ranks process same batches, so divide by tp_degree if needed
+            if self.tp_degree > 1:
+                batch_count = int(batch_count / self.tp_degree)
 
         # Global norms (sqrt of summed squares)
         global_grad_norm = (total_grad_norm_sq**0.5) if total_grad_norm_sq > 0 else 0.0
@@ -962,10 +1002,6 @@ class Trainer:
         # ---------------------------------------------------------------------- #
         # 7. Return aggregated metrics
         # ---------------------------------------------------------------------- #
-        # Batch count: TP ranks process same batches, so divide by tp_degree
-        batch_count = int(
-            dist_helper.ddp_reduce(batch_count, device=self.device) / self.tp_degree
-        )
         return {
             "total_loss": global_loss_sum,  # cross-rank sum
             "window_entry_loss": window_entry_loss,
