@@ -1476,10 +1476,12 @@ class Validator(BaseNode, Trainer):
                 continue
 
             # --------------------------------------------------------------+
-            #  Simulate the miner’s *inner* loop so the LR schedule advances │
+            #  Simulate the miner's *inner* loop so the LR schedule advances │
             # --------------------------------------------------------------+
             for _ in range(self.hparams.inner_steps):
-                self.inner_scheduler.step()
+                if not self.should_skip_scheduler_step():
+                    self.inner_scheduler.step()
+                self.inner_scheduler_step_count += 1
 
             # current inner‑LR after simulation
             current_inner_lr = self.inner_scheduler.get_last_lr()[0]
