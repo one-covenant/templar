@@ -23,6 +23,7 @@ def mock_instance():
     instance.current_window = 150
     instance.global_step = 0
     instance.model_initialized = False
+    instance.inner_scheduler_step_count = 0
 
     # Setup hparams
     instance.hparams = MagicMock()
@@ -42,6 +43,9 @@ def mock_instance():
 
     # Bootstrap version (can be overridden in tests)
     instance.bootstrap_version = None
+
+    # Mock should_skip_scheduler_step to return False (no flattening by default)
+    instance.should_skip_scheduler_step = MagicMock(return_value=False)
 
     return instance
 
