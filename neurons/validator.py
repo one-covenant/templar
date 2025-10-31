@@ -3698,6 +3698,7 @@ class Validator(BaseNode, Trainer):
         """Return cpu tensors ready for torch.save."""
         return {
             "global_step": self.global_step,
+            "inner_scheduler_step_count": self.inner_scheduler_step_count,
             "gradient_scores": self.gradient_scores.cpu(),
             "sync_scores": self.sync_scores.cpu(),
             "binary_indicator_scores": self.binary_indicator_scores.cpu(),
@@ -3775,6 +3776,12 @@ class Validator(BaseNode, Trainer):
         # NOTE: use `.get` so missing keys don't blow up wrong‑schema tests.
         self.global_step = int(
             state.get("global_step", getattr(self, "global_step", 0))
+        )
+        self.inner_scheduler_step_count = int(
+            state.get(
+                "inner_scheduler_step_count",
+                getattr(self, "inner_scheduler_step_count", 0),
+            )
         )
 
         def _maybe(name):
