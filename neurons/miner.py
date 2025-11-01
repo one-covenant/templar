@@ -232,8 +232,28 @@ class Miner(BaseNode, Trainer):
         self.totalks = {}
         model_iterator = self.model.named_parameters()
 
+        # [TP] In TP, all ranks in the same TP group must own the SAME parameters
+        tp_degree = int(
+            os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
+        )
+        if (
+            tp_degree > 1
+            and self.world_size >= tp_degree
+            and (self.world_size % tp_degree == 0)
+        ):
+            # Calculate DP rank (which TP group this rank belongs to)
+            dp_rank = self.rank // tp_degree
+            dp_world_size = self.world_size // tp_degree
+            tplr.logger.info(
+                f"[TP Ownership] TP={tp_degree}, rank={self.rank}, "
+                f"dp_rank={dp_rank}, dp_world_size={dp_world_size}"
+            )
+        else:
+            dp_rank = self.rank
+            dp_world_size = self.world_size
+
         for idx, (n, p) in enumerate(model_iterator):
-            if idx % self.world_size == self.rank:
+            if idx % dp_world_size == dp_rank:
                 # this rank "owns" the parameter
                 self.owned_params.add(n)
                 # For DTensors, create error feedback based on full tensor since TP is not supported
@@ -516,11 +536,11 @@ class Miner(BaseNode, Trainer):
                     )
                 elif no_peers_null:
                     tplr.logger.info(
-                        f"Start accumulating... (null round: no gather peers available)"
+                        "Start accumulating... (null round: no gather peers available)"
                     )
                 else:
                     tplr.logger.info(
-                        f"Start accumulating... (null round: triggered by another rank)"
+                        "Start accumulating... (null round: triggered by another rank)"
                     )
             else:
                 tplr.logger.info("Start accumulating...")
@@ -744,19 +764,18 @@ class Miner(BaseNode, Trainer):
             update_start = tplr.T()
 
             # Only perform outer step and increment counter if we have gradients to apply
-            gradient_fingerprint = None
+            stats = None
             if should_update:
-                gradient_fingerprint = self.outer_step(gather_result)
+                stats = self.outer_step(gather_result)
                 self.global_step += (
                     1  # Increment only when we actually do an outer step
                 )
                 model_update_time = tplr.T() - update_start
-                if gradient_fingerprint is not None:
+                if stats is not None and self.is_master:
                     tplr.logger.info(
-                        f"{tplr.P(step_window, model_update_time)} Updated model (Outer step #{self.global_step}) "
-                        f"Fingerprint: global_l2={gradient_fingerprint['global_l2_norm']:.6f}, "
-                        f"params={len(gradient_fingerprint['param_norms'])}, "
-                        f"elements={gradient_fingerprint['total_elements']}"
+                        f"{tplr.P(step_window, model_update_time)} Updated model (Outer step #{self.global_step}) | "
+                        f"GradNorm: {stats.get('global_l2_norm', 0.0):.4f}, "
+                        f"Params: {len(stats.get('param_norms', {}))}"
                     )
                 else:
                     tplr.logger.info(
@@ -768,37 +787,25 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
+            # [TP] All ranks must call full_tensor() for DTensors, then only master uploads
+            debug_dict = {}
+
+            # Add model parameters debug info (sample from local shard to avoid collectives)
+            for name, param in self.model.named_parameters():
+                if param is not None and self.is_master:
+                    # Use to_local() for DTensor to avoid full_tensor() collective deadlock
+                    if isinstance(param, DT):
+                        flat = param.to_local().data.flatten()
+                    else:
+                        flat = param.data.flatten()
+
+                    if flat.numel() > 0:
+                        # Sample last 2 elements to be consistent with comparison
+                        sample = flat[-2:] if flat.numel() >= 2 else flat[-1:]
+                        debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
+
+            # Only master uploads the debug dictionary
             if self.is_master:
-                # Add debug data including successfully gathered peers
-                debug_dict = {}
-
-                # Add model parameters debug info
-                for name, param in self.model.named_parameters():
-                    if param is not None:
-                        # Handle DTensor vs regular tensor
-                        if isinstance(param, DT):
-                            local_param = param.to_local()
-                            if local_param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    local_param.flatten()[10:12].detach().cpu().tolist()
-                                )
-                        else:
-                            if param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    param.flatten()[10:12].detach().cpu().tolist()
-                                )
-
-                # Add gradient fingerprint if available
-                if gradient_fingerprint is not None:
-                    debug_dict["gradient_fingerprint"] = {
-                        "global_l2_norm": gradient_fingerprint["global_l2_norm"],
-                        "total_elements": gradient_fingerprint["total_elements"],
-                        # Store only first 5 param norms to avoid bloat
-                        "sample_param_norms": dict(
-                            list(gradient_fingerprint["param_norms"].items())[:5]
-                        ),
-                    }
-
                 # Add successful peers information
                 if gather_result is not None:
                     debug_dict["successful_peers"] = sorted(
@@ -885,13 +892,13 @@ class Miner(BaseNode, Trainer):
                     for key, value in adam_metrics.items():
                         wandb_metrics[f"miner/{key}"] = value
 
-                    # Add gradient fingerprint metrics if available
-                    if gradient_fingerprint is not None:
-                        wandb_metrics["miner/gradient_fingerprint/global_l2_norm"] = (
-                            gradient_fingerprint["global_l2_norm"]
+                    # Add outer_step gradient statistics if available
+                    if stats is not None:
+                        wandb_metrics["miner/outer_step/global_grad_norm"] = stats.get(
+                            "global_l2_norm", 0.0
                         )
-                        wandb_metrics["miner/gradient_fingerprint/total_elements"] = (
-                            gradient_fingerprint["total_elements"]
+                        wandb_metrics["miner/outer_step/total_elements"] = stats.get(
+                            "total_elements", 0
                         )
 
                     self.wandb.log(wandb_metrics, step=self.global_step)
