@@ -49,7 +49,7 @@ from tplr.schemas import Bucket, CommsGetResult
 
 # Add DTensor types to safe globals for torch.load with weights_only=True
 try:
-    from torch.distributed.tensor.placement_types import _StridedShard, Replicate, Shard
+    from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 
     torch.serialization.add_safe_globals([_StridedShard, Replicate, Shard])
 except ImportError:

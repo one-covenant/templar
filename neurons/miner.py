@@ -28,6 +28,12 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+
+# Set PyTorch CUDA memory allocator to use expandable segments for better FSDP performance
+# This reduces memory fragmentation and improves allocation efficiency for large models
+# Must be set before importing torch
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from types import SimpleNamespace
 from typing import cast
 
@@ -204,7 +210,18 @@ class Miner(BaseNode, Trainer):
 
         # Store parallelization parameters for later use
         tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
-        self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        # Check environment override first, parse safely, clamp to ≥1
+        raw_tp = os.environ.get("TP_DEGREE")
+        if raw_tp is not None:
+            try:
+                self.tp_degree = max(1, int(raw_tp))
+            except (ValueError, TypeError):
+                tplr.logger.warning(
+                    f"Invalid TP_DEGREE='{raw_tp}', falling back to hparams"
+                )
+                self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        else:
+            self.tp_degree = int(getattr(tt, "tp_degree", 1))
         self.pp_degree = int(getattr(tt, "pp_degree", 1))
         self.cp_degree = int(getattr(tt, "cp_degree", 1))
         self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
@@ -233,34 +250,48 @@ class Miner(BaseNode, Trainer):
         model_iterator = self.model.named_parameters()
 
         # [TP] In TP, all ranks in the same TP group must own the SAME parameters
-        tp_degree = int(
-            os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
-        )
+        # Use already-validated self.tp_degree instead of re-reading environment
         if (
-            tp_degree > 1
-            and self.world_size >= tp_degree
-            and (self.world_size % tp_degree == 0)
+            self.tp_degree > 1
+            and self.world_size >= self.tp_degree
+            and (self.world_size % self.tp_degree == 0)
         ):
             # Calculate DP rank (which TP group this rank belongs to)
-            dp_rank = self.rank // tp_degree
-            dp_world_size = self.world_size // tp_degree
-            tplr.logger.info(
-                f"[TP Ownership] TP={tp_degree}, rank={self.rank}, "
-                f"dp_rank={dp_rank}, dp_world_size={dp_world_size}"
-            )
+            dp_rank = self.rank // self.tp_degree
+            dp_world_size = self.world_size // self.tp_degree
         else:
             dp_rank = self.rank
             dp_world_size = self.world_size
 
+        # Track error feedback buffer memory
+        total_buffer_memory = 0
+        num_dtensor_params = 0
+        num_regular_params = 0
+
         for idx, (n, p) in enumerate(model_iterator):
-            if idx % dp_world_size == dp_rank:
+            # Guard against ZeroDivisionError in edge cases
+            if dp_world_size > 0 and idx % dp_world_size == dp_rank:
                 # this rank "owns" the parameter
                 self.owned_params.add(n)
-                # For DTensors, create error feedback based on full tensor since TP is not supported
+                # For DTensors, create error feedback based on local shard size
                 self.error_feedback[n] = None
-                self.error_feedback_cpu_buffers[n] = torch.empty(
-                    p.shape, device="cpu", pin_memory=True
-                )
+                # Use local shape for DTensor to avoid allocating full-sized buffers
+                if isinstance(p, DT):
+                    local = p.to_local()
+                    local_shape = local.shape
+                    self.error_feedback_cpu_buffers[n] = torch.empty(
+                        local_shape, device="cpu", pin_memory=True
+                    )
+                    buffer_size = local.numel() * 4  # float32 = 4 bytes
+                    total_buffer_memory += buffer_size
+                    num_dtensor_params += 1
+                else:
+                    self.error_feedback_cpu_buffers[n] = torch.empty(
+                        p.shape, device="cpu", pin_memory=True
+                    )
+                    buffer_size = p.numel() * 4  # float32 = 4 bytes
+                    total_buffer_memory += buffer_size
+                    num_regular_params += 1
 
             enc = self.transformer.encode(
                 torch.empty(p.shape, dtype=torch.float16, device=self.device),
@@ -272,6 +303,15 @@ class Miner(BaseNode, Trainer):
             )
             self.xshapes[n] = xshape
             self.totalks[n] = totalk
+
+        # Log error feedback buffer memory allocation
+        total_buffer_gb = total_buffer_memory / (1024**3)
+        total_owned_params = num_dtensor_params + num_regular_params
+        tplr.logger.info(
+            f"[Init] Error feedback buffers allocated: {total_buffer_gb:.2f} GB "
+            f"({total_owned_params} owned params: {num_dtensor_params} DTensor, {num_regular_params} regular) "
+            f"[TP={self.tp_degree}, DP_rank={dp_rank}/{dp_world_size}]"
+        )
 
         tplr.logger.info(
             f"[Init] Compression initialized for {len(self.xshapes)} parameters"
@@ -612,15 +652,46 @@ class Miner(BaseNode, Trainer):
 
             # ------------------------------------------------------------
             #  rank-0 merges & uploads the full gradient
+            # Handles three cases: Pure FSDP, Pure TP, and TP+FSDP hybrid
             # ------------------------------------------------------------
             gradient = {}
-            processed_state_dict = {}
+            processed_state_dict = {}  # Initialize here for proper scope
+            tp_degree = self.tp_degree if self.tp_degree > 1 else 1
+
             if self.is_master:
                 assert gathered is not None
-                for i, shard in enumerate(gathered):
-                    if shard is not None:
-                        gradient.update(shard)
-                        gathered[i] = None  # Free memory immediately after using shard
+
+                if tp_degree == 1:
+                    # Case 1: Pure FSDP - each rank owns different parameters
+                    # Simple merge with no conflicts
+                    for i, shard in enumerate(gathered):
+                        if shard:
+                            gradient.update(shard)
+                            gathered[i] = None  # Free memory immediately
+
+                elif self.world_size == tp_degree:
+                    # Case 2: Pure TP - all ranks have same parameters sharded
+                    # Need to reconstruct full parameters from shards
+                    gradient = self._reconstruct_tp_gradients(gathered)
+
+                else:
+                    # Case 3: TP + FSDP hybrid
+                    # Process each FSDP group's TP shards separately
+                    num_fsdp_groups = self.world_size // tp_degree
+
+                    for fsdp_id in range(num_fsdp_groups):
+                        # Extract TP shards for this FSDP group
+                        start_idx = fsdp_id * tp_degree
+                        end_idx = start_idx + tp_degree
+                        tp_shards = gathered[start_idx:end_idx]
+
+                        # Reconstruct this FSDP group's parameters
+                        reconstructed = self._reconstruct_tp_gradients(tp_shards)
+                        gradient.update(reconstructed)
+
+                        # Free memory for processed shards
+                        for idx in range(start_idx, end_idx):
+                            gathered[idx] = None
 
                 # dataset metadata
                 gidx = self.sampler._global_indices()
@@ -631,17 +702,59 @@ class Miner(BaseNode, Trainer):
                 sample_count = len(ids)
 
                 # ── attach window + sample receipt ─────────────────────
-                gradient["metadata"] = {
-                    "window": step_window,
-                    "sample_digest": sample_digest,
-                    "sample_count": sample_count,
-                }
-                tplr.logger.info(
-                    f"Attached metadata to gradient: {gradient['metadata']}"
+                # Build xshapes and totalks for TP-reconstructed parameters
+                final_xshapes = {}
+                final_totalks = {}
+
+                for key in gradient:
+                    if key.endswith("idxs"):
+                        param_name = key[:-4]  # Remove "idxs" suffix
+
+                        # Get shape and totalk from the reconstructed gradient
+                        if param_name + "vals" in gradient:
+                            idxs_tensor = gradient[key]
+                            vals_tensor = gradient[param_name + "vals"]
+
+                            # For TP-reconstructed params, use the full shape
+                            shard_meta = gradient.get(param_name + "shard_metadata", {})
+                            if shard_meta.get("was_tp_sharded"):
+                                # Use the global shape from reconstruction
+                                final_xshapes[param_name] = shard_meta.get(
+                                    "global_shape", vals_tensor.shape
+                                )
+                                # Use the totalk from reconstruction
+                                final_totalks[param_name] = shard_meta.get(
+                                    "totalk", len(idxs_tensor)
+                                )
+                            else:
+                                # Use the original shape and totalk
+                                final_xshapes[param_name] = self.xshapes.get(
+                                    param_name, vals_tensor.shape
+                                )
+                                final_totalks[param_name] = self.totalks.get(
+                                    param_name, len(idxs_tensor)
+                                )
+
+                # Update metadata (preserve existing fields if any)
+                if "metadata" not in gradient:
+                    gradient["metadata"] = {}
+                gradient["metadata"].update(
+                    {
+                        "window": step_window,
+                        "sample_digest": sample_digest,
+                        "sample_count": sample_count,
+                        "xshapes": final_xshapes,  # Critical for validator decompression
+                        "totalks": final_totalks,  # Critical for validator decompression
+                    }
                 )
 
+                mode = (
+                    "FSDP"
+                    if tp_degree == 1
+                    else ("TP" if self.world_size == tp_degree else "TP+FSDP")
+                )
                 tplr.logger.info(
-                    f"Merged {len(gathered)} shards → {len(gradient) - 1} tensors"
+                    f"Gradient ready: {len(gradient) - 1} tensors ({mode} mode)"
                 )
                 del gathered  # Free gathered list after merging
 
@@ -667,26 +780,40 @@ class Miner(BaseNode, Trainer):
                 await self.wait_until_window(step_window + 1)
 
             if self.is_master:
-                put_start = tplr.T()
-                await self.comms.put(
-                    state_dict=processed_state_dict,
-                    uid=str(self.uid),
-                    window=step_window,
-                    key="gradient",
-                    global_step=self.global_step,
-                    local=False,
-                    stale_retention=100,
-                )
+                try:
+                    put_start = tplr.T()
 
-                upload_size = sum(
-                    t.element_size() * t.nelement()
-                    for t in processed_state_dict.values()
-                    if isinstance(t, torch.Tensor)
-                )
-                put_time = tplr.T() - put_start  # ⏱ done
-                tplr.logger.info(
-                    f"Uploaded {upload_size / 1e6:.1f} MB shard-merged gradient"
-                )
+                    # Calculate upload size
+                    upload_size = sum(
+                        t.element_size() * t.nelement()
+                        for t in processed_state_dict.values()
+                        if isinstance(t, torch.Tensor)
+                    )
+                    await self.comms.put(
+                        state_dict=processed_state_dict,
+                        uid=str(self.uid),
+                        window=step_window,
+                        key="gradient",
+                        global_step=self.global_step,
+                        local=False,
+                        stale_retention=100,
+                    )
+
+                    put_time = tplr.T() - put_start
+                    mode = (
+                        "FSDP"
+                        if tp_degree == 1
+                        else ("TP" if self.world_size == tp_degree else "TP+FSDP")
+                    )
+                    tplr.logger.info(
+                        f"Successfully uploaded {upload_size / 1e6:.1f} MB gradient [{mode} mode] in {put_time:.2f}s"
+                    )
+                except Exception as e:
+                    tplr.logger.error(f"Failed to upload gradient: {e}")
+                    import traceback
+
+                    tplr.logger.error(f"Traceback: {traceback.format_exc()}")
+                    raise
 
                 # Free memory immediately after upload
                 del processed_state_dict
@@ -787,7 +914,7 @@ class Miner(BaseNode, Trainer):
                     f"{tplr.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
-            # [TP] All ranks must call full_tensor() for DTensors, then only master uploads
+            # [TP] Debug sampling avoids collectives: master samples local shards via to_local(), non-masters skip
             debug_dict = {}
 
             # Add model parameters debug info (sample from local shard to avoid collectives)
@@ -838,6 +965,34 @@ class Miner(BaseNode, Trainer):
                 m.norm().item() for m in self.error_feedback.values()
             ]
             gathered_mom = dist_helper.all_gather_object(local_mom_norms)
+
+            # Track error feedback memory usage (every 10 windows)
+            if self.current_window % 10 == 0:
+                gpu_memory = 0
+                cpu_memory = 0
+                for name in self.error_feedback:
+                    if self.error_feedback[name] is not None:
+                        if self.error_feedback[name].is_cuda:
+                            gpu_memory += (
+                                self.error_feedback[name].numel()
+                                * self.error_feedback[name].element_size()
+                            )
+                        else:
+                            cpu_memory += (
+                                self.error_feedback[name].numel()
+                                * self.error_feedback[name].element_size()
+                            )
+
+                cpu_buffer_memory = sum(
+                    buf.numel() * buf.element_size()
+                    for buf in self.error_feedback_cpu_buffers.values()
+                )
+
+                tplr.logger.info(
+                    f"[Memory] Error feedback: GPU={gpu_memory / (1024**3):.2f}GB, "
+                    f"CPU={cpu_memory / (1024**3):.2f}GB, "
+                    f"CPU buffers={cpu_buffer_memory / (1024**3):.2f}GB"
+                )
 
             momentum_norms = []
             # Log metrics to WandB
@@ -980,6 +1135,229 @@ class Miner(BaseNode, Trainer):
         tplr.logger.info(
             f"After cleanup - GPU reserved: {torch.cuda.memory_reserved(self.device) / 1024**3:.2f} GB"
         )
+
+    def _reconstruct_tp_gradients(self, tp_shards):
+        """
+        Reconstruct full gradients from tensor-parallel shards.
+
+        Args:
+            tp_shards: List of gradient dictionaries from TP ranks
+
+        Returns:
+            Dictionary with reconstructed full gradients maintaining compression
+        """
+        if not tp_shards or not any(tp_shards):
+            return {}
+
+        # Get all parameter names from first non-None shard
+        all_params = set()
+        for shard in tp_shards:
+            if shard:
+                for key in shard:
+                    if key.endswith("idxs"):
+                        all_params.add(key[:-4])  # Remove "idxs" suffix
+                break
+
+        result = {}
+
+        # Process each parameter
+        for param_name in all_params:
+            # Check if this is a TP-sharded parameter
+            first_shard = next(s for s in tp_shards if s)
+            shard_meta = first_shard.get(param_name + "shard_metadata", {})
+
+            if shard_meta.get("is_tp_sharded"):
+                # Collect all TP shards for this parameter
+                shards_data = []
+                for rank_idx, shard_dict in enumerate(tp_shards):
+                    if shard_dict and (param_name + "idxs") in shard_dict:
+                        shards_data.append(
+                            {
+                                "rank": rank_idx,
+                                "idxs": shard_dict.get(param_name + "idxs"),
+                                "vals": shard_dict.get(param_name + "vals"),
+                                "quant_params": shard_dict.get(
+                                    param_name + "quant_params"
+                                ),
+                                "xshape": shard_dict.get("metadata", {})
+                                .get("xshapes", {})
+                                .get(param_name),
+                                "totalk": shard_dict.get("metadata", {})
+                                .get("totalks", {})
+                                .get(param_name),
+                                "local_shape": shard_meta.get("local_shape"),
+                                "shard_dim": shard_meta.get("shard_dim", 0),
+                            }
+                        )
+
+                if not shards_data:
+                    continue
+
+                # 1. DECOMPRESS each shard
+                decompressed_shards = []
+                for shard in shards_data:
+                    if shard["idxs"] is None or shard["vals"] is None:
+                        continue
+
+                    # Use xshape from compression metadata
+                    shard_xshape = shard["xshape"] or shard["local_shape"]
+                    shard_totalk = shard["totalk"] or len(shard["idxs"])
+
+                    # Create reference tensor for decompression
+                    ref = torch.empty(
+                        shard_xshape, device=self.device, dtype=torch.float32
+                    )
+
+                    # Move quantization params to device if present
+                    quant_params_on_device = None
+                    if shard["quant_params"] is not None:
+                        # Handle both dict and tuple formats for quant_params
+                        if isinstance(shard["quant_params"], dict):
+                            quant_params_on_device = {}
+                            for key, value in shard["quant_params"].items():
+                                if isinstance(value, torch.Tensor):
+                                    quant_params_on_device[key] = value.to(self.device)
+                                else:
+                                    quant_params_on_device[key] = value
+                        elif isinstance(shard["quant_params"], (tuple, list)):
+                            # If it's a tuple/list, move tensors to device
+                            quant_params_on_device = []
+                            for item in shard["quant_params"]:
+                                if isinstance(item, torch.Tensor):
+                                    quant_params_on_device.append(item.to(self.device))
+                                else:
+                                    quant_params_on_device.append(item)
+                            quant_params_on_device = tuple(quant_params_on_device)
+                        else:
+                            # Just pass through as-is for other types
+                            quant_params_on_device = shard["quant_params"]
+
+                    # Decompress the shard
+                    decompressed = self.compressor.decompress(
+                        ref,
+                        shard["idxs"].to(self.device),
+                        shard["vals"].to(self.device),
+                        shard_xshape,
+                        shard_totalk,
+                        quantize_params=quant_params_on_device,
+                    )
+
+                    # Decode from transformer space
+                    decoded = self.transformer.decode(
+                        decompressed, use_dct=self.hparams.use_dct
+                    )
+
+                    # Reshape back to local shape if needed
+                    if shard["local_shape"] and tuple(decoded.shape) != tuple(
+                        shard["local_shape"]
+                    ):
+                        decoded = decoded.reshape(shard["local_shape"])
+
+                    decompressed_shards.append(decoded)
+                    del decompressed  # Free memory
+
+                if not decompressed_shards:
+                    continue
+
+                # 2. CONCATENATE along the shard dimension
+                shard_dim = shards_data[0]["shard_dim"]
+                full_gradient = torch.cat(decompressed_shards, dim=shard_dim)
+                num_shards = len(decompressed_shards)  # Store for later use
+
+                # 3. RECOMPRESS the full gradient
+                # First encode with transformer
+                encoded = self.transformer.encode(
+                    full_gradient, use_dct=self.hparams.use_dct
+                )
+
+                # Get the target k for compression
+                # Use the same per-row topk as original compression
+                # NOTE: self.totalks stores TOTAL values kept, not per-row topk
+                # So we use the original topk_compression setting instead
+                topk_compression = getattr(self.hparams, "topk_compression", 32)
+                target_k = topk_compression  # Same per-row compression as original
+
+                # Calculate expected values to keep
+                # For per-row compression: num_rows × values_per_row
+                num_rows = (
+                    full_gradient.shape[0] if len(full_gradient.shape) >= 2 else 1
+                )
+                expected_kept = num_rows * min(target_k, full_gradient.shape[-1])
+                compression_ratio = (
+                    full_gradient.numel() / expected_kept if expected_kept > 0 else 0
+                )
+
+                # Compress
+                compress_result = self.compressor.compress(encoded, target_k)
+
+                # Handle both 3-tuple and 5-tuple returns from compress
+                if len(compress_result) == 3:
+                    idxs, vals, xshape = compress_result
+                    totalk = len(idxs)
+                    quant_params = None
+                elif len(compress_result) == 5:
+                    idxs, vals, xshape, totalk, quant_params = compress_result
+                else:
+                    raise ValueError(
+                        f"Unexpected compress return: {len(compress_result)} values"
+                    )
+
+                # Store the recompressed full gradient
+                result[param_name + "idxs"] = idxs
+                result[param_name + "vals"] = vals
+                if quant_params:
+                    result[param_name + "quant_params"] = quant_params
+                result[param_name + "shard_metadata"] = {
+                    "is_shard": False,  # This is now a full gradient
+                    "was_tp_sharded": True,
+                    "num_tp_shards_merged": num_shards,
+                    "global_shape": tuple(
+                        xshape
+                    ),  # Use xshape from compressor (handles any reshaping)
+                    "totalk": totalk,  # Store the actual totalk for this reconstructed parameter
+                }
+
+                # Free memory
+                del decompressed_shards, full_gradient, encoded
+
+            else:
+                # Not TP-sharded (or replicated), just copy from first shard that has it
+                for shard_dict in tp_shards:
+                    if shard_dict and (param_name + "idxs") in shard_dict:
+                        result[param_name + "idxs"] = shard_dict[param_name + "idxs"]
+                        result[param_name + "vals"] = shard_dict[param_name + "vals"]
+                        if param_name + "quant_params" in shard_dict:
+                            result[param_name + "quant_params"] = shard_dict[
+                                param_name + "quant_params"
+                            ]
+                        result[param_name + "shard_metadata"] = shard_dict.get(
+                            param_name + "shard_metadata", {}
+                        )
+                        break
+
+        # Copy and update metadata from first shard
+        first_shard = next((s for s in tp_shards if s), {})
+        if "metadata" in first_shard:
+            result["metadata"] = first_shard["metadata"].copy()
+            # Update xshapes and totalks for reconstructed parameters
+            for param_name in all_params:
+                if (param_name + "shard_metadata") in result:
+                    meta = result[param_name + "shard_metadata"]
+                    if meta.get("was_tp_sharded") and meta.get("global_shape"):
+                        # Update shapes for reconstructed parameters
+                        if "xshapes" not in result["metadata"]:
+                            result["metadata"]["xshapes"] = {}
+                        if "totalks" not in result["metadata"]:
+                            result["metadata"]["totalks"] = {}
+                        result["metadata"]["xshapes"][param_name] = meta["global_shape"]
+                        # Update totalk with actual compressed size
+                        if param_name + "idxs" in result:
+                            idxs = result[param_name + "idxs"]
+                            result["metadata"]["totalks"][param_name] = (
+                                len(idxs) if torch.is_tensor(idxs) else len(idxs)
+                            )
+
+        return result
 
 
 # Start miner.

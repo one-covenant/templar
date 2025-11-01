@@ -337,7 +337,17 @@ class Validator(BaseNode, Trainer):
         # Store parallelization parameters
         tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
         # Check environment variable first for runtime override, then hparams
-        self.tp_degree = int(os.environ.get("TP_DEGREE", getattr(tt, "tp_degree", 1)))
+        raw_tp = os.environ.get("TP_DEGREE")
+        if raw_tp is not None:
+            try:
+                self.tp_degree = max(1, int(raw_tp))
+            except (ValueError, TypeError):
+                tplr.logger.warning(
+                    f"Invalid TP_DEGREE='{raw_tp}', falling back to hparams"
+                )
+                self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        else:
+            self.tp_degree = int(getattr(tt, "tp_degree", 1))
 
         # Init bittensor objects
         self.wallet = bt.wallet(config=self.config)
@@ -1987,15 +1997,15 @@ class Validator(BaseNode, Trainer):
 
                 # Only call slash AFTER all_ok completes, so all ranks are synchronized
                 if not apply_ok_global and self.is_master:
-                    # Find which rank failed by checking if we had an exception
-                    if not apply_ok_local:
-                        # This rank failed - create a proper exception object
-                        exc = (
-                            Exception(exception_msg)
-                            if exception_msg
-                            else Exception("Unknown error")
+                    # Slash regardless of which rank failed
+                    exc = (
+                        Exception(exception_msg)
+                        if exception_msg
+                        else Exception(
+                            "Gradient application failed on at least one rank"
                         )
-                        self.slash_for_invalid_gradient(eval_uid, exc)
+                    )
+                    self.slash_for_invalid_gradient(eval_uid, exc)
 
                 if not apply_ok_global:
                     # Restore and skip in lockstep
@@ -3442,6 +3452,21 @@ class Validator(BaseNode, Trainer):
         Raises:
             ValueError: If any gradient data is invalid
         """
+        # Extract miner's metadata for cross-configuration compatibility
+        # When miners use tensor parallelism (TP), they send full reconstructed gradients.
+        # The metadata contains the actual shapes and compression parameters needed for decompression.
+        miner_metadata = eval_state_dict.get("metadata", {})
+        miner_xshapes = (
+            miner_metadata.get("xshapes", {})
+            if isinstance(miner_metadata, dict)
+            else {}
+        )
+        miner_totalks = (
+            miner_metadata.get("totalks", {})
+            if isinstance(miner_metadata, dict)
+            else {}
+        )
+
         for n, p in model.named_parameters():
             idxs_key = n + "idxs"
             vals_key = n + "vals"
@@ -3459,8 +3484,11 @@ class Validator(BaseNode, Trainer):
                     idxs = (packed_data, original_shape)
                 vals = vals.to(self.device)
 
+                # Use miner's totalk for validation to ensure correct decompression
+                param_totalk = miner_totalks.get(n, self.totalks.get(n))
+
                 # Validate indices are within bounds
-                if self.totalks.get(n) is None:
+                if param_totalk is None:
                     tplr.log_with_context(
                         level="warning",
                         message=f"Missing totalk for parameter {n}, skipping peer {eval_uid}",
@@ -3476,7 +3504,7 @@ class Validator(BaseNode, Trainer):
                 self.comms.check_compressed_indices(
                     idxs_key,
                     idxs,
-                    self.totalks[n],
+                    param_totalk,
                     allowed_topk=self.hparams.topk_compression,
                     vals=vals,
                 )
@@ -3506,9 +3534,21 @@ class Validator(BaseNode, Trainer):
         clip_norm = True  # Always true in the repo 8/13/2025
         # If all validations pass, apply the gradients
 
-        # NOTE: For evaluation, we MUST use validator's own xshapes, not miner's xshapes
-        # The miner's xshapes are only used in outer_step for gradient aggregation
-        # Here we need to decompress to match the validator's model shape
+        # Extract miner's metadata for cross-configuration compatibility
+        # When miners use tensor parallelism (TP), they send full reconstructed gradients
+        # with metadata containing the proper shapes and compression parameters.
+        # This allows validators with different TP/FSDP configurations to correctly decompress.
+        miner_metadata = eval_state_dict.get("metadata", {})
+        miner_xshapes = (
+            miner_metadata.get("xshapes", {})
+            if isinstance(miner_metadata, dict)
+            else {}
+        )
+        miner_totalks = (
+            miner_metadata.get("totalks", {})
+            if isinstance(miner_metadata, dict)
+            else {}
+        )
 
         for n, p in model.named_parameters():
             src_rank = 0
@@ -3560,9 +3600,10 @@ class Validator(BaseNode, Trainer):
                         if clip_norm:
                             quant_params = None  # Fast route for decompress
 
-                        # For evaluation, always use validator's own xshapes to match model shape
-                        param_xshape = self.xshapes[n]
-                        param_totalk = self.totalks[n]
+                        # Use miner's shapes and totalk for decompression
+                        # This ensures compatibility when miners send TP-reconstructed full gradients
+                        param_xshape = miner_xshapes.get(n, self.xshapes[n])
+                        param_totalk = miner_totalks.get(n, self.totalks[n])
 
                         # Use empty_like to avoid copying the param; just provide dtype/device/shape
                         ref = torch.empty(
@@ -3984,6 +4025,16 @@ class Validator(BaseNode, Trainer):
         Re-create the *exact* index pool a miner used for (uid, window) and
         return a 128-bit hex digest **plus the expected sample count**.
         """
+        # Safe-parse TP_DEGREE
+        raw_tp = os.environ.get("TP_DEGREE")
+        if raw_tp is not None:
+            try:
+                tp_degree = max(1, int(raw_tp))
+            except (ValueError, TypeError):
+                tp_degree = int(getattr(self.hparams, "tp_degree", 1))
+        else:
+            tp_degree = int(getattr(self.hparams, "tp_degree", 1))
+
         # Use rank=0 to get the first DP rank's indices (representative for all TP ranks)
         # tp_degree doesn't affect _global_indices(), but pass it for consistency
         miner_sampler = tplr.MinerSampler(
@@ -3996,9 +4047,7 @@ class Validator(BaseNode, Trainer):
             target_batch_size=self.hparams.target_batch_size,
             rank=0,
             world_size=self.world_size,
-            tp_degree=int(
-                os.environ.get("TP_DEGREE", getattr(self.hparams, "tp_degree", 1))
-            ),
+            tp_degree=tp_degree,
         )
         idxs = miner_sampler._global_indices()
         ids = miner_sampler.ids_for_indices(idxs.tolist())

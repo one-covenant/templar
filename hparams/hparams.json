@@ -80,12 +80,12 @@
   },
   "offload_optimizer_states": true,
   "torchtitan": {
-    "tp_degree": 8,
+    "tp_degree": 2,
     "pp_degree": 1,
     "cp_degree": 1,
 
     "dp_replicate": 1,
-    "dp_shard": 1,
+    "dp_shard": 4,
 
     "compile": true,
     "enable_cpu_offload": false,
@@ -95,8 +95,8 @@
 
     "enable_async_tensor_parallel": false,
     "disable_loss_parallel": true,
-    "fsdp_reshard_after_forward": "default",
-    "enable_compiled_autograd": false,
+    "fsdp_reshard_after_forward": "never",
+    "enable_compiled_autograd": true,
 
     "float8_recipe_name": null,
     

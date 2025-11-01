@@ -104,9 +104,11 @@ def test_return_structure_and_types(caplog):
     )
     # Verify that the metadata key exists
     assert "metadata" in gradient
-    # Check that metadata equals the expected dictionary.
-    expected_metadata = {"window": step_window}
-    assert gradient["metadata"] == expected_metadata
+    # Check that metadata contains the expected keys
+    assert "window" in gradient["metadata"]
+    assert gradient["metadata"]["window"] == step_window
+    assert "xshapes" in gradient["metadata"]
+    assert "totalks" in gradient["metadata"]
 
     # Check that xshapes, totalks, are dictionaries.
     assert isinstance(xshapes, dict)
@@ -131,11 +133,15 @@ def test_metadata_attachment():
     # Call prepare_gradient_dict.
     gradient, xshapes, totalks = prepare_gradient_dict(miner, step_window)
 
-    # Verify that gradient["metadata"] exactly equals the expected dictionary.
-    expected_metadata = {"window": step_window}
-    assert gradient.get("metadata") == expected_metadata, (
-        f"Metadata does not match. Expected: {expected_metadata}, Got: {gradient.get('metadata')}"
+    # Verify that gradient["metadata"] contains the expected keys
+    metadata = gradient.get("metadata")
+    assert metadata is not None, "Metadata should not be None"
+    assert "window" in metadata, "Metadata should contain 'window'"
+    assert metadata["window"] == step_window, (
+        f"Window mismatch. Expected: {step_window}, Got: {metadata['window']}"
     )
+    assert "xshapes" in metadata, "Metadata should contain 'xshapes'"
+    assert "totalks" in metadata, "Metadata should contain 'totalks'"
 
 
 def test_error_feedback_decay_and_gradient_accumulation():

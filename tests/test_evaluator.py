@@ -67,6 +67,7 @@ def setup_evaluator_with_mocks():
         evaluator.local_rank = 0
         evaluator.is_master = True
         evaluator.device = "cpu"
+        evaluator.tp_degree = 1  # Default to FSDP mode (no TP)
 
         # Setup model and components
         evaluator.model = MagicMock()
