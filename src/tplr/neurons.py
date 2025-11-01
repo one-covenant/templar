@@ -728,7 +728,10 @@ async def handle_checkpoint_catchup(
     total_inner_steps = ckpt_global_step * instance.hparams.inner_steps
     if total_inner_steps > 0:
         for _ in range(total_inner_steps):
-            instance.inner_scheduler.step()
+            # Respect flatten window during replay
+            if not instance.should_skip_scheduler_step():
+                instance.inner_scheduler.step()
+            instance.inner_scheduler_step_count += 1
         tplr.logger.info(
             f"Replayed {total_inner_steps} scheduler steps (checkpoint global_step="
             f"{ckpt_global_step} * {instance.hparams.inner_steps} inner_steps)"
@@ -977,7 +980,10 @@ async def catchup_with_aggregation_server(
         inner_sched: LRScheduler | None = getattr(instance, "inner_scheduler", None)
         if inner_sched is not None:
             for _ in range(instance.hparams.inner_steps):
-                inner_sched.step()
+                # Respect flatten window during catch-up
+                if not instance.should_skip_scheduler_step():
+                    inner_sched.step()
+                instance.inner_scheduler_step_count += 1
 
         # Aggressive memory cleanup after each window
         if instance.is_master and "gather_ns" in locals() and gather_ns is not None:

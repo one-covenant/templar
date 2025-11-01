@@ -61,7 +61,9 @@
       "scheduler": {
         "warmup_steps": 1500,
         "t_max": 140000,
-        "eta_min_factor": 0.1
+        "eta_min_factor": 0.1,
+        "flatten_start_step": null,
+        "flatten_duration": 0
       }
     },
     "muon": {
@@ -74,7 +76,9 @@
       "scheduler": {
         "warmup_steps": 1500,
         "t_max": 140000,
-        "eta_min_factor": 0.1
+        "eta_min_factor": 0.1,
+        "flatten_start_step": null,
+        "flatten_duration": 0
       }
     }
   },
