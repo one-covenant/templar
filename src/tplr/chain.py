@@ -394,12 +394,6 @@ class ChainManager:
             logger.warning(
                 "No active peers found yet. Using gather peers for evaluation."
             )
-            # Use gather peers (self.peers) for eval_peers instead of blocking evaluation
-            if self.peers:
-                active_peers = set(int(uid) for uid in self.peers)
-            else:
-                logger.warning("No gather peers either. Skipping update.")
-                return
 
         # ---------------------------------------------------------------
         # Convert self.eval_peers into a dict while retaining old counts

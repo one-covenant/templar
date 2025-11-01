@@ -465,15 +465,24 @@ def outer_step(
 
                 decoded_grad = transformer.decode(decompressed, use_dct=use_dct)
 
-                # If this was a shard, we need to handle it differently
+                # Check if this is an unreconstructed shard
                 if shard_meta is not None and shard_meta.get("is_shard"):
-                    # This is a shard gradient - it will be distributed via DTensor below
-                    # The decoded_grad is the LOCAL SHARD that needs to be distributed
+                    # This is still a shard (not reconstructed) - cannot use distribute_tensor
+                    # For DTensor params, we cannot use distribute_tensor with local shards
+                    if isinstance(p, DT):
+                        raise RuntimeError(
+                            f"Parameter '{name}' has an unreconstructed shard gradient. "
+                            f"Shard shape: {decoded_grad.shape}, expected full shape: {p.shape}. "
+                            f"is_tp_sharded={shard_meta.get('is_tp_sharded')}. "
+                            "TP gradients must be reconstructed by the miner before sending to validator."
+                        )
+                    # For non-DTensor params, this shouldn't happen but handle gracefully
                     full_grad_src = decoded_grad.to(
                         dtype=p.dtype, device=p.device, non_blocking=True
                     )
                 else:
-                    # Regular full gradient
+                    # Either no shard_meta, or is_shard=False (reconstructed gradient)
+                    # This is a full gradient - safe to use with distribute_tensor
                     full_grad_src = decoded_grad.to(
                         dtype=p.dtype, device=p.device, non_blocking=True
                     )
@@ -505,6 +514,15 @@ def outer_step(
                 if on_src
                 else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
+
+            # Validate DTensor source payload before distribution
+            if on_src and src_tensor.shape != p.shape:
+                raise RuntimeError(
+                    f"DTensor grad for '{name}' has shape {src_tensor.shape}; "
+                    f"expected full shape {p.shape} for distribute_tensor. "
+                    "This indicates an unreconstructed shard was passed."
+                )
+
             new_grad = distribute_tensor(
                 src_tensor,
                 device_mesh=p.device_mesh,

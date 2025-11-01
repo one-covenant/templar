@@ -282,14 +282,14 @@ class Miner(BaseNode, Trainer):
                     self.error_feedback_cpu_buffers[n] = torch.empty(
                         local_shape, device="cpu", pin_memory=True
                     )
-                    buffer_size = local.numel() * 4  # float32 = 4 bytes
+                    buffer_size = local.numel() * local.element_size()
                     total_buffer_memory += buffer_size
                     num_dtensor_params += 1
                 else:
                     self.error_feedback_cpu_buffers[n] = torch.empty(
                         p.shape, device="cpu", pin_memory=True
                     )
-                    buffer_size = p.numel() * 4  # float32 = 4 bytes
+                    buffer_size = p.numel() * p.element_size()
                     total_buffer_memory += buffer_size
                     num_regular_params += 1
 
@@ -1140,6 +1140,14 @@ class Miner(BaseNode, Trainer):
         """
         Reconstruct full gradients from tensor-parallel shards.
 
+        Process Overview:
+        1. Collect shards from all TP ranks
+        2. Decompress each shard (sparse → 4D tensor)
+        3. Decode to 2D without DCT (lossless unchunking)
+        4. Concatenate shards along split dimension
+        5. Encode back to 4D without DCT (lossless chunking)
+        6. Recompress to sparse format for validator
+
         Args:
             tp_shards: List of gradient dictionaries from TP ranks
 
@@ -1186,6 +1194,7 @@ class Miner(BaseNode, Trainer):
                                 .get("totalks", {})
                                 .get(param_name),
                                 "local_shape": shard_meta.get("local_shape"),
+                                "global_shape": shard_meta.get("global_shape"),
                                 "shard_dim": shard_meta.get("shard_dim", 0),
                             }
                         )
@@ -1193,7 +1202,21 @@ class Miner(BaseNode, Trainer):
                 if not shards_data:
                     continue
 
-                # 1. DECOMPRESS each shard
+                # TP Gradient Reconstruction Process
+                # Why we decompress and recompress:
+                # - Each TP rank sends a shard of the gradient
+                # - We need to combine shards into a full gradient for the validator
+                # - The validator expects a single compressed gradient, not multiple shards
+                # Important: We must use the same use_dct setting as the original compression
+                # to ensure correct reconstruction without corruption
+
+                shard_dim = shards_data[0]["shard_dim"]
+                global_shape = shards_data[0]["global_shape"]
+
+                # Get use_dct setting to match original encoding
+                use_dct = getattr(self.hparams, "use_dct", False)
+
+                # Step 1: DECOMPRESS each shard (compressed format → encoded tensor)
                 decompressed_shards = []
                 for shard in shards_data:
                     if shard["idxs"] is None or shard["vals"] is None:
@@ -1203,15 +1226,9 @@ class Miner(BaseNode, Trainer):
                     shard_xshape = shard["xshape"] or shard["local_shape"]
                     shard_totalk = shard["totalk"] or len(shard["idxs"])
 
-                    # Create reference tensor for decompression
-                    ref = torch.empty(
-                        shard_xshape, device=self.device, dtype=torch.float32
-                    )
-
                     # Move quantization params to device if present
                     quant_params_on_device = None
                     if shard["quant_params"] is not None:
-                        # Handle both dict and tuple formats for quant_params
                         if isinstance(shard["quant_params"], dict):
                             quant_params_on_device = {}
                             for key, value in shard["quant_params"].items():
@@ -1220,7 +1237,6 @@ class Miner(BaseNode, Trainer):
                                 else:
                                     quant_params_on_device[key] = value
                         elif isinstance(shard["quant_params"], (tuple, list)):
-                            # If it's a tuple/list, move tensors to device
                             quant_params_on_device = []
                             for item in shard["quant_params"]:
                                 if isinstance(item, torch.Tensor):
@@ -1229,10 +1245,14 @@ class Miner(BaseNode, Trainer):
                                     quant_params_on_device.append(item)
                             quant_params_on_device = tuple(quant_params_on_device)
                         else:
-                            # Just pass through as-is for other types
                             quant_params_on_device = shard["quant_params"]
 
-                    # Decompress the shard
+                    # Create reference tensor for decompression
+                    ref = torch.empty(
+                        shard_xshape, device=self.device, dtype=torch.float32
+                    )
+
+                    # Decompress the shard (sparse format → encoded 4D tensor)
                     decompressed = self.compressor.decompress(
                         ref,
                         shard["idxs"].to(self.device),
@@ -1242,12 +1262,14 @@ class Miner(BaseNode, Trainer):
                         quantize_params=quant_params_on_device,
                     )
 
-                    # Decode from transformer space
+                    # Decode from transformer space (4D chunked → 2D gradient tensor)
+                    # Must use the same DCT setting as original encoding
                     decoded = self.transformer.decode(
-                        decompressed, use_dct=self.hparams.use_dct
+                        decompressed,
+                        use_dct=use_dct,  # Match original encoding
                     )
 
-                    # Reshape back to local shape if needed
+                    # Reshape if needed to match local shape
                     if shard["local_shape"] and tuple(decoded.shape) != tuple(
                         shard["local_shape"]
                     ):
@@ -1259,36 +1281,21 @@ class Miner(BaseNode, Trainer):
                 if not decompressed_shards:
                     continue
 
-                # 2. CONCATENATE along the shard dimension
-                shard_dim = shards_data[0]["shard_dim"]
+                # Step 2: CONCATENATE shards to form the full gradient
+                # This combines the TP shards along their split dimension (e.g., columns for MLP)
                 full_gradient = torch.cat(decompressed_shards, dim=shard_dim)
-                num_shards = len(decompressed_shards)  # Store for later use
+                num_shards = len(decompressed_shards)  # Store for metadata
 
-                # 3. RECOMPRESS the full gradient
-                # First encode with transformer
+                # Step 3: RECOMPRESS the full gradient for the validator
+                # Must use the same DCT setting to maintain consistency
                 encoded = self.transformer.encode(
-                    full_gradient, use_dct=self.hparams.use_dct
+                    full_gradient,
+                    use_dct=use_dct,  # Match original encoding
                 )
 
-                # Get the target k for compression
-                # Use the same per-row topk as original compression
-                # NOTE: self.totalks stores TOTAL values kept, not per-row topk
-                # So we use the original topk_compression setting instead
+                # Compress the full gradient (4D tensor → sparse format)
                 topk_compression = getattr(self.hparams, "topk_compression", 32)
-                target_k = topk_compression  # Same per-row compression as original
-
-                # Calculate expected values to keep
-                # For per-row compression: num_rows × values_per_row
-                num_rows = (
-                    full_gradient.shape[0] if len(full_gradient.shape) >= 2 else 1
-                )
-                expected_kept = num_rows * min(target_k, full_gradient.shape[-1])
-                compression_ratio = (
-                    full_gradient.numel() / expected_kept if expected_kept > 0 else 0
-                )
-
-                # Compress
-                compress_result = self.compressor.compress(encoded, target_k)
+                compress_result = self.compressor.compress(encoded, topk_compression)
 
                 # Handle both 3-tuple and 5-tuple returns from compress
                 if len(compress_result) == 3:
@@ -1307,17 +1314,20 @@ class Miner(BaseNode, Trainer):
                 result[param_name + "vals"] = vals
                 if quant_params:
                     result[param_name + "quant_params"] = quant_params
+                # Store metadata about this reconstructed parameter
+                # This tells the validator that this gradient:
+                # - Is a full gradient (not a shard)
+                # - Was reconstructed from TP shards
+                # - Has specific shape/compression parameters
                 result[param_name + "shard_metadata"] = {
                     "is_shard": False,  # This is now a full gradient
-                    "was_tp_sharded": True,
-                    "num_tp_shards_merged": num_shards,
-                    "global_shape": tuple(
-                        xshape
-                    ),  # Use xshape from compressor (handles any reshaping)
-                    "totalk": totalk,  # Store the actual totalk for this reconstructed parameter
+                    "was_tp_sharded": True,  # Was originally TP sharded
+                    "num_tp_shards_merged": num_shards,  # Number of shards combined
+                    "global_shape": tuple(xshape),  # Shape for decompression
+                    "totalk": totalk,  # Number of values kept after compression
                 }
 
-                # Free memory
+                # Free GPU memory immediately
                 del decompressed_shards, full_gradient, encoded
 
             else:
@@ -1349,13 +1359,15 @@ class Miner(BaseNode, Trainer):
                             result["metadata"]["xshapes"] = {}
                         if "totalks" not in result["metadata"]:
                             result["metadata"]["totalks"] = {}
+                        # Use the global shape for reconstructed TP parameters
                         result["metadata"]["xshapes"][param_name] = meta["global_shape"]
-                        # Update totalk with actual compressed size
-                        if param_name + "idxs" in result:
-                            idxs = result[param_name + "idxs"]
-                            result["metadata"]["totalks"][param_name] = (
-                                len(idxs) if torch.is_tensor(idxs) else len(idxs)
-                            )
+                        # Use the actual totalk from reconstruction metadata
+                        result["metadata"]["totalks"][param_name] = meta.get(
+                            "totalk",
+                            len(result[param_name + "idxs"])
+                            if param_name + "idxs" in result
+                            else 0,
+                        )
 
         return result
 

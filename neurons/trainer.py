@@ -37,7 +37,6 @@ from neurons.base_node import CPU_COUNT
 from tplr import model_factory
 from tplr.distributed import dist_helper
 from tplr.muon import Muon, SingleDeviceMuonWithAuxAdam
-from torchtitan.tools.utils import get_peak_flops
 
 
 class Trainer:
@@ -135,69 +134,7 @@ class Trainer:
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
-        # Initialize MFU calculation parameters
-        self._init_mfu_calculator()
-
         return
-
-    def _init_mfu_calculator(self):
-        """
-        Initialize MFU (Model FLOPs Utilization) calculation parameters.
-        Based on TorchTitan's implementation.
-        """
-        try:
-            import torch.nn as nn
-
-            # Get GPU peak FLOPs
-            device_name = torch.cuda.get_device_name(self.device)
-            self._gpu_peak_flops = get_peak_flops(device_name)
-
-            # Calculate num_flops_per_token
-            # Based on: https://github.com/one-covenant/torchtitan/blob/a25a978c7a5392d58a8e7e47bb367fa59e46cb69/torchtitan/models/llama3/model/args.py#L86
-
-            # Get model config (TorchTitan uses 'args' attribute)
-            model_args = getattr(
-                self.model, "args", getattr(self.model, "config", None)
-            )
-            if model_args is None:
-                raise AttributeError("Model has neither 'args' nor 'config' attribute")
-
-            seq_len = self.hparams.sequence_length
-
-            # Count total parameters
-            nparams = sum(p.numel() for p in self.model.parameters())
-
-            # Count embedding parameters (don't participate in matmuls)
-            nparams_embedding = sum(
-                m.weight.numel()
-                for m in self.model.modules()
-                if isinstance(m, nn.Embedding)
-            )
-
-            l = model_args.n_layers  # number of layers
-            h = model_args.n_heads  # number of attention heads
-            q = model_args.dim // model_args.n_heads  # head dimension
-            t = seq_len  # sequence length
-
-            # Reasoning behind the formula:
-            # - Factor of 6 for non-embedding params: 2 FLOPs/param in forward, 4 in backward
-            # - Factor of 12 for attention: 2 matmul forward + 4 backward (6), times 2 for mul+add
-            # - Flash attention recomputation not counted (as per convention)
-            self._num_flops_per_token = (
-                6 * (nparams - nparams_embedding) + 12 * l * h * q * t
-            )
-
-            self._mfu_initialized = True
-
-            if self.is_master:
-                tplr.logger.info(
-                    f"[MFU Init] GPU: {device_name}, Peak FLOPs: {self._gpu_peak_flops / 1e12:.2f} TFLOPs, "
-                    f"FLOPs/token: {self._num_flops_per_token / 1e9:.2f}G"
-                )
-        except Exception as e:
-            self._mfu_initialized = False
-            if self.is_master:
-                tplr.logger.warning(f"Failed to initialize MFU calculator: {e}")
 
     def init_optimizers_schedulers(self, validator=False):
         self.lr = float(self.hparams.outer_learning_rate)
@@ -758,18 +695,10 @@ class Trainer:
         # Do this once per window, not per micro-batch.
         self.prefetch_inner_optimizer_states()
 
-        # Check for FSDP2 optimizations once per window
-        if hasattr(self.model, "set_requires_gradient_sync") and hasattr(
-            self.model, "set_reshard_after_backward"
-        ):
-            if not hasattr(self, "_logged_fsdp2_mode"):
-                tplr.logger.info(
-                    "FSDP2 optimizations detected - using set_requires_gradient_sync/set_reshard_after_backward"
-                )
-                self._logged_fsdp2_mode = True
-        elif hasattr(self.model, "no_sync") and self.world_size > 1:
+        # Check for no_sync support for gradient accumulation
+        if hasattr(self.model, "no_sync") and self.world_size > 1:
             if not hasattr(self, "_logged_nosync_mode"):
-                tplr.logger.info("Using generic no_sync() for gradient accumulation")
+                tplr.logger.info("Using no_sync() for gradient accumulation")
                 self._logged_nosync_mode = True
 
         # Initialize profiler if config is available (from BaseNode)
@@ -798,8 +727,6 @@ class Trainer:
         # Timing accumulators for forward and backward passes
         step_forward_time: float = 0.0  # Per-step timing (reset after each inner step)
         step_backward_time: float = 0.0  # Per-step timing (reset after each inner step)
-        total_forward_time: float = 0.0  # Total accumulated timing (for MFU)
-        total_backward_time: float = 0.0  # Total accumulated timing (for MFU)
 
         inner_step_count: int = 0
         loader_iter = iter(loader)
@@ -847,9 +774,7 @@ class Trainer:
                     accum_batch_size += local_bs
 
                     tokens_this_batch = input_ids.numel()
-                    batch_tokens += (
-                        tokens_this_batch  # Accumulate for MFU (never reset)
-                    )
+                    batch_tokens += tokens_this_batch
                     local_tokens_sum += tokens_this_batch
 
                     labels = input_ids.clone()
@@ -874,43 +799,29 @@ class Trainer:
                 forward_time = time.time() - forward_start
 
                 # -------------------------------------------------------------- #
-                # 3-a.  Back-prop with FSDP2 optimizations or no_sync()
+                # 3-a.  Back-prop with optional no_sync() for gradient accumulation
                 # -------------------------------------------------------------- #
                 backward_start = time.time()
                 with tp.record_function("Backward Pass") if prof else nullcontext():
                     corrected_accum_steps = max(self.sampler.grad_accum_steps, 1)
                     final_micro_batch = (batch_count + 1) % corrected_accum_steps == 0
 
-                    # Check for FSDP2-specific optimizations
-                    if hasattr(self.model, "set_requires_gradient_sync") and hasattr(
-                        self.model, "set_reshard_after_backward"
-                    ):
-                        # FSDP2: Use fine-grained control for better performance
-                        # Only reduce-scatter gradients on the last microbatch
-                        self.model.set_requires_gradient_sync(final_micro_batch)
-                        # Only all-gather parameters on the first microbatch (keep gathered for others)
-                        is_first_micro_batch = batch_count % corrected_accum_steps == 0
-                        self.model.set_reshard_after_backward(not is_first_micro_batch)
-
-                        self.scaler.scale(loss).backward()
-                    elif (
+                    if (
                         hasattr(self.model, "no_sync")
                         and self.world_size > 1
                         and not final_micro_batch
                     ):
-                        # Fallback to generic no_sync() for non-FSDP2 models
+                        # Use no_sync() for gradient accumulation (skip sync until final microbatch)
                         with self.model.no_sync():
                             self.scaler.scale(loss).backward()
                     else:
-                        # No special handling needed (single GPU or final microbatch)
+                        # Standard backward pass (single GPU or final microbatch)
                         self.scaler.scale(loss).backward()
                 backward_time = time.time() - backward_start
 
                 # Accumulate timing for this step (both per-step and total)
                 step_forward_time += forward_time
                 step_backward_time += backward_time
-                total_forward_time += forward_time
-                total_backward_time += backward_time
 
                 total_loss += loss_item
                 local_loss_sum += loss_item  # defer collective
@@ -1005,20 +916,18 @@ class Trainer:
                                 f"accum: {accum_batch_size}/{self.hparams.batch_size}"
                             )
 
-                        # Reset timing accumulators for next inner step
-                        step_forward_time = 0.0
-                        step_backward_time = 0.0
+                    # Reset timing accumulators for next inner step (on all ranks)
+                    step_forward_time = 0.0
+                    step_backward_time = 0.0
 
-                        if window_entry_loss == 0.0:
-                            # TP ranks process same batches, divide by tp_degree
-                            total_batches_first_step = int(
-                                dist_helper.ddp_reduce(batch_count, device=self.device)
-                                / self.tp_degree
-                            )
-                            window_entry_loss = (
-                                global_loss_sum / total_batches_first_step
-                            )
-                        accum_batch_size = 0  # reset on *all* ranks
+                    if window_entry_loss == 0.0:
+                        # TP ranks process same batches, divide by tp_degree
+                        total_batches_first_step = int(
+                            dist_helper.ddp_reduce(batch_count, device=self.device)
+                            / self.tp_degree
+                        )
+                        window_entry_loss = global_loss_sum / total_batches_first_step
+                    accum_batch_size = 0  # reset on *all* ranks
 
                     # Step the profiler after optimizer step
                     if prof is not None and hasattr(prof, "step"):
@@ -1099,65 +1008,6 @@ class Trainer:
         )
 
         # ---------------------------------------------------------------------- #
-        # 7. Calculate MFU (Model FLOPs Utilization)
-        # ---------------------------------------------------------------------- #
-        mfu_metrics = {}
-
-        # Debug: Check MFU initialization status
-        if self.is_master:
-            tplr.logger.info(
-                f"[MFU Check] _mfu_initialized={getattr(self, '_mfu_initialized', False)}, "
-                f"batch_count={batch_count}"
-            )
-
-        if (
-            hasattr(self, "_mfu_initialized")
-            and self._mfu_initialized
-            and batch_count > 0
-        ):
-            try:
-                # Total compute time across all inner steps (for average throughput calculation)
-                total_compute_time = total_forward_time + total_backward_time
-
-                if total_compute_time > 0 and batch_tokens > 0:
-                    # Tokens per second per device (TPS)
-                    tps = batch_tokens / (total_compute_time * self.tp_degree)
-
-                    # TFLOPs per GPU
-                    tflops = self._num_flops_per_token * tps / 1e12
-
-                    # Model FLOPS Utilization (MFU) as percentage
-                    mfu = 100 * self._num_flops_per_token * tps / self._gpu_peak_flops
-
-                    # Samples (sequences) per second per GPU
-                    samples_per_sec = tps / self.hparams.sequence_length
-
-                    # Time per iteration (average across all inner steps)
-                    time_per_iter = (
-                        total_compute_time / inner_step_count
-                        if inner_step_count > 0
-                        else 0.00000001
-                    )
-
-                    mfu_metrics = {
-                        "mfu": mfu,
-                        "tflops_per_gpu": tflops,
-                        "tokens_per_sec_per_gpu": tps,
-                        "samples_per_sec_per_gpu": samples_per_sec,
-                        "time_per_iteration_ms": time_per_iter * 1000,  # Convert to ms
-                    }
-
-                    # Log MFU metrics (all ranks for debugging, can filter to master later)
-                    tplr.logger.info(
-                        f"[MFU] {mfu:.2f}% | TFLOPs: {tflops:.2f} | "
-                        f"Tokens/sec: {tps:.0f} | Samples/sec: {samples_per_sec:.2f} | "
-                        f"Time/iter: {time_per_iter * 1000:.1f}ms"
-                    )
-            except Exception as e:
-                if self.is_master:
-                    tplr.logger.warning(f"Failed to calculate MFU: {e}")
-
-        # ---------------------------------------------------------------------- #
         # 8. Return aggregated metrics
         # ---------------------------------------------------------------------- #
         return {
@@ -1168,7 +1018,6 @@ class Trainer:
             "global_grad_norm": global_grad_norm,  # global gradient norm
             "global_weight_norm": global_weight_norm,  # global weight norm
             "adam_metrics": adam_metrics,  # Adam optimizer metrics dict
-            "mfu_metrics": mfu_metrics,  # MFU metrics dict
         }
 
     def outer_step(self, gather_result, log_wandb: bool = False):

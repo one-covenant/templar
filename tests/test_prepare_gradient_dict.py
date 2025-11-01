@@ -149,7 +149,8 @@ def test_error_feedback_decay_and_gradient_accumulation():
     Test 4 – Error feedback Calculation on First Iteration
     ------------------------------------------------
     When  momentum_decay == 0.0  and the transmitted gradient is 0,
-    the final momentum must be  lr * grad  after prepare_gradient_dict.
+    the final momentum must be  grad  after prepare_gradient_dict.
+    (Note: lr scaling was removed in current implementation)
     """
 
     # ------------------------------------------------------------------ #
@@ -199,9 +200,9 @@ def test_error_feedback_decay_and_gradient_accumulation():
     miner.model.weight.grad = torch.tensor([0.1, 0.2])
 
     # ------------------------------------------------------------------ #
-    #  Expected result = lr * grad
+    #  Expected result = grad (no lr scaling in current implementation)
     # ------------------------------------------------------------------ #
-    expected_final_momentum = miner.model.weight.grad * lr  # [0.09, 0.18]
+    expected_final_momentum = miner.model.weight.grad  # [0.1, 0.2]
 
     # ------------------------------------------------------------------ #
     #  Run
@@ -215,7 +216,7 @@ def test_error_feedback_decay_and_gradient_accumulation():
         miner.error_feedback["weight"],
         expected_final_momentum,
         msg=(
-            "Final momentum should equal lr * grad when "
+            "Final momentum should equal grad when "
             "momentum_decay == 0 and the transmitted gradient is zero."
         ),
     )
@@ -230,6 +231,7 @@ def test_compressor_and_transformer_calls():
         • compressor.compress is invoked with
           transformer.encode(momentum_after_decay_and_add)
           and miner.hparams.topk_compression.
+          (Note: add no longer uses alpha=lr)
 
         • transformer.decode is invoked with the output of
           compressor.decompress.
@@ -294,9 +296,9 @@ def test_compressor_and_transformer_calls():
     # -------------------------------------------------------
     # prepare_gradient_dict does (per parameter):
     #   momentum.mul_(momentum_decay)
-    #   momentum.add_(grad, alpha=lr)
+    #   momentum.add_(grad)  # Note: no alpha=lr in current implementation
     expected_tensor_for_compression = (
-        miner.error_feedback["weight"] * momentum_decay + miner.model.weight.grad * lr
+        miner.error_feedback["weight"] * momentum_decay + miner.model.weight.grad
     )
 
     # ------------------------------------------------------------------ #
