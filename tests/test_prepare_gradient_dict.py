@@ -193,9 +193,9 @@ def test_error_feedback_decay_and_gradient_accumulation():
     miner.model.weight.grad = torch.tensor([0.1, 0.2])
 
     # ------------------------------------------------------------------ #
-    #  Expected result = lr * grad
+    #  Expected result = grad (LR scaling removed in commit 5a74fa33)
     # ------------------------------------------------------------------ #
-    expected_final_momentum = miner.model.weight.grad * lr  # [0.09, 0.18]
+    expected_final_momentum = miner.model.weight.grad  # [0.1, 0.2]
 
     # ------------------------------------------------------------------ #
     #  Run
@@ -209,7 +209,7 @@ def test_error_feedback_decay_and_gradient_accumulation():
         miner.error_feedback["weight"],
         expected_final_momentum,
         msg=(
-            "Final momentum should equal lr * grad when "
+            "Final momentum should equal grad when "
             "momentum_decay == 0 and the transmitted gradient is zero."
         ),
     )
@@ -288,9 +288,9 @@ def test_compressor_and_transformer_calls():
     # -------------------------------------------------------
     # prepare_gradient_dict does (per parameter):
     #   momentum.mul_(momentum_decay)
-    #   momentum.add_(grad, alpha=lr)
+    #   momentum.add_(grad)  # LR scaling removed in commit 5a74fa33
     expected_tensor_for_compression = (
-        miner.error_feedback["weight"] * momentum_decay + miner.model.weight.grad * lr
+        miner.error_feedback["weight"] * momentum_decay + miner.model.weight.grad
     )
 
     # ------------------------------------------------------------------ #
