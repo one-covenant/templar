@@ -391,8 +391,9 @@ class ChainManager:
         logger.debug(f"Stakes: {uid_to_stake}")
 
         if not active_peers:
-            logger.warning("No active peers found. Skipping update.")
-            return
+            logger.warning(
+                "No active peers found yet. Using gather peers for evaluation."
+            )
 
         # ---------------------------------------------------------------
         # Convert self.eval_peers into a dict while retaining old counts
