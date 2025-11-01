@@ -279,8 +279,22 @@ def test_track_negative_evaluation_slashing(validator_instance):
     )
     validator.gradient_scores[uid] = -0.1  # Set current evaluation to negative
 
-    # Track the negative evaluation - should trigger slashing
+    # Set up current_window_scores with multiple UIDs showing good overall performance
+    # so slashing is applied (5th ranked is positive)
+    validator.current_window_scores = {
+        1: 0.5,
+        2: 0.4,
+        3: 0.3,
+        4: -0.1,  # Our UID (negative but overall performance is good)
+        5: 0.2,  # 5th ranked (positive)
+        6: 0.1,
+    }
+
+    # Track the negative evaluation
     validator.track_negative_evaluation(uid)
+
+    # Apply penalties after tracking
+    validator.apply_negative_evaluation_penalties()
 
     # Should be slashed by 75% (multiplied by 0.25)
     # But the history already had 5 negatives, now we added one more (6 total)
@@ -314,3 +328,307 @@ def test_track_negative_evaluation_no_slash_below_threshold(validator_instance):
 
     # Score should remain 1.0 (no slashing)
     assert validator.final_scores[uid] == 1.0
+
+
+def test_should_skip_negative_penalty_5th_ranked_negative(validator_instance):
+    """Test skipping penalty when 5th-ranked UID is negative"""
+    validator = validator_instance
+
+    # Set up current_window_scores with 7 UIDs
+    # Sorted by score (descending): [0.5, 0.3, 0.1, 0.05, -0.1, -0.2, -0.3]
+    # 5th ranked (index 4) is -0.1 (negative)
+    validator.current_window_scores = {
+        1: 0.5,
+        2: 0.3,
+        3: 0.1,
+        4: 0.05,
+        5: -0.1,  # 5th ranked
+        6: -0.2,
+        7: -0.3,
+    }
+
+    # Should return True (skip penalty) since 5th ranked is negative
+    assert validator.should_skip_negative_penalty() is True
+
+
+def test_should_skip_negative_penalty_5th_ranked_positive(validator_instance):
+    """Test NOT skipping penalty when 5th-ranked UID is positive"""
+    validator = validator_instance
+
+    # Set up current_window_scores with 7 UIDs
+    # Sorted by score (descending): [0.5, 0.3, 0.2, 0.1, 0.05, -0.1, -0.2]
+    # 5th ranked (index 4) is 0.05 (positive)
+    validator.current_window_scores = {
+        1: 0.5,
+        2: 0.3,
+        3: 0.2,
+        4: 0.1,
+        5: 0.05,  # 5th ranked
+        6: -0.1,
+        7: -0.2,
+    }
+
+    # Should return False (don't skip penalty) since 5th ranked is positive
+    assert validator.should_skip_negative_penalty() is False
+
+
+def test_should_skip_negative_penalty_fewer_than_5_uids(validator_instance):
+    """Test with fewer than 5 UIDs - should check lowest ranked"""
+    validator = validator_instance
+
+    # Only 3 UIDs, sorted: [0.3, 0.1, -0.2]
+    # Lowest ranked (index 2) is -0.2 (negative)
+    validator.current_window_scores = {
+        1: 0.3,
+        2: 0.1,
+        3: -0.2,  # Lowest ranked
+    }
+
+    # Should return True (skip penalty) since lowest ranked is negative
+    assert validator.should_skip_negative_penalty() is True
+
+
+def test_should_skip_negative_penalty_fewer_than_5_uids_positive(validator_instance):
+    """Test with fewer than 5 UIDs and lowest is positive"""
+    validator = validator_instance
+
+    # Only 3 UIDs, sorted: [0.3, 0.2, 0.1]
+    # Lowest ranked (index 2) is 0.1 (positive)
+    validator.current_window_scores = {
+        1: 0.3,
+        2: 0.2,
+        3: 0.1,  # Lowest ranked
+    }
+
+    # Should return False (don't skip penalty) since lowest ranked is positive
+    assert validator.should_skip_negative_penalty() is False
+
+
+def test_should_skip_negative_penalty_exactly_5_uids(validator_instance):
+    """Test with exactly 5 UIDs"""
+    validator = validator_instance
+
+    # Exactly 5 UIDs, sorted: [0.4, 0.3, 0.2, 0.1, -0.1]
+    # 5th ranked (index 4) is -0.1 (negative)
+    validator.current_window_scores = {
+        1: 0.4,
+        2: 0.3,
+        3: 0.2,
+        4: 0.1,
+        5: -0.1,  # 5th ranked
+    }
+
+    # Should return True (skip penalty) since 5th ranked is negative
+    assert validator.should_skip_negative_penalty() is True
+
+
+def test_should_skip_negative_penalty_no_window_scores(validator_instance):
+    """Test when no current_window_scores available"""
+    validator = validator_instance
+
+    # No current_window_scores set
+    if hasattr(validator, "current_window_scores"):
+        delattr(validator, "current_window_scores")
+
+    # Should return False (don't skip) when no scores available
+    assert validator.should_skip_negative_penalty() is False
+
+
+def test_track_negative_evaluation_skip_slash_5th_ranked_negative(validator_instance):
+    """Test that slashing is skipped when 5th-ranked UID is negative"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+
+    uid = 4
+    validator.final_scores[uid] = 1.0
+
+    # Set up window scores showing overall poor performance
+    # 5th ranked is negative
+    validator.current_window_scores = {
+        1: 0.2,
+        2: 0.1,
+        3: 0.05,
+        4: -0.1,
+        5: -0.2,  # 5th ranked
+        6: -0.3,
+    }
+
+    # Simulate 5 negative and 3 positive evaluations (would normally trigger slash)
+    validator.peer_eval_history[uid] = deque(
+        [True, False, True, True, False, True, False, True],
+        maxlen=validator.eval_history_limit,
+    )
+    validator.gradient_scores[uid] = -0.1
+
+    # Track the negative evaluation
+    validator.track_negative_evaluation(uid)
+
+    # Apply penalties after tracking
+    validator.apply_negative_evaluation_penalties()
+
+    # Score should remain 1.0 (slashing skipped due to overall poor performance)
+    assert validator.final_scores[uid] == 1.0
+
+
+def test_track_negative_evaluation_apply_slash_5th_ranked_positive(validator_instance):
+    """Test that slashing is applied when 5th-ranked UID is positive"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+
+    uid = 4
+    validator.final_scores[uid] = 1.0
+
+    # Set up window scores showing acceptable overall performance
+    # 5th ranked is positive
+    validator.current_window_scores = {
+        1: 0.5,
+        2: 0.4,
+        3: 0.3,
+        4: 0.2,
+        5: 0.1,  # 5th ranked (positive)
+        6: -0.1,
+    }
+
+    # Simulate 5 negative and 3 positive evaluations (should trigger slash)
+    validator.peer_eval_history[uid] = deque(
+        [True, False, True, True, False, True, False, True],
+        maxlen=validator.eval_history_limit,
+    )
+    validator.gradient_scores[uid] = -0.1
+
+    # Track the negative evaluation
+    validator.track_negative_evaluation(uid)
+
+    # Apply penalties after tracking
+    validator.apply_negative_evaluation_penalties()
+
+    # Score should be slashed by 75% (multiplied by 0.25)
+    assert validator.final_scores[uid] == pytest.approx(0.25, rel=1e-3)
+
+
+def test_track_negative_evaluation_skip_exclusion_5th_ranked_negative(
+    validator_instance,
+):
+    """Test that exclusion is skipped when 5th-ranked UID is negative"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.exclude_negative_peers = True
+    validator.hparams.consecutive_negative_threshold = 3
+
+    uid = 5
+
+    # Set up window scores showing overall poor performance
+    validator.current_window_scores = {
+        1: 0.1,
+        2: 0.05,
+        3: -0.1,
+        4: -0.2,
+        5: -0.3,  # 5th ranked (negative)
+    }
+
+    # Set up consecutive negative count to threshold
+    validator.consecutive_negative_count[uid] = 2
+    validator.gradient_scores[uid] = -0.1
+
+    # Initialize history
+    validator.peer_eval_history[uid] = deque(
+        [True, True], maxlen=validator.eval_history_limit
+    )
+
+    # Track negative evaluation (would normally trigger exclusion)
+    validator.track_negative_evaluation(uid)
+
+    # Apply penalties after tracking
+    validator.apply_negative_evaluation_penalties()
+
+    # Should NOT be excluded due to overall poor performance
+    assert uid not in validator.excluded_from_gather
+
+
+def test_track_negative_evaluation_apply_exclusion_5th_ranked_positive(
+    validator_instance,
+):
+    """Test that exclusion is applied when 5th-ranked UID is positive"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.exclude_negative_peers = True
+    validator.hparams.consecutive_negative_threshold = 3
+
+    uid = 5
+
+    # Set up window scores showing acceptable overall performance
+    validator.current_window_scores = {
+        1: 0.5,
+        2: 0.4,
+        3: 0.3,
+        4: 0.2,
+        5: 0.1,  # 5th ranked (positive)
+        6: -0.1,
+    }
+
+    # Set up consecutive negative count to threshold
+    validator.consecutive_negative_count[uid] = 2
+    validator.gradient_scores[uid] = -0.1
+
+    # Initialize history
+    validator.peer_eval_history[uid] = deque(
+        [True, True], maxlen=validator.eval_history_limit
+    )
+
+    # Track negative evaluation (should trigger exclusion)
+    validator.track_negative_evaluation(uid)
+
+    # Apply penalties after tracking
+    validator.apply_negative_evaluation_penalties()
+
+    # Should be excluded
+    assert uid in validator.excluded_from_gather
+
+
+def test_should_exclude_from_gather_skips_when_5th_ranked_negative(validator_instance):
+    """Test should_exclude_from_gather returns False when 5th-ranked is negative"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.exclude_negative_peers = True
+    validator.hparams.consecutive_negative_threshold = 3
+
+    uid = 3
+    validator.consecutive_negative_count[uid] = 3
+
+    # Set up window scores showing overall poor performance
+    validator.current_window_scores = {
+        1: 0.1,
+        2: -0.1,
+        3: -0.2,
+        4: -0.3,
+        5: -0.4,  # 5th ranked (negative)
+    }
+
+    # Should return False (don't exclude) due to overall poor performance
+    assert validator.should_exclude_from_gather(uid) is False
+
+
+def test_should_exclude_from_gather_excludes_when_5th_ranked_positive(
+    validator_instance,
+):
+    """Test should_exclude_from_gather returns True when 5th-ranked is positive"""
+    validator = validator_instance
+    validator.hparams = SimpleNamespace()
+    validator.hparams.exclude_negative_peers = True
+    validator.hparams.consecutive_negative_threshold = 3
+
+    uid = 3
+    validator.consecutive_negative_count[uid] = 3
+
+    # Set up window scores showing acceptable overall performance
+    validator.current_window_scores = {
+        1: 0.5,
+        2: 0.4,
+        3: 0.3,
+        4: 0.2,
+        5: 0.1,  # 5th ranked (positive)
+        6: -0.1,
+    }
+
+    # Should return True (exclude) since overall performance is acceptable
+    assert validator.should_exclude_from_gather(uid) is True
