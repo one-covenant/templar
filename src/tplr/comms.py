@@ -570,13 +570,18 @@ class Comms(ChainManager):
                 success = True
             else:
                 # Use our optimized Python implementation for all large files
-                success = await self.download_large_file(
-                    s3_client=s3_client,
-                    bucket=bucket,
-                    key=key,
-                    file_size=file_size,
-                    temp_file_path=temp_file_path,
-                    show_progress=show_progress,
+                # Scale timeout with file size: minimum 300s, or 1 second per 25MB
+                download_timeout = max(300, file_size / (25 * 1024 * 1024))
+                success = await asyncio.wait_for(
+                    self.download_large_file(
+                        s3_client=s3_client,
+                        bucket=bucket,
+                        key=key,
+                        file_size=file_size,
+                        temp_file_path=temp_file_path,
+                        show_progress=show_progress,
+                    ),
+                    timeout=download_timeout,
                 )
 
                 if not success:
@@ -1025,10 +1030,14 @@ class Comms(ChainManager):
                         expected_len = end - start + 1
 
                         try:
-                            response = await s3_client.get_object(
-                                Bucket=bucket.name,
-                                Key=key,
-                                Range=f"bytes={start}-{end}",
+                            # Per-chunk timeout (15 seconds for S3 request)
+                            response = await asyncio.wait_for(
+                                s3_client.get_object(
+                                    Bucket=bucket.name,
+                                    Key=key,
+                                    Range=f"bytes={start}-{end}",
+                                ),
+                                timeout=15,
                             )
 
                             bytes_written = 0
@@ -1044,7 +1053,10 @@ class Comms(ChainManager):
                                         to_read = min(
                                             buffer_size, expected_len - bytes_written
                                         )
-                                        chunk = await stream.read(to_read)
+                                        # Timeout for each stream read (15 seconds)
+                                        chunk = await asyncio.wait_for(
+                                            stream.read(to_read), timeout=15
+                                        )
                                         if not chunk:
                                             raise Exception(
                                                 f"Unexpected EOF in range {start}-{end}; "
