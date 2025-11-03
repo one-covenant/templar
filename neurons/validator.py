@@ -947,11 +947,17 @@ class Validator(BaseNode, Trainer):
                     self.sync_scores[uid].item() if uid in self.evaluated_uids else 0.0
                 )
 
-                self.final_scores[uid] = (
-                    openskill_ordinal
-                    * max(0, self.binary_moving_averages[uid].item())
-                    * sync_score
-                )
+                bma = max(0, self.binary_moving_averages[uid].item())
+
+                # Apply BMA threshold only after warmup windows
+                bma_threshold = getattr(self.hparams, "bma_threshold", 0.10)
+                warmup_windows = getattr(self.hparams, "bma_warmup_windows", 10)
+                windows_since_start = self.current_window - self.start_window
+
+                if windows_since_start >= warmup_windows:
+                    bma = bma if bma >= bma_threshold else 0
+
+                self.final_scores[uid] = openskill_ordinal * bma * sync_score
                 tplr.log_with_context(
                     level="info",
                     message=f"Computed Final Score for UID {uid}: {self.final_scores[uid]}",
