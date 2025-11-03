@@ -7,7 +7,7 @@
     "target_batch_size": 1024,
     "batch_size": 192,
     "inner_steps": 30,
-    "outer_learning_rate": 0.7,
+    "outer_learning_rate": 0.6,
     "blocks_per_window": 115,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
@@ -43,8 +43,8 @@
     "eval_lr_factor": 0.2,
     "openskill_beta": 7,
     "openskill_tau": 0.1,
-    "checkpoint_init_version": "2.1.9",
-    "checkpoint_init_window": 58181,
+    "checkpoint_init_version": "2.1.12",
+    "checkpoint_init_window": 59057,
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
@@ -63,8 +63,8 @@
         "warmup_steps": 1500,
         "t_max": 140000,
         "eta_min_factor": 0.1,
-        "flatten_start_step": null,
-        "flatten_duration": 0
+        "flatten_start_step": 2650,
+        "flatten_duration": 1000
       }
     },
     "muon": {
