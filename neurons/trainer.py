@@ -45,7 +45,8 @@ class Trainer:
     """
 
     def __init__(self):
-        pass
+        # Initialize scheduler step count early so it's available during catch-up
+        self.inner_scheduler_step_count = 0
 
     def set_dataloader(self, validator: bool = False) -> None:
         self.dataset = self.dataset_manager.active_dataset
@@ -130,6 +131,7 @@ class Trainer:
 
         self.inner_optimizer = self.get_inner_optimizer(validator)
         self.inner_scheduler = self.get_inner_scheduler()
+        self.inner_scheduler_step_count = 0  # Track scheduler steps for flatten window
 
         tplr.logger.info("[Init] optimizers & schedulers constructed")
         return
@@ -176,6 +178,38 @@ class Trainer:
         )
 
         return inner_scheduler
+
+    def should_skip_scheduler_step(self) -> bool:
+        """Check if we're in the LR flatten window and should skip scheduler stepping.
+
+        Note: flatten_start_step and flatten_duration are specified in outer steps (windows),
+        but we check against inner_scheduler_step_count which tracks individual scheduler steps.
+        """
+        optimizer_config = getattr(self.hparams, "optimizer", {})
+        optimizer_type = optimizer_config.get("type", "adamw").lower()
+        opt_config = optimizer_config.get(optimizer_type, {})
+        scheduler_config = opt_config.get("scheduler", {})
+
+        # flatten_start_step is in outer steps (windows)
+        flatten_start_window = scheduler_config.get("flatten_start_step", None)
+        if flatten_start_window is None or flatten_start_window <= 0:
+            return False
+
+        # flatten_duration is in outer steps (windows)
+        flatten_duration_windows = scheduler_config.get("flatten_duration", 0)
+        if flatten_duration_windows <= 0:
+            return False
+
+        # Convert outer steps (windows) to inner steps for comparison
+        inner_steps_per_window = self.hparams.inner_steps
+        flatten_start_inner = flatten_start_window * inner_steps_per_window
+        flatten_end_inner = (
+            flatten_start_window + flatten_duration_windows
+        ) * inner_steps_per_window
+
+        return (
+            flatten_start_inner <= self.inner_scheduler_step_count < flatten_end_inner
+        )
 
     def get_inner_optimizer(self, validator: bool):
         # Get optimizer config from hparams
@@ -835,7 +869,10 @@ class Trainer:
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                             self.scaler.step(self.inner_optimizer)
                             self.scaler.update()
-                            self.inner_scheduler.step()
+                            # Step scheduler unless we're in flatten window
+                            if not self.should_skip_scheduler_step():
+                                self.inner_scheduler.step()
+                            self.inner_scheduler_step_count += 1
                         else:
                             # Spin-up: don't step optimizer/scheduler, just clear gradients
                             self.scaler.update()
@@ -891,8 +928,11 @@ class Trainer:
                     if self.is_master:
                         tplr.logger.info("<Exhausted window: exiting synchronously>")
                     if not null_round:
+                        # Catch up remaining scheduler steps (respecting flatten window)
                         for _ in range(inner_step_count, self.hparams.inner_steps):
-                            self.inner_scheduler.step()
+                            if not self.should_skip_scheduler_step():
+                                self.inner_scheduler.step()
+                            self.inner_scheduler_step_count += 1
                     break
 
             await asyncio.sleep(0)

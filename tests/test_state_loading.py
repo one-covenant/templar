@@ -36,6 +36,7 @@ def _make_validator(tmp_path, device="cpu", is_master=True):
     v.is_master = is_master  # Add is_master attribute for distributed support
     v.state_path = os.path.join(tmp_path, "validator-state-TEST.pt")
     v.global_step = 123
+    v.inner_scheduler_step_count = 0  # Add scheduler step count for LR flattening
     d = device
     v.gradient_scores = torch.rand(256, dtype=torch.float32, device=d)
     v.sync_scores = torch.rand(256, dtype=torch.float32, device=d)

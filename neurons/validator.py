@@ -571,11 +571,52 @@ class Validator(BaseNode, Trainer):
         self.exclusion_start_window.pop(uid, None)
         return
 
+    def should_skip_negative_penalty(self) -> bool:
+        """
+        Check if we should skip negative evaluation penalties based on overall
+        performance in the current evaluation window.
+
+        Returns True (skip penalty) if the 5th best ranked UID in the current
+        window has a negative gradient score, indicating overall poor performance.
+        If fewer than 5 UIDs, checks the lowest ranked UID instead.
+
+        Returns:
+            True if penalties should be skipped, False otherwise
+        """
+        # Check if we have current window scores
+        if not hasattr(self, "current_window_scores") or not self.current_window_scores:
+            return False
+
+        # Get UIDs and their gradient scores from current window
+        window_uids = list(self.current_window_scores.keys())
+
+        # Need at least one UID to make a determination
+        if not window_uids:
+            return False
+
+        # Sort UIDs by gradient score (descending - higher is better)
+        sorted_uids = sorted(
+            window_uids, key=lambda uid: self.current_window_scores[uid], reverse=True
+        )
+
+        # Get the 5th ranked UID, or the lowest ranked if fewer than 5
+        target_rank = min(4, len(sorted_uids) - 1)  # 0-indexed, so 4 = 5th
+        target_uid = sorted_uids[target_rank]
+        target_score = self.current_window_scores[target_uid]
+
+        # Skip penalty if the target UID has a negative score
+        return target_score < 0
+
     def track_negative_evaluation(self, eval_uid: int) -> None:
         """
         Track negative evaluation history for a peer over the last N evaluations.
         Also tracks consecutive negative evaluations for exclusion logic.
         Stores True for negative, False for positive. Frequency = mean(history).
+
+        NOTE: This method only tracks history and counts. Actual slashing and
+        exclusion are applied later by apply_negative_evaluation_penalties() after
+        all evaluations are complete, ensuring consistent treatment based on the
+        full window of evaluated UIDs.
         """
         # --- get score safely
         is_negative = bool(self.gradient_scores[eval_uid] < 0)
@@ -595,27 +636,6 @@ class Validator(BaseNode, Trainer):
         if is_negative:
             # Increment consecutive negative count
             self.consecutive_negative_count[eval_uid] = prev_consecutive + 1
-
-            # Check if peer should now be excluded
-            threshold = getattr(self.hparams, "consecutive_negative_threshold", 3)
-            if (
-                getattr(self.hparams, "exclude_negative_peers", False)
-                and self.consecutive_negative_count[eval_uid] >= threshold
-                and eval_uid not in self.excluded_from_gather
-            ):
-                self.excluded_from_gather.add(eval_uid)
-                self.exclusion_start_window[eval_uid] = self.sync_window
-
-                tplr.log_with_context(
-                    level="warning",
-                    message=(
-                        f"UID {eval_uid} EXCLUDED from gathering after "
-                        f"{self.consecutive_negative_count[eval_uid]} consecutive negative evaluations"
-                    ),
-                    sync_window=self.sync_window,
-                    current_window=self.current_window,
-                    eval_uid=eval_uid,
-                )
         else:
             # Positive evaluation - reset consecutive count (recovery mechanism)
             if prev_consecutive > 0:
@@ -652,45 +672,11 @@ class Validator(BaseNode, Trainer):
 
             self.consecutive_negative_count[eval_uid] = 0
 
-        # --- compute stats
+        # --- compute stats for logging
         total = len(window)
         neg_count = sum(window)  # True==1, False==0
         negative_freq = (neg_count / total) if total else 0.0
         consecutive_negs = self.consecutive_negative_count.get(eval_uid, 0)
-
-        # --- slash for >50% negative in last 8 evaluations
-        if total >= 8:
-            last_8 = list(window)[-8:]  # Get last 8 evaluations
-            neg_count_last_8 = sum(last_8)
-            neg_ratio_last_8 = neg_count_last_8 / 8
-
-            if neg_ratio_last_8 > 0.5:
-                old_score = self.final_scores[eval_uid].item()
-                if old_score > 0:
-                    # Apply 75% slash (multiply by 0.25)
-                    self.final_scores[eval_uid] *= 0.25
-                    self.binary_moving_averages[eval_uid] *= 0.25
-
-                    # Set to zero if score drops below threshold
-                    score_threshold = self.score_zero_threshold
-                    if self.final_scores[eval_uid] < score_threshold:
-                        tplr.log_with_context(
-                            level="info",
-                            message=f"UID {eval_uid} final_score {self.final_scores[eval_uid]:.8f} below threshold {score_threshold:.8f}, setting to 0.0",
-                            sync_window=self.sync_window,
-                            current_window=self.current_window,
-                        )
-                        self.final_scores[eval_uid] = 0.0
-
-                    new_score = self.final_scores[eval_uid].item()
-                    tplr.log_with_context(
-                        level="warning",
-                        message=f"UID {eval_uid} has {neg_count_last_8}/8 negative evaluations ({neg_ratio_last_8:.1%}) in last 8 windows. "
-                        f"Slashing score from {old_score:.4f} to {new_score:.4f}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
 
         # --- logging (consider rate limiting in practice)
         tplr.log_with_context(
@@ -718,6 +704,104 @@ class Validator(BaseNode, Trainer):
             step=self.global_step,
         )
 
+    def apply_negative_evaluation_penalties(self) -> None:
+        """
+        Apply slashing and exclusion penalties to UIDs with negative evaluations.
+
+        This method is called AFTER all evaluations in a window are complete,
+        ensuring consistent treatment based on the full set of evaluated UIDs.
+        Checks if the 5th-ranked UID is negative before applying penalties.
+        """
+        if not self.peer_eval_history:
+            return  # No evaluations to process
+
+        # Check if we should skip penalties due to overall poor performance
+        skip_penalty = self.should_skip_negative_penalty()
+
+        # Process each UID that has evaluation history
+        for eval_uid in list(self.peer_eval_history.keys()):
+            window = self.peer_eval_history[eval_uid]
+            total = len(window)
+            neg_count = sum(window)
+            consecutive_negs = self.consecutive_negative_count.get(eval_uid, 0)
+
+            # --- Apply slashing for >50% negative in last 8 evaluations
+            if total >= 8:
+                last_8 = list(window)[-8:]
+                neg_count_last_8 = sum(last_8)
+                neg_ratio_last_8 = neg_count_last_8 / 8
+
+                if neg_ratio_last_8 > 0.5:
+                    if skip_penalty:
+                        tplr.log_with_context(
+                            level="info",
+                            message=f"UID {eval_uid} has {neg_count_last_8}/8 negative evaluations ({neg_ratio_last_8:.1%}), "
+                            f"but skipping slash because 5th-ranked UID in current window is negative (overall poor performance)",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+                    else:
+                        old_score = self.final_scores[eval_uid].item()
+                        if old_score > 0:
+                            # Apply 75% slash (multiply by 0.25)
+                            self.final_scores[eval_uid] *= 0.25
+                            self.binary_moving_averages[eval_uid] *= 0.25
+
+                            # Set to zero if score drops below threshold
+                            score_threshold = self.score_zero_threshold
+                            if self.final_scores[eval_uid] < score_threshold:
+                                tplr.log_with_context(
+                                    level="info",
+                                    message=f"UID {eval_uid} final_score {self.final_scores[eval_uid]:.8f} below threshold {score_threshold:.8f}, setting to 0.0",
+                                    sync_window=self.sync_window,
+                                    current_window=self.current_window,
+                                )
+                                self.final_scores[eval_uid] = 0.0
+
+                            new_score = self.final_scores[eval_uid].item()
+                            tplr.log_with_context(
+                                level="warning",
+                                message=f"UID {eval_uid} has {neg_count_last_8}/8 negative evaluations ({neg_ratio_last_8:.1%}) in last 8 windows. "
+                                f"Slashing score from {old_score:.4f} to {new_score:.4f}",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+
+            # --- Apply exclusion for consecutive negative evaluations
+            threshold = getattr(self.hparams, "consecutive_negative_threshold", 3)
+            if (
+                getattr(self.hparams, "exclude_negative_peers", False)
+                and consecutive_negs >= threshold
+                and eval_uid not in self.excluded_from_gather
+            ):
+                if skip_penalty:
+                    tplr.log_with_context(
+                        level="info",
+                        message=(
+                            f"UID {eval_uid} has {consecutive_negs} consecutive negative evaluations, "
+                            f"but skipping exclusion because 5th-ranked UID in current window is negative (overall poor performance)"
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                        eval_uid=eval_uid,
+                    )
+                else:
+                    self.excluded_from_gather.add(eval_uid)
+                    self.exclusion_start_window[eval_uid] = self.sync_window
+
+                    tplr.log_with_context(
+                        level="warning",
+                        message=(
+                            f"UID {eval_uid} EXCLUDED from gathering after "
+                            f"{consecutive_negs} consecutive negative evaluations"
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                        eval_uid=eval_uid,
+                    )
+
     def should_exclude_from_gather(self, uid: int) -> bool:
         """
         Check if a peer should be excluded from gather selection.
@@ -725,6 +809,7 @@ class Validator(BaseNode, Trainer):
         A peer is excluded if:
         1. They have consecutive negative evaluations >= threshold
         2. The exclude_negative_peers feature is enabled
+        3. The 5th-ranked UID in current window is not negative (overall performance is acceptable)
 
         Args:
             uid: The peer UID to check
@@ -742,7 +827,13 @@ class Validator(BaseNode, Trainer):
         # Check if peer has exceeded consecutive negative threshold
         consecutive_negatives = self.consecutive_negative_count.get(uid, 0)
 
-        return consecutive_negatives >= threshold
+        if consecutive_negatives < threshold:
+            return False
+
+        # Check if we should skip exclusion due to overall poor performance
+        skip_penalty = self.should_skip_negative_penalty()
+
+        return not skip_penalty
 
     def log_sync_score(
         self, eval_uid: int, sync_result: dict[str, bool | float | int | str]
@@ -856,11 +947,17 @@ class Validator(BaseNode, Trainer):
                     self.sync_scores[uid].item() if uid in self.evaluated_uids else 0.0
                 )
 
-                self.final_scores[uid] = (
-                    openskill_ordinal
-                    * max(0, self.binary_moving_averages[uid].item())
-                    * sync_score
-                )
+                bma = max(0, self.binary_moving_averages[uid].item())
+
+                # Apply BMA threshold only after warmup windows
+                bma_threshold = getattr(self.hparams, "bma_threshold", 0.10)
+                warmup_windows = getattr(self.hparams, "bma_warmup_windows", 10)
+                windows_since_start = self.current_window - self.start_window
+
+                if windows_since_start >= warmup_windows:
+                    bma = bma if bma >= bma_threshold else 0
+
+                self.final_scores[uid] = openskill_ordinal * bma * sync_score
                 tplr.log_with_context(
                     level="info",
                     message=f"Computed Final Score for UID {uid}: {self.final_scores[uid]}",
@@ -1385,10 +1482,12 @@ class Validator(BaseNode, Trainer):
                 continue
 
             # --------------------------------------------------------------+
-            #  Simulate the miner’s *inner* loop so the LR schedule advances │
+            #  Simulate the miner's *inner* loop so the LR schedule advances │
             # --------------------------------------------------------------+
             for _ in range(self.hparams.inner_steps):
-                self.inner_scheduler.step()
+                if not self.should_skip_scheduler_step():
+                    self.inner_scheduler.step()
+                self.inner_scheduler_step_count += 1
 
             # current inner‑LR after simulation
             current_inner_lr = self.inner_scheduler.get_last_lr()[0]
@@ -2197,6 +2296,11 @@ class Validator(BaseNode, Trainer):
 
             # Barrier after evaluation completes
             dist_helper.safe_barrier("post_eval", self.local_rank)
+
+            # Apply negative evaluation penalties after all evaluations are complete
+            # This ensures consistent treatment based on the full window of evaluated UIDs
+            if self.is_master:
+                self.apply_negative_evaluation_penalties()
 
             # Perform logging
             if self.is_master:
@@ -3018,11 +3122,11 @@ class Validator(BaseNode, Trainer):
                 "sync_score": 0.0,
             }
 
-        # Calculate sync score using the formula: score = (1-x/5)^2.5
-        # where x is the average steps behind, capped at 5
+        # Calculate sync score using the formula: score = (1-x/3)^2.5
+        # where x is the average steps behind, capped at 3
         avg_steps_behind = comparison_metrics["avg_steps_behind"]
-        x = min(avg_steps_behind, 5.0)
-        sync_score = max(0.0, (1.0 - x / 5.0) ** 2.5)
+        x = min(avg_steps_behind, 3.0)
+        sync_score = max(0.0, (1.0 - x / 3.0) ** 2.5)
 
         # Add the sync score to the metrics
         result = {**comparison_metrics, "sync_score": sync_score}
