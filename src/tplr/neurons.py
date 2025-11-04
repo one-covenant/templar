@@ -92,7 +92,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
     # ------------ start ------------
     gradient, xshapes, totalks = {}, {}, {}
-    lr = float(miner.hparams.outer_learning_rate)
     use_dct = getattr(miner.hparams, "use_dct", False)
     topk = getattr(miner.hparams, "topk_compression", 32)
 
@@ -138,20 +137,76 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         # This means each TP rank will compress and exchange its own shard
         shard_metadata = None
         if g_is_dt:
-            # Use local shard only - no expensive collective!
+            # Detect if this is TP-sharded (has Shard placement) vs FSDP-only (Replicate)
+            is_tp_sharded = False
+            is_replicated = True
+            shard_dim = 0
+            tp_rank = 0
+            tp_world_size = 1
+
+            # Check placements to identify sharding type
+            for i, placement in enumerate(g.placements):
+                placement_str = str(placement)
+                if "Shard" in placement_str or placement_str.startswith("S("):
+                    is_tp_sharded = True
+                    is_replicated = False
+                    # Extract shard dimension from placement string
+                    # Format is usually "Shard(dim=0)" or "S(0)"
+                    import re
+
+                    match = re.search(r"[Ss]hard.*?(\d+)|S\((\d+)\)", placement_str)
+                    if match:
+                        shard_dim = int(
+                            match.group(1) if match.group(1) else match.group(2)
+                        )
+
+                    # Get TP rank and world size from device mesh
+                    if hasattr(g, "device_mesh"):
+                        mesh = g.device_mesh
+                        if hasattr(mesh, "get_coordinate"):
+                            try:
+                                tp_rank = (
+                                    mesh.get_coordinate()[i]
+                                    if mesh.get_coordinate()
+                                    else 0
+                                )
+                                tp_world_size = (
+                                    mesh.size(i) if hasattr(mesh, "size") else 1
+                                )
+                            except:
+                                pass
+                elif "Replicate" in placement_str or placement_str == "R":
+                    # This dimension is replicated
+                    pass
+
             grad_local = g.to_local().to(p.device)
-            # Store metadata for receiver to reconstruct DTensor
-            # Only store primitives (not DTensor objects) to avoid pickle issues
-            shard_metadata = {
-                "is_shard": True,
-                "global_shape": tuple(g.size()),  # Global shape as tuple
-            }
+
+            # Store metadata that allows the miner to identify and reconstruct TP-sharded parameters
+            if is_tp_sharded:
+                shard_metadata = {
+                    "is_shard": True,
+                    "is_tp_sharded": True,  # Signals that this parameter needs TP reconstruction
+                    "global_shape": tuple(g.size()),
+                    "local_shape": tuple(grad_local.shape),
+                    "shard_dim": shard_dim,
+                    "tp_rank": tp_rank,
+                    "tp_world_size": tp_world_size,
+                }
+            else:
+                # FSDP-only or replicated DTensor - no TP reconstruction needed
+                shard_metadata = {
+                    "is_shard": True,
+                    "is_tp_sharded": False,
+                    "global_shape": tuple(g.size()),
+                    "is_replicated": is_replicated,
+                }
             grad_to_compress = grad_local
         else:
             grad_to_compress = g.to(p.device)
 
         # --- 2) Momentum buffer update (owner only) ---
-        # Handle DTensor error feedback by creating new regular tensor if needed
+        # Error feedback compensates for compression loss and is maintained per-rank
+        # For TP parameters, error feedback is local shard-sized for memory efficiency
         error_feedback = miner.error_feedback[n]
         if error_feedback is None:
             error_feedback = torch.zeros_like(grad_to_compress, device=p.device)
@@ -164,7 +219,7 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             error_feedback.zero_()
         else:
             error_feedback.mul_(miner.hparams.momentum_decay)
-            error_feedback.add_(grad_to_compress, alpha=lr)
+            error_feedback.add_(grad_to_compress)
 
         # --- 4) Encode & compress (owner only) ---
         encoded = miner.transformer.encode(error_feedback, use_dct=use_dct)
@@ -238,8 +293,9 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
-    # Include xshapes and totalks in gradient dict for cross-TP-degree compatibility
-    # This allows validators with different TP degrees to correctly decompress
+    # Include xshapes and totalks in metadata for cross-configuration compatibility
+    # The miner will update this metadata after TP reconstruction if needed,
+    # ensuring validators can correctly decompress regardless of their TP/FSDP configuration
     gradient["metadata"] = {
         "window": step_window,
         "xshapes": xshapes,
@@ -409,15 +465,36 @@ def outer_step(
 
                 decoded_grad = transformer.decode(decompressed, use_dct=use_dct)
 
-                # If this was a shard, we need to handle it differently
+                # Check if this is an unreconstructed shard
                 if shard_meta is not None and shard_meta.get("is_shard"):
-                    # This is a shard gradient - it will be distributed via DTensor below
-                    # The decoded_grad is the LOCAL SHARD that needs to be distributed
+                    # This is still a shard (not reconstructed) - cannot use distribute_tensor
+                    # For DTensor params, we cannot use distribute_tensor with local shards
+                    if isinstance(p, DT):
+                        tplr.logger.warning(
+                            f"[UNRECONSTRUCTED SHARD] Skipping parameter '{name}': "
+                            f"shard shape {decoded_grad.shape} vs expected {p.shape}. "
+                            f"is_tp_sharded={shard_meta.get('is_tp_sharded')}. "
+                            "TP gradients should be reconstructed before sending."
+                        )
+                        # Skip this parameter gracefully
+                        del decoded_grad
+                        torch.cuda.empty_cache()
+                        continue
+                    # For non-DTensor params, check shape compatibility
+                    if decoded_grad.shape != p.shape:
+                        tplr.logger.warning(
+                            f"[SHAPE MISMATCH] Skipping parameter '{name}': "
+                            f"gradient shape {decoded_grad.shape} vs expected {p.shape}"
+                        )
+                        del decoded_grad
+                        torch.cuda.empty_cache()
+                        continue
                     full_grad_src = decoded_grad.to(
                         dtype=p.dtype, device=p.device, non_blocking=True
                     )
                 else:
-                    # Regular full gradient
+                    # Either no shard_meta, or is_shard=False (reconstructed gradient)
+                    # This is a full gradient - safe to use with distribute_tensor
                     full_grad_src = decoded_grad.to(
                         dtype=p.dtype, device=p.device, non_blocking=True
                     )
@@ -449,6 +526,21 @@ def outer_step(
                 if on_src
                 else torch.empty(p.shape, device=p.device, dtype=p.dtype)
             )
+
+            # Validate DTensor source payload before distribution
+            if on_src and src_tensor.shape != p.shape:
+                tplr.logger.warning(
+                    f"[SHAPE MISMATCH] Skipping DTensor grad for '{name}': "
+                    f"shape {src_tensor.shape} vs expected {p.shape}. "
+                    "This may indicate an unreconstructed shard or incompatible TP configuration."
+                )
+                # Skip this parameter gracefully
+                del src_tensor
+                if full_grad_src is not None:
+                    del full_grad_src
+                torch.cuda.empty_cache()
+                continue
+
             new_grad = distribute_tensor(
                 src_tensor,
                 device_mesh=p.device_mesh,
@@ -473,6 +565,16 @@ def outer_step(
 
         else:
             # Replicated param: broadcast dense grad once.
+            # First check shape compatibility
+            if on_src and full_grad_src.shape != p.shape:
+                tplr.logger.warning(
+                    f"[SHAPE MISMATCH] Skipping parameter '{name}': "
+                    f"gradient shape {full_grad_src.shape} vs expected {p.shape}"
+                )
+                del full_grad_src
+                torch.cuda.empty_cache()
+                continue
+            
             if ddp:
                 if on_src:
                     # Broadcast from the source tensor; then reuse it as grad

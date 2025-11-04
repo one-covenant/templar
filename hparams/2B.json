@@ -10,15 +10,16 @@
     "max_position_embeddings": 2048,
 
     "batch_size": 32,
-    "micro_batch_size": 2,
+    "micro_batch_size": 1,
     "inner_steps": 10,
-    "outer_learning_rate": 0.2,
-    "blocks_per_window": 8,
-    "time_window_delta_seconds": 80,
+    "outer_learning_rate": 0.15,
+    "blocks_per_window": 5,
+    "time_window_delta_seconds": 50,
     
     "checkpoint_init_version": null,
     "checkpoint_init_window": null,
     "torchtitan": {
-        "enable_async_tensor_parallel": false
+        "enable_async_tensor_parallel": false,
+        "tie_model_and_embeddings": false
       }
 }
