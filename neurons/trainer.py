@@ -856,7 +856,9 @@ class Trainer:
                             )
 
                             # TP ranks process same data, so divide by tp_degree
-                            global_tokens_step = int(reduced["tokens_sum"] / self.tp_degree)
+                            global_tokens_step = int(
+                                reduced["tokens_sum"] / self.tp_degree
+                            )
                             global_loss_step = reduced["loss_sum"] / self.tp_degree
                             log_loss = reduced["loss_avg"]
                         else:

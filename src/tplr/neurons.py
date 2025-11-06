@@ -399,16 +399,48 @@ def outer_step(
             miner_xshapes = metadata.get("xshapes")
             miner_totalks = metadata.get("totalks")
 
+    # Detect if received gradients use tied embeddings (tok_embeddings only, no output)
+    # but local model expects untied embeddings (separate tok_embeddings and output)
+    tied_to_untied_params = set()
+    if on_src and src_sd is not None:
+        has_tok_embeddings = "tok_embeddingsidxs" in src_sd
+        has_output = "outputidxs" in src_sd
+        if has_tok_embeddings and not has_output:
+            # Check if local model has separate output layer
+            model_params = dict(model.named_parameters())
+            if (
+                "tok_embeddings.weight" in model_params
+                and "output.weight" in model_params
+            ):
+                # Need to duplicate tok_embeddings gradient to output
+                tied_to_untied_params.add("output.weight")
+                tplr.logger.info(
+                    "[TIED→UNTIED] Detected tied embeddings in received gradients. "
+                    "Will duplicate tok_embeddings.weight gradient to output.weight"
+                )
+
     for name, p in model.named_parameters():
         # ---- master decides if this param has an update; others receive a flag ----
         has_update = 0
         payload = None
 
         if on_src and src_sd is not None:
-            idxs = src_sd.get(name + "idxs")
-            vals = src_sd.get(name + "vals")
-            qps = src_sd.get(name + "quant_params")
-            shard_meta = src_sd.get(name + "shard_metadata")
+            # Handle tied→untied embedding conversion
+            if name in tied_to_untied_params:
+                # Use tok_embeddings gradient for output.weight
+                source_name = "tok_embeddings.weight"
+                idxs = src_sd.get(source_name + "idxs")
+                vals = src_sd.get(source_name + "vals")
+                qps = src_sd.get(source_name + "quant_params")
+                shard_meta = src_sd.get(source_name + "shard_metadata")
+                tplr.logger.debug(
+                    f"[TIED→UNTIED] Using {source_name} gradient for {name}"
+                )
+            else:
+                idxs = src_sd.get(name + "idxs")
+                vals = src_sd.get(name + "vals")
+                qps = src_sd.get(name + "quant_params")
+                shard_meta = src_sd.get(name + "shard_metadata")
 
             if idxs is not None and vals is not None:
                 if not isinstance(idxs, (list, tuple)):
@@ -446,8 +478,28 @@ def outer_step(
 
                 # Use miner's xshapes/totalks if available (for cross-TP-degree compatibility)
                 # Otherwise fall back to validator's own xshapes/totalks
-                param_xshape = (miner_xshapes or xshapes).get(name, xshapes[name])
-                param_totalk = (miner_totalks or totalks).get(name, totalks[name])
+                # For tied→untied conversion, use source parameter's shapes
+                lookup_name = (
+                    "tok_embeddings.weight" if name in tied_to_untied_params else name
+                )
+
+                raw_xshape = (miner_xshapes or xshapes).get(
+                    lookup_name, xshapes.get(name)
+                )
+                raw_totalk = (miner_totalks or totalks).get(
+                    lookup_name, totalks.get(name)
+                )
+
+                # Handle new dict format: {"local": shape, "global": shape}
+                if isinstance(raw_xshape, dict):
+                    param_xshape = raw_xshape.get("global", raw_xshape.get("local"))
+                else:
+                    param_xshape = raw_xshape
+
+                if isinstance(raw_totalk, dict):
+                    param_totalk = raw_totalk.get("global", raw_totalk.get("local"))
+                else:
+                    param_totalk = raw_totalk
                 # Decompress using the shape that was compressed (shard or full)
                 ref = torch.empty(param_xshape, device=device, dtype=p.dtype)
 
@@ -574,7 +626,7 @@ def outer_step(
                 del full_grad_src
                 torch.cuda.empty_cache()
                 continue
-            
+
             if ddp:
                 if on_src:
                     # Broadcast from the source tensor; then reuse it as grad

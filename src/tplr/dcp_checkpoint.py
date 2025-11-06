@@ -851,6 +851,72 @@ class DCPCheckpointer:
         )
         return local_dir
 
+    def _convert_tied_to_untied_embeddings(self, model) -> None:
+        """
+        Convert tied embeddings to untied by copying tok_embeddings.weight to output.weight.
+
+        This is needed when loading a checkpoint saved with tie_embeddings=true into a model
+        configured with tie_embeddings=false (e.g., when running with TP > 1).
+
+        When embeddings are tied, tok_embeddings.weight and output.weight share the same tensor.
+        When untied, they are separate tensors. This method ensures output.weight is initialized
+        with the same values as tok_embeddings.weight when loading a tied checkpoint into an
+        untied model.
+
+        Handles DTensor/sharded tensors automatically - each rank copies only its shard.
+        """
+        # Unwrap FSDP/parallelism wrappers to access the base model
+        base_model = model
+        while hasattr(base_model, "module"):
+            base_model = base_model.module
+
+        # Check if model has the expected torchtitan Transformer structure
+        if not hasattr(base_model, "tok_embeddings") or not hasattr(
+            base_model, "output"
+        ):
+            tplr.logger.info(
+                "[DCP] Model does not have tok_embeddings/output layers, skipping embedding conversion"
+            )
+            return
+
+        tok_embeddings = base_model.tok_embeddings
+        output_layer = base_model.output
+
+        # Check if embeddings are already tied (same weight object)
+        if tok_embeddings.weight is output_layer.weight:
+            tplr.logger.info("[DCP] Embeddings already tied, skipping conversion")
+            return
+
+        # Embeddings are untied - copy tok_embeddings.weight to output.weight
+        # This preserves the model behavior from when embeddings were tied
+        with torch.no_grad():
+            output_layer.weight.copy_(tok_embeddings.weight)
+
+        rank = _rank()
+
+        # Log conversion with weight statistics
+        tok_w = tok_embeddings.weight
+        out_w = output_layer.weight
+        if hasattr(tok_w, "_local_tensor"):
+            tok_w = tok_w._local_tensor
+        if hasattr(out_w, "_local_tensor"):
+            out_w = out_w._local_tensor
+
+        tplr.logger.info(
+            f"[DCP] Rank {rank}: Converted tied→untied embeddings by copying "
+            f"tok_embeddings.weight → output.weight (shape={list(tok_embeddings.weight.shape)})"
+        )
+        tplr.logger.info(
+            f"[DCP] Rank {rank}: tok_embeddings.weight stats: "
+            f"min={tok_w.min().item():.6e}, max={tok_w.max().item():.6e}, "
+            f"mean={tok_w.mean().item():.6e}, std={tok_w.std().item():.6e}"
+        )
+        tplr.logger.info(
+            f"[DCP] Rank {rank}: output.weight stats: "
+            f"min={out_w.min().item():.6e}, max={out_w.max().item():.6e}, "
+            f"mean={out_w.mean().item():.6e}, std={out_w.std().item():.6e}"
+        )
+
     # ── Load (reshard automatically to current topology) ───────────────────────
     def load_local(
         self, *, model, window: int, process_group: dist.ProcessGroup | None = None
@@ -859,6 +925,8 @@ class DCPCheckpointer:
         ckpt_dir = self._local_dir(layout)
         state = {"app": AppState(model)}
         load(state_dict=state, checkpoint_id=str(ckpt_dir), process_group=process_group)
+        # Convert tied embeddings to untied if needed (e.g., when loading old checkpoint for TP>1)
+        self._convert_tied_to_untied_embeddings(model)
 
     async def download_and_load(
         self,

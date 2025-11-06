@@ -245,7 +245,10 @@ class Miner(BaseNode, Trainer):
         self.error_feedback_cpu_buffers = {}
         self.owned_params = set()
 
+        # Store both local and global shapes for proper gradient distribution
+        # Format: {param_name: {"local": shape, "global": shape}}
         self.xshapes = {}
+        # Format: {param_name: {"local": totalk, "global": totalk}}
         self.totalks = {}
         model_iterator = self.model.named_parameters()
 
@@ -293,16 +296,33 @@ class Miner(BaseNode, Trainer):
                     total_buffer_memory += buffer_size
                     num_regular_params += 1
 
-            enc = self.transformer.encode(
+            # Compute global shape (for full parameter)
+            enc_global = self.transformer.encode(
                 torch.empty(p.shape, dtype=torch.float16, device=self.device),
                 use_dct=self.hparams.use_dct,
             )
-            _, _, xshape, totalk, _ = self.compressor.compress(
-                enc,
+            _, _, xshape_global, totalk_global, _ = self.compressor.compress(
+                enc_global,
                 self.hparams.topk_compression,
             )
-            self.xshapes[n] = xshape
-            self.totalks[n] = totalk
+
+            # For DTensor, also compute local shape
+            if isinstance(p, DT):
+                local = p.to_local()
+                enc_local = self.transformer.encode(
+                    torch.empty(local.shape, dtype=torch.float16, device=self.device),
+                    use_dct=self.hparams.use_dct,
+                )
+                _, _, xshape_local, totalk_local, _ = self.compressor.compress(
+                    enc_local,
+                    self.hparams.topk_compression,
+                )
+                self.xshapes[n] = {"local": xshape_local, "global": xshape_global}
+                self.totalks[n] = {"local": totalk_local, "global": totalk_global}
+            else:
+                # For non-DTensor, local and global are the same
+                self.xshapes[n] = {"local": xshape_global, "global": xshape_global}
+                self.totalks[n] = {"local": totalk_global, "global": totalk_global}
 
         # Log error feedback buffer memory allocation
         total_buffer_gb = total_buffer_memory / (1024**3)
@@ -727,13 +747,23 @@ class Miner(BaseNode, Trainer):
                                     "totalk", len(idxs_tensor)
                                 )
                             else:
-                                # Use the original shape and totalk
-                                final_xshapes[param_name] = self.xshapes.get(
-                                    param_name, vals_tensor.shape
-                                )
-                                final_totalks[param_name] = self.totalks.get(
-                                    param_name, len(idxs_tensor)
-                                )
+                                # Use the global shape and totalk for sending
+                                param_shapes = self.xshapes.get(param_name, {})
+                                param_totalks = self.totalks.get(param_name, {})
+                                if isinstance(param_shapes, dict):
+                                    final_xshapes[param_name] = param_shapes.get(
+                                        "global", vals_tensor.shape
+                                    )
+                                else:
+                                    # Legacy format fallback
+                                    final_xshapes[param_name] = param_shapes
+                                if isinstance(param_totalks, dict):
+                                    final_totalks[param_name] = param_totalks.get(
+                                        "global", len(idxs_tensor)
+                                    )
+                                else:
+                                    # Legacy format fallback
+                                    final_totalks[param_name] = param_totalks
 
                 # Update metadata (preserve existing fields if any)
                 if "metadata" not in gradient:

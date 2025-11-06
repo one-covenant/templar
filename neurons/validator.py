@@ -421,8 +421,9 @@ class Validator(BaseNode, Trainer):
                 enc,
                 self.hparams.topk_compression,
             )
-            self.xshapes[n] = xshape
-            self.totalks[n] = totalk
+            # Store in dict format for consistency with miner (validator uses global shapes only)
+            self.xshapes[n] = {"local": xshape, "global": xshape}
+            self.totalks[n] = {"local": totalk, "global": totalk}
 
         self.openskill_model = PlackettLuce(
             beta=self.hparams.openskill_beta, tau=self.hparams.openskill_tau
@@ -3387,10 +3388,14 @@ class Validator(BaseNode, Trainer):
                     )
 
                 # Check compressed indices are valid
+                # Handle new dict format: {"local": totalk, "global": totalk}
+                totalk_val = self.totalks[n]
+                if isinstance(totalk_val, dict):
+                    totalk_val = totalk_val.get("global", totalk_val.get("local"))
                 self.comms.check_compressed_indices(
                     idxs_key,
                     idxs,
-                    self.totalks[n],
+                    totalk_val,
                     allowed_topk=self.hparams.topk_compression,
                     vals=vals,
                 )
@@ -3475,8 +3480,17 @@ class Validator(BaseNode, Trainer):
                             quant_params = None  # Fast route for decompress
 
                         # For evaluation, always use validator's own xshapes to match model shape
+                        # Handle new dict format: {"local": shape, "global": shape}
                         param_xshape = self.xshapes[n]
+                        if isinstance(param_xshape, dict):
+                            param_xshape = param_xshape.get(
+                                "global", param_xshape.get("local")
+                            )
                         param_totalk = self.totalks[n]
+                        if isinstance(param_totalk, dict):
+                            param_totalk = param_totalk.get(
+                                "global", param_totalk.get("local")
+                            )
 
                         # Use empty_like to avoid copying the param; just provide dtype/device/shape
                         ref = torch.empty(
