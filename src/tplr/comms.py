@@ -1674,6 +1674,7 @@ class Comms(ChainManager):
         valid_uids = []
         skipped_uids = []  # Retain UIDs that are skipped.
         global_steps = []
+        skip_reasons = {}  # Track why each UID was skipped
 
         # Ensure deterministic order across processes/ranks
         uids = sorted(uids)
@@ -1707,15 +1708,19 @@ class Comms(ChainManager):
                     received_compressed_params = set()
 
                     if isinstance(response, Exception):
+                        reason = f"Download error: {str(response)}"
+                        skip_reasons[uid] = reason
                         tplr.log_with_context(
-                            level="debug",
-                            message=f"Error from UID {uid}: {str(response)}",
+                            level="info",
+                            message=f"[GATHER SKIP] UID {uid}: {reason}",
                             current_window=window,
                         )
                         skipped_uids.append(uid)
                         continue
                     if response is None:
-                        tplr.logger.info(f"Skipped UID {uid} - gradient not found.")
+                        reason = "Gradient not found"
+                        skip_reasons[uid] = reason
+                        tplr.logger.info(f"[GATHER SKIP] UID {uid}: {reason}")
                         skipped_uids.append(uid)
                         continue
 
@@ -1730,21 +1735,26 @@ class Comms(ChainManager):
                             f"Received state dict and global step {global_step_resp} from UID {uid}"
                         )
                     except (TypeError, ValueError) as e:
+                        reason = f"Invalid response format: {e}"
+                        skip_reasons[uid] = reason
                         tplr.log_with_context(
-                            level="debug",
-                            message=f"Invalid response from UID {uid}: {e}",
+                            level="info",
+                            message=f"[GATHER SKIP] UID {uid}: {reason}",
                             current_window=window,
                         )
                         skipped_uids.append(uid)
                         continue
 
                     if state_dict_resp is None:
-                        tplr.logger.debug(f"Empty state dict from UID {uid}")
+                        reason = "Empty state dict"
+                        skip_reasons[uid] = reason
+                        tplr.logger.info(f"[GATHER SKIP] UID {uid}: {reason}")
                         skipped_uids.append(uid)
                         continue
 
                     # ---------- Begin Compressed Indices and Values Check ----------
                     valid_response = True
+                    validation_failure_reason = None
                     for param_name, tensor in state_dict_resp.items():
                         received_compressed_params.add(param_name)
 
@@ -1762,18 +1772,18 @@ class Comms(ChainManager):
                                     or abs(scale) > 1e4
                                 )
                             ):
+                                validation_failure_reason = f"Bad quant_params in {param_name}: shift={shift}, scale={scale}"
                                 tplr.logger.warning(
-                                    f"Bad quant‑params in {param_name} from UID {uid}; "
-                                    f"shift={shift}, scale={scale}"
+                                    f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                 )
                                 valid_response = False
                                 break
                             if torch.is_tensor(lookup) and (
                                 not torch.isfinite(lookup).all()
                             ):
+                                validation_failure_reason = f"Lookup table contains non-finite values in {param_name}"
                                 tplr.logger.warning(
-                                    f"Lookup table contains non‑finite values in {param_name} "
-                                    f"from UID {uid}"
+                                    f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                 )
                                 valid_response = False
                                 break
@@ -1782,8 +1792,11 @@ class Comms(ChainManager):
                             base_name = param_name[:-4]
                             totalk_value = totalks.get(base_name)
                             if totalk_value is None:
+                                validation_failure_reason = (
+                                    f"Missing totalk for parameter {base_name}"
+                                )
                                 tplr.logger.warning(
-                                    f"Missing totalk for parameter {base_name} from UID {uid}, skipping UID."
+                                    f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                 )
                                 valid_response = False
                                 break
@@ -1804,8 +1817,9 @@ class Comms(ChainManager):
                                     vals=vals_tensor,
                                 )
                             except Exception as e:
+                                validation_failure_reason = f"Compressed indices check failed for {param_name}: {e}"
                                 tplr.logger.warning(
-                                    f"Compressed indices check failed for parameter {param_name} from UID {uid}: {e}"
+                                    f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                 )
                                 valid_response = False
                                 break
@@ -1815,8 +1829,11 @@ class Comms(ChainManager):
                             if tensor.dtype == torch.uint8:
                                 # For quantized values, do a quick check on the raw bytes
                                 if tensor.nelement() == 0:
+                                    validation_failure_reason = (
+                                        f"Empty tensor in {param_name}"
+                                    )
                                     tplr.logger.warning(
-                                        f"Empty tensor in {param_name} from UID {uid}, skipping"
+                                        f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                     )
                                     valid_response = False
                                     break
@@ -1827,8 +1844,11 @@ class Comms(ChainManager):
                                     torch.isnan(tensor_to_check).any()
                                     or torch.isinf(tensor_to_check).any()
                                 ):
+                                    validation_failure_reason = (
+                                        f"NaN/Inf detected in {param_name}"
+                                    )
                                     tplr.logger.warning(
-                                        f"NaN/Inf in {param_name} from UID {uid}, skipping"
+                                        f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                     )
                                     valid_response = False
                                     break
@@ -1842,8 +1862,11 @@ class Comms(ChainManager):
                                 param_name[:-4] + "quant_params", None
                             )
                             if qparams is None and tensor.dtype == torch.uint8:
+                                validation_failure_reason = (
+                                    f"Missing quant_params for quantized {param_name}"
+                                )
                                 tplr.logger.warning(
-                                    f"Missing quant_params for quantized {param_name} from UID {uid}"
+                                    f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                                 )
                                 valid_response = False
                                 break
@@ -1854,20 +1877,39 @@ class Comms(ChainManager):
                     # Allow output.weight to be missing if tok_embeddings.weight is present
                     # (indicates tied embeddings from peer, which will be handled during gradient application)
                     if "tok_embeddings.weightidxs" in received_compressed_params:
+                        output_params_removed = missing_params & {
+                            "output.weightidxs",
+                            "output.weightvals",
+                            "output.weightquant_params",
+                        }
+                        if output_params_removed:
+                            tplr.logger.info(
+                                f"[GATHER] UID {uid} has tied embeddings (missing {output_params_removed}), "
+                                "allowing through for tied→untied conversion"
+                            )
                         missing_params.discard("output.weightidxs")
                         missing_params.discard("output.weightvals")
                         missing_params.discard("output.weightquant_params")
 
                     if missing_params:
+                        validation_failure_reason = (
+                            f"Missing compressed parameters: {missing_params}"
+                        )
                         tplr.logger.warning(
-                            f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
+                            f"[VALIDATION] UID {uid}: {validation_failure_reason}"
                         )
                         valid_response = False
 
                     # If any check failed, skip this UID entirely
                     if not valid_response:
+                        if validation_failure_reason:
+                            skip_reasons[uid] = (
+                                f"Validation failed: {validation_failure_reason}"
+                            )
+                        else:
+                            skip_reasons[uid] = "Validation failed: Unknown reason"
                         tplr.logger.info(
-                            f"Skipping UID {uid} due to validation failures"
+                            f"[GATHER SKIP] UID {uid}: {skip_reasons[uid]}"
                         )
                         skipped_uids.append(uid)
                         continue
@@ -1916,6 +1958,30 @@ class Comms(ChainManager):
             return None
 
         total_time = time.time() - start_time
+
+        # Log summary of skip reasons
+        if skip_reasons:
+            reason_counts = {}
+            for reason in skip_reasons.values():
+                # Extract the main failure category
+                if "Download error" in reason:
+                    category = "Download error"
+                elif "Validation failed" in reason:
+                    category = "Validation failed"
+                elif "Gradient not found" in reason:
+                    category = "Gradient not found"
+                elif "Empty state dict" in reason:
+                    category = "Empty state dict"
+                elif "Invalid response" in reason:
+                    category = "Invalid response"
+                else:
+                    category = "Other"
+                reason_counts[category] = reason_counts.get(category, 0) + 1
+
+            tplr.logger.info(
+                f"[GATHER SUMMARY] Skipped {len(skip_reasons)} UIDs: {reason_counts}"
+            )
+
         tplr.logger.info(
             f"Gather done in {total_time:.2f}s. Success rate: {len(valid_uids)}/{len(uids)}, "
             f"Upload: {metrics['upload_bytes']} bytes, Download: {metrics['download_bytes']} bytes"
