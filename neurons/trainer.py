@@ -792,6 +792,13 @@ class Trainer:
                     loss_item = calculated_loss.detach().item()
                 forward_time = time.time() - forward_start
 
+                # DIAGNOSTIC: Log forward time every 10 batches to track slowdown
+                if batch_count % 10 == 0:
+                    tplr.logger.info(
+                        f"[DIAG] Window={step_window} Batch={batch_count} "
+                        f"Forward={forward_time:.4f}s"
+                    )
+
                 # -------------------------------------------------------------- #
                 # 3-a.  Back-prop with no_sync() on non-final micro-batches
                 # -------------------------------------------------------------- #

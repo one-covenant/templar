@@ -536,6 +536,13 @@ class Miner(BaseNode, Trainer):
             # Start the gather in the background:
             step_window = self.current_window
             # global_step will be incremented only when we do an actual outer step
+
+            # DIAGNOSTIC: Mark each window clearly for performance tracking
+            tplr.logger.info(
+                f"\n{'=' * 80}\n"
+                f"[DIAG] === STARTING WINDOW {step_window} === (Outer Steps: {self.global_step})\n"
+                f"{'=' * 80}"
+            )
             tplr.logger.info(
                 f"\n{'-' * 40} Window: {step_window} (Outer Steps Taken: {self.global_step}) {'-' * 40}"
             )
@@ -610,11 +617,29 @@ class Miner(BaseNode, Trainer):
             )
 
             # Restore parameters from CPU after inner_steps
+            # DIAGNOSTIC: Log memory state before restore
+            mem_before = torch.cuda.memory_allocated(self.device) / 1e9
+            mem_reserved_before = torch.cuda.memory_reserved(self.device) / 1e9
+            tplr.logger.info(
+                f"[DIAG] Before restore: Allocated={mem_before:.2f}GB "
+                f"Reserved={mem_reserved_before:.2f}GB"
+            )
+
             restore_start = time.time()
             dist_helper.restore_offloaded_params(
                 self.model, params_offloaded, param_specs
             )
             restore_time = time.time() - restore_start
+
+            # DIAGNOSTIC: Log memory state after restore
+            mem_after = torch.cuda.memory_allocated(self.device) / 1e9
+            mem_reserved_after = torch.cuda.memory_reserved(self.device) / 1e9
+            tplr.logger.info(
+                f"[DIAG] After restore: Allocated={mem_after:.2f}GB "
+                f"Reserved={mem_reserved_after:.2f}GB "
+                f"Delta_Allocated={mem_after - mem_before:.2f}GB"
+            )
+
             tplr.logger.info(f"Parameter restore to GPU took {restore_time:.4f}s")
 
             training_time = tplr.T() - train_start

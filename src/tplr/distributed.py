@@ -597,6 +597,38 @@ class DistributedHelper:
             torch.cuda.current_stream().wait_stream(stream)
             stream.synchronize()
 
+        # DIAGNOSTIC: Check DTensor and parameter state after restore
+        sample_count = 0
+        for p, spec in zip(params_offloaded, param_specs):
+            if sample_count >= 3:  # Only log first 3 params to avoid spam
+                break
+            param_name = spec.get("name", "unknown")
+            has_offload_buf = hasattr(p, "_cpu_offload_buf")
+            is_dtensor = hasattr(p, "to_local")
+
+            if is_dtensor:
+                try:
+                    local_shard = p.to_local()
+                    local_contiguous = local_shard.is_contiguous()
+                    local_stride = local_shard.stride()
+                    tplr.logger.info(
+                        f"[DIAG] Param={param_name[:30]} DTensor=True "
+                        f"HasOffloadBuf={has_offload_buf} "
+                        f"LocalContiguous={local_contiguous} LocalStride={local_stride}"
+                    )
+                    sample_count += 1
+                except Exception as e:
+                    tplr.logger.warning(f"[DIAG] Failed to check DTensor state: {e}")
+            else:
+                p_contiguous = p.is_contiguous()
+                p_stride = p.stride()
+                tplr.logger.info(
+                    f"[DIAG] Param={param_name[:30]} DTensor=False "
+                    f"HasOffloadBuf={has_offload_buf} "
+                    f"Contiguous={p_contiguous} Stride={p_stride}"
+                )
+                sample_count += 1
+
         tplr.logger.info(
             f"[ParamRestore] restored {len(params_offloaded)} params in {time.time() - t0:.3f}s"
         )
