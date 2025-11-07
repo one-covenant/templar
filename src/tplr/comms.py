@@ -1851,6 +1851,13 @@ class Comms(ChainManager):
                     missing_params = (
                         expected_compressed_params - received_compressed_params
                     )
+                    # Allow output.weight to be missing if tok_embeddings.weight is present
+                    # (indicates tied embeddings from peer, which will be handled during gradient application)
+                    if "tok_embeddings.weightidxs" in received_compressed_params:
+                        missing_params.discard("output.weightidxs")
+                        missing_params.discard("output.weightvals")
+                        missing_params.discard("output.weightquant_params")
+
                     if missing_params:
                         tplr.logger.warning(
                             f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
