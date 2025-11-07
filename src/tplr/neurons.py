@@ -403,8 +403,8 @@ def outer_step(
     # but local model expects untied embeddings (separate tok_embeddings and output)
     tied_to_untied_params = set()
     if on_src and src_sd is not None:
-        has_tok_embeddings = "tok_embeddingsidxs" in src_sd
-        has_output = "outputidxs" in src_sd
+        has_tok_embeddings = "tok_embeddings.weightidxs" in src_sd
+        has_output = "output.weightidxs" in src_sd
         if has_tok_embeddings and not has_output:
             # Check if local model has separate output layer
             model_params = dict(model.named_parameters())
