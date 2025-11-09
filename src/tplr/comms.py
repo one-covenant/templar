@@ -1030,14 +1030,14 @@ class Comms(ChainManager):
                         expected_len = end - start + 1
 
                         try:
-                            # Per-chunk timeout (15 seconds for S3 request)
+                            # Per-chunk timeout (60 seconds for S3 request)
                             response = await asyncio.wait_for(
                                 s3_client.get_object(
                                     Bucket=bucket.name,
                                     Key=key,
                                     Range=f"bytes={start}-{end}",
                                 ),
-                                timeout=15,
+                                timeout=60,
                             )
 
                             bytes_written = 0
@@ -1053,9 +1053,9 @@ class Comms(ChainManager):
                                         to_read = min(
                                             buffer_size, expected_len - bytes_written
                                         )
-                                        # Timeout for each stream read (15 seconds)
+                                        # Timeout for each stream read (60 seconds)
                                         chunk = await asyncio.wait_for(
-                                            stream.read(to_read), timeout=15
+                                            stream.read(to_read), timeout=60
                                         )
                                         if not chunk:
                                             raise Exception(
