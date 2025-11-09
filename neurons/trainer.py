@@ -1001,4 +1001,6 @@ class Trainer:
             use_dct=self.hparams.use_dct,
             wandb_run=self.wandb if self.is_master and log_wandb else None,
             global_step=self.global_step,
+            memory_budget_mb=getattr(self.hparams, "gradient_memory_budget_mb", None),
+            batch_size_override=getattr(self.hparams, "incremental_batch_size", None),
         )

@@ -465,6 +465,8 @@ class Miner(BaseNode, Trainer):
                 await tplr.neurons.update_peers(
                     instance=self, window=step_window, peer_start=peer_start
                 )
+                # Refresh commitments to get updated bucket info for all peers
+                self.comms.commitments = await self.comms.get_commitments()
             peer_update_time = tplr.T() - peer_start
 
             # 2. Load data
@@ -702,13 +704,18 @@ class Miner(BaseNode, Trainer):
             gather_time = 0.0
             should_update = True
 
+            # Miners use sequential gather only (master-only, original behavior)
+            # Distributed gather is only enabled for validators
+            gather_start = tplr.T()
+
             if self.is_master:
-                gather_start = tplr.T()
-                tplr.logger.info("Waiting on gather task...")
-                gather_result = await self.comms.gather_with_reserve(
+                tplr.logger.info(
+                    f"Starting sequential gather from {len(self.comms.peers)} peer(s)"
+                )
+
+                gather_result = await self.comms.gather(
                     my_uid=self.uid,
-                    gather_uids=self.comms.peers,
-                    reserve_uids=self.comms.reserve_peers,
+                    uids=self.comms.peers,
                     window=step_window,
                     key="gradient",
                     timeout=90,
@@ -721,8 +728,20 @@ class Miner(BaseNode, Trainer):
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
                 )
-                tplr.logger.info("Gather task completed!")
                 gather_time = tplr.T() - gather_start
+
+                if gather_result is not None:
+                    tplr.logger.info(
+                        f"Sequential gather complete: {len(gather_result.uids)}/{len(self.comms.peers)} successful, "
+                        f"{len(gather_result.skipped_uids)} skipped, "
+                        f"success_rate={gather_result.success_rate:.2%}, "
+                        f"time={gather_time:.2f}s"
+                    )
+                else:
+                    tplr.logger.warning(
+                        "Sequential gather failed - no gradients collected from peers"
+                    )
+
                 should_update = gather_result is not None
 
             # Broadcast whether we should update to all ranks

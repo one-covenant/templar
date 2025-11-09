@@ -19,7 +19,7 @@
     "bma_threshold": 0.10,
     "bma_warmup_windows": 10,
     "missing_gradient_penalty_score": -99.0,
-    "model_size": "70B",
+    "model_size": "2B",
     "weight_decay": 0.1,
     "validator_offset": 1,
     "checkpoint_frequency": 10,
