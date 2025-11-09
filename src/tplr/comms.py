@@ -2350,10 +2350,8 @@ class Comms(ChainManager):
 
         my_uids = partitions[rank] if rank < len(partitions) else []
 
-        tplr.log_with_context(
-            level="info",
-            message=f"[DISTRIBUTED_GATHER] Rank {rank}/{world_size} assigned {len(my_uids)}/{len(uids)} UIDs: {my_uids}",
-            window=window,
+        tplr.logger.info(
+            f"[DISTRIBUTED_GATHER] Rank {rank} assigned {len(my_uids)}/{len(uids)} UIDs: {my_uids}"
         )
 
         # Step 2: Each rank gathers its assigned subset
@@ -2370,35 +2368,25 @@ class Comms(ChainManager):
 
         # Log per-rank metrics
         if partial_result is not None:
-            tplr.log_with_context(
-                level="info",
-                message=f"[DISTRIBUTED_GATHER] Rank {rank} partial: {len(partial_result.uids)} fetched, "
-                f"{len(partial_result.skipped_uids)} skipped, "
-                f"download={partial_result.download_bytes / 1e6:.2f}MB, "
-                f"time={gather_time:.2f}s",
-                window=window,
+            tplr.logger.info(
+                f"[DISTRIBUTED_GATHER] Rank {rank} fetched {len(partial_result.uids)} UIDs "
+                f"({partial_result.download_bytes / 1e6:.1f}MB in {gather_time:.2f}s)"
             )
         else:
-            tplr.log_with_context(
-                level="info",
-                message=f"[DISTRIBUTED_GATHER] Rank {rank} partial: no results (time={gather_time:.2f}s)",
-                window=window,
+            tplr.logger.debug(
+                f"[DISTRIBUTED_GATHER] Rank {rank} no results (time={gather_time:.2f}s)"
             )
 
         # Step 3: All-gather partial results to all ranks
         merge_start = time.time()
         if world_size > 1 and dist_helper.is_distributed():
-            tplr.log_with_context(
-                level="info",
-                message=f"[DISTRIBUTED_GATHER] Rank {rank} performing all-gather of partial results",
-                window=window,
+            tplr.logger.debug(
+                f"[DISTRIBUTED_GATHER] Rank {rank} syncing at all-gather barrier..."
             )
             # Call synchronously - this is a blocking barrier operation by design
             all_partials = dist_helper.all_gather_object(partial_result)
-            tplr.log_with_context(
-                level="info",
-                message=f"[DISTRIBUTED_GATHER] Rank {rank} all-gather complete, received {len(all_partials)} partials",
-                window=window,
+            tplr.logger.info(
+                f"[DISTRIBUTED_GATHER] Rank {rank} all-gather complete ({len(all_partials)} partials)"
             )
         else:
             all_partials = [partial_result]
@@ -2417,12 +2405,11 @@ class Comms(ChainManager):
                 total_uids = sum(
                     len(getattr(p, "uids", [])) for p in all_partials if p is not None
                 )
-                tplr.log_with_context(
-                    level="info",
-                    message=f"[DISTRIBUTED_GATHER] ✓ COMPLETE (partials): {total_uids}/{len(uids)} total UIDs across {len(all_partials)} partials, "
-                    f"gather_time={gather_time:.2f}s, total_time={time.time() - start_time:.2f}s",
-                    window=window,
-                )
+                if rank == 0:  # Only master logs summary
+                    tplr.logger.info(
+                        f"[DISTRIBUTED_GATHER] ✓ Complete: {total_uids}/{len(uids)} UIDs gathered "
+                        f"across {len(all_partials)} ranks in {time.time() - start_time:.2f}s"
+                    )
             # Add rank metadata to each partial for deterministic sorting
             for idx, partial in enumerate(all_partials):
                 if partial is not None and not hasattr(partial, "rank"):
@@ -2489,9 +2476,18 @@ class Comms(ChainManager):
             f"[gather_with_reserve][Rank {dist_helper.rank}] ENTRY | gather_uids={gather_uids}, reserve_uids={reserve_uids}"
         )
 
-        if len(gather_uids + reserve_uids) == 0:
+        # Determine if we should use distributed gather
+        use_distributed = (
+            getattr(self.hparams, "distributed_gather", False)
+            and dist_helper.world_size > 1
+            and dist_helper.is_distributed()
+        )
+
+        # In distributed mode, all ranks must participate even if they have no UIDs
+        # to ensure synchronization at the all-gather barrier
+        if len(gather_uids + reserve_uids) == 0 and not use_distributed:
             tplr.logger.info(
-                f"[gather_with_reserve][Rank {dist_helper.rank}] No UIDs, returning None"
+                f"[gather_with_reserve][Rank {dist_helper.rank}] No UIDs and not distributed, returning None"
             )
             return None
 
@@ -2504,13 +2500,6 @@ class Comms(ChainManager):
         context_log(
             message=f"[gather_with_reserve] ⏩ start | "
             f"gather={gather_uids} reserve={reserve_uids}"
-        )
-
-        # Determine if we should use distributed gather
-        use_distributed = (
-            getattr(self.hparams, "distributed_gather", False)
-            and dist_helper.world_size > 1
-            and dist_helper.is_distributed()
         )
 
         if use_distributed:
