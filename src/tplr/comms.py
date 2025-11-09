@@ -25,6 +25,7 @@ import re
 import shutil
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from functools import partial
 from types import SimpleNamespace
@@ -45,6 +46,7 @@ import tplr
 from tplr.chain import ChainManager
 from tplr.compress import TopKCompressor, unpack_12bit_indices
 from tplr.config import BUCKET_SECRETS, client_config
+from tplr.distributed import dist_helper
 from tplr.schemas import Bucket, CommsGetResult
 
 # Constants
@@ -136,6 +138,9 @@ class Comms(ChainManager):
         self.gather_semaphore = asyncio.Semaphore(CPU_MAX_CONNECTIONS // 2)
         # Limit how many TransferManagers run concurrently (protects threads/conn pool)
         self.upload_sem = asyncio.Semaphore(4)
+        self._partition_cache: OrderedDict[
+            tuple[int | None, tuple[int, ...], int], list[list[int]]
+        ] = OrderedDict()
 
     async def _get_s3_client(self, bucket: Bucket) -> AioBaseClient:
         """
@@ -474,6 +479,106 @@ class Comms(ChainManager):
             tplr.logger.error(f"Error uploading {key} to S3: {e}")
             raise
 
+    async def s3_object_exists(
+        self,
+        key: str,
+        bucket: Bucket | None = None,
+        timeout: int = 10,
+    ) -> bool:
+        """
+        Check if an object exists in S3 without downloading it.
+
+        Uses conservative error handling to avoid false slashing:
+        - Returns False only for 404 (not found) and configuration errors (403, invalid bucket)
+        - Returns True for transient network/service errors (timeouts, 5xx, connection issues)
+
+        Configuration errors (403, invalid bucket) are logged at ERROR level to surface
+        legitimate setup issues that need attention.
+
+        Args:
+            key: The S3 object key to check
+            bucket: The bucket configuration (defaults to self.bucket)
+            timeout: Timeout in seconds for the HEAD request
+
+        Returns:
+            bool: True if object exists or error is transient, False if confirmed missing or config error
+        """
+        if bucket is None:
+            bucket = self.bucket
+
+        s3_client = await self._get_s3_client(bucket)
+        try:
+            await asyncio.wait_for(
+                s3_client.head_object(Bucket=bucket.name, Key=key),
+                timeout=timeout,
+            )
+            return True
+        except asyncio.TimeoutError:
+            # Transient network issue - be conservative
+            tplr.logger.debug(f"Timeout checking existence of {key}")
+            return True  # Conservative: assume exists (network timeout)
+        except (ConnectionClosedError, ClientError) as e:
+            # Prefer structured fields when available (aiobotocore/botocore)
+            status = None
+            code = None
+            if isinstance(e, ClientError) and hasattr(e, "response"):
+                status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                code = e.response.get("Error", {}).get("Code")
+            error_str = str(e)
+
+            # Not found
+            if status == 404 or code in {"404", "NoSuchKey"}:
+                tplr.logger.debug(f"Object {key} does not exist")
+                return False
+
+            # Permission/config errors — surface loudly, don't assume exists
+            elif status in {401, 403} or code in {
+                "AccessDenied",
+                "InvalidAccessKeyId",
+                "SignatureDoesNotMatch",
+            }:
+                tplr.logger.error(
+                    f"Permission denied checking {key} in bucket {bucket.name}. "
+                    f"Check R2 credentials and bucket permissions. Error: {e}"
+                )
+                return False  # Don't assume exists — this is a config issue
+
+            elif (
+                code in {"NoSuchBucket", "InvalidBucketName"}
+                or "NoSuchBucket" in error_str
+                or "InvalidBucket" in error_str
+            ):
+                # Bucket configuration issue
+                tplr.logger.error(
+                    f"Bucket configuration error for {bucket.name}: {e}. "
+                    f"Miner may have invalid bucket commitment."
+                )
+                return False  # Bucket doesn't exist or is invalid
+
+            # Transient service/network errors — conservative True
+            elif status in {500, 502, 503, 504} or any(
+                s in error_str for s in ["500", "502", "503", "504"]
+            ):
+                # S3/R2 service error - transient, be conservative
+                tplr.logger.warning(
+                    f"S3 service error checking {key}: {e}. Assuming exists (transient service issue)."
+                )
+                return True  # Conservative for service errors
+
+            else:
+                # Other connection/network errors - likely transient
+                tplr.logger.warning(
+                    f"Network error checking existence of {key}: {e}. Assuming exists (network issue)."
+                )
+                return True  # Conservative for network issues
+        except Exception as e:
+            # Unexpected errors - log at error level
+            tplr.logger.error(
+                f"Unexpected error checking {key}: {type(e).__name__}: {e}. "
+                f"Assuming exists conservatively."
+            )
+            return True  # Conservative: assume exists
+
     async def s3_get_object(
         self,
         key: str,
@@ -531,14 +636,14 @@ class Comms(ChainManager):
 
                 if time_min is not None and last_modified < time_min:
                     time_diff = (time_min - last_modified).total_seconds()
-                    tplr.logger.info(
+                    tplr.logger.debug(
                         f"Object {key} was uploaded {time_diff:.2f}s before time_min."
                     )
                     return {"__status": "TOO_EARLY"}
 
                 if time_max is not None and last_modified > time_max:
                     time_diff = (last_modified - time_max).total_seconds()
-                    tplr.logger.info(
+                    tplr.logger.debug(
                         f"Object {key} was uploaded {time_diff:.2f}s after time_max."
                     )
                     return {"__status": "TOO_LATE"}
@@ -599,11 +704,21 @@ class Comms(ChainManager):
                     device_location = (
                         map_location if map_location is not None else self.config.device
                     )
-                    loaded_data = torch.load(
-                        temp_file_path,
-                        map_location=device_location,
-                        weights_only=True,
-                    )
+                    try:
+                        # CRITICAL FIX: Offload torch.load() to thread pool to avoid blocking event loop
+                        # torch.load() does CPU decompression which takes 1-2s per file
+                        # Without this, parallel downloads are serialized during decompression
+                        loaded_data = await asyncio.to_thread(
+                            torch.load,
+                            temp_file_path,
+                            map_location=device_location,
+                            weights_only=True,
+                        )
+                    except Exception as load_error:
+                        tplr.logger.error(
+                            f"Failed to load {key}: {type(load_error).__name__}: {str(load_error)}"
+                        )
+                        loaded_data = None
             else:
                 if success:
                     target_directory = os.path.dirname(key)
@@ -1352,7 +1467,7 @@ class Comms(ChainManager):
         return put_end - put_start
 
     async def gradient_timestamp(
-        self, uid: int, window: int, version: str = tplr.__version__
+        self, uid: int, window: int, version: str | None = None
     ) -> float:
         """
         Retrieves the last-modified timestamp of a gradient file from S3.
@@ -1364,13 +1479,15 @@ class Comms(ChainManager):
         Args:
             uid (int): The UID of the miner who owns the gradient.
             window (int): The window number for the gradient.
-            version (str, optional): The templar version string. Defaults to `tplr.__version__`.
+            version (str | None, optional): The templar version string. Defaults to `tplr.__version__`.
 
         Returns:
             float: The POSIX timestamp (seconds since epoch) of the file's
                 last modification, or 0.0 if the file is not found or an
                 error occurs.
         """
+        if version is None:
+            version = tplr.__version__
         bucket = self.commitments.get(int(uid))
         if not bucket:
             return 0.0
@@ -1441,7 +1558,10 @@ class Comms(ChainManager):
                 if not os.path.exists(local_path):
                     tplr.logger.debug(f"Local file not found: {local_path}")
                     return CommsGetResult(status="NOT_FOUND")
-                loaded_data = torch.load(local_path, weights_only=True)
+                # Offload torch.load() to thread pool (same fix as remote storage)
+                loaded_data = await asyncio.to_thread(
+                    torch.load, local_path, weights_only=True
+                )
                 state_dict = loaded_data.get("state_dict")
                 global_step = loaded_data.get("global_step", 0)
                 return CommsGetResult(data=state_dict, global_step=global_step)
@@ -1544,6 +1664,8 @@ class Comms(ChainManager):
         end_time = start_time + timeout
         tried_after_time_max = False
         time_max_grace_period = 3.0
+        consecutive_not_found = 0  # Track consecutive NOT_FOUND errors
+        max_consecutive_not_found = 5  # Give up after 5 consecutive NOT_FOUND (2.5s)
 
         while True:
             # Check if we've timed out
@@ -1597,6 +1719,19 @@ class Comms(ChainManager):
                     f"Gradient for UID {uid}, window {window} exists but was uploaded {formatted_status}. Skipping."
                 )
                 return None
+
+            # For NOT_FOUND, track consecutive failures
+            if result.status == "NOT_FOUND":
+                consecutive_not_found += 1
+                if consecutive_not_found >= max_consecutive_not_found:
+                    tplr.logger.debug(
+                        f"GET {uid}/{window}/{key} - {consecutive_not_found} consecutive NOT_FOUND. "
+                        f"Giving up early (file likely doesn't exist)."
+                    )
+                    return None
+            else:
+                # Reset counter on other errors (might be transient network issues)
+                consecutive_not_found = 0
 
             # For NOT_FOUND or ERROR, we retry.
             # Short delay before retrying
@@ -1703,20 +1838,100 @@ class Comms(ChainManager):
                     f"{tplr.P(window, tplr.T() - download_start)} Downloaded peer gradients <--"
                 )
                 process_start = tplr.T()
+
+                # OPTIMIZATION: Parallelize S3 existence checks for failed downloads
+                # to avoid serial API calls that add 5s per failure
+                failed_checks = []
+                for uid, response in zip(uids, batch_responses):
+                    if isinstance(response, (Exception, type(None))):
+                        peer_bucket = self.commitments.get(int(uid))
+                        if peer_bucket:  # Only check if bucket is committed
+                            gradient_key = (
+                                f"{key}-{window}-{uid}-v{tplr.__version__}.pt"
+                            )
+                            failed_checks.append((uid, gradient_key, peer_bucket))
+
+                # Run all existence checks in parallel (huge speedup!)
+                existence_results = {}
+                if failed_checks:
+                    existence_tasks = [
+                        self.s3_object_exists(key=check[1], bucket=check[2], timeout=5)
+                        for check in failed_checks
+                    ]
+                    existence_responses = await asyncio.gather(
+                        *existence_tasks, return_exceptions=True
+                    )
+                    existence_results = {
+                        check[0]: (resp if not isinstance(resp, Exception) else False)
+                        for check, resp in zip(failed_checks, existence_responses)
+                    }
+                    tplr.logger.debug(
+                        f"Checked existence for {len(failed_checks)} failed downloads in parallel"
+                    )
+
+                # Now process all responses with cached existence checks
                 for uid, response in zip(uids, batch_responses):
                     received_compressed_params = set()
 
                     if isinstance(response, Exception):
                         tplr.log_with_context(
-                            level="debug",
-                            message=f"Error from UID {uid}: {str(response)}",
+                            level="warning",
+                            message=f"Download error from UID {uid}: {str(response)}",
                             current_window=window,
                         )
-                        skipped_uids.append(uid)
+                        # Check if file exists on R2 to distinguish miner vs network failure
+                        peer_bucket = self.commitments.get(int(uid))
+                        if not peer_bucket:
+                            # No bucket committed, treat as miner didn't upload
+                            tplr.logger.info(
+                                f"Skipped UID {uid} - no bucket committed (not registered)."
+                            )
+                            skipped_uids.append(uid)
+                            continue
+                        # Use cached existence check result (already checked in parallel above)
+                        file_exists = existence_results.get(uid, False)
+                        if file_exists:
+                            # File exists but download failed - network issue, not miner's fault
+                            tplr.log_with_context(
+                                level="warning",
+                                message=f"UID {uid}: File exists on R2 but download failed (network/timeout issue). Not slashing.",
+                                current_window=window,
+                            )
+                            # Don't add to skipped_uids - this prevents slashing
+                        else:
+                            # File doesn't exist - miner didn't upload, legitimate slash
+                            tplr.log_with_context(
+                                level="info",
+                                message=f"UID {uid}: File not found on R2 (miner didn't upload). Will be slashed.",
+                                current_window=window,
+                            )
+                            skipped_uids.append(uid)
                         continue
                     if response is None:
-                        tplr.logger.info(f"Skipped UID {uid} - gradient not found.")
-                        skipped_uids.append(uid)
+                        # Similar check for None responses
+                        peer_bucket = self.commitments.get(int(uid))
+                        if not peer_bucket:
+                            # No bucket committed, treat as miner didn't upload
+                            tplr.logger.info(
+                                f"Skipped UID {uid} - no bucket committed (not registered)."
+                            )
+                            skipped_uids.append(uid)
+                            continue
+                        # Use cached existence check result (already checked in parallel above)
+                        file_exists = existence_results.get(uid, False)
+                        if file_exists:
+                            # File exists but wasn't returned - likely timing or validation issue
+                            tplr.log_with_context(
+                                level="warning",
+                                message=f"UID {uid}: File exists on R2 but get returned None (timing/validation issue). Not slashing.",
+                                current_window=window,
+                            )
+                        else:
+                            # File doesn't exist - miner didn't upload
+                            tplr.logger.info(
+                                f"Skipped UID {uid} - gradient not found on R2 (miner didn't upload)."
+                            )
+                            skipped_uids.append(uid)
                         continue
 
                     try:
@@ -1927,6 +2142,311 @@ class Comms(ChainManager):
         return result
 
     # ------------------------------------------------------------------
+    # Distributed Gather Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def partition_uids_across_ranks(
+        uids: list[int],
+        world_size: int,
+        rank: int,
+    ) -> list[int]:
+        """
+        Deterministically partition UIDs across ranks using round-robin.
+
+        Args:
+            uids: List of UIDs to partition
+            world_size: Number of ranks
+            rank: Current rank
+
+        Returns:
+            List of UIDs assigned to this rank
+        """
+        if world_size <= 1:
+            return uids
+
+        # Sort for deterministic ordering
+        sorted_uids = sorted(uids)
+
+        # Round-robin assignment: rank i gets indices i, i+world_size, i+2*world_size, ...
+        return sorted_uids[rank::world_size]
+
+    @staticmethod
+    def merge_gather_results(
+        partial_results: list[SimpleNamespace | None],
+        target_device: str | None = None,
+    ) -> SimpleNamespace | None:
+        """
+        Merge partial gather results from all ranks into a single aggregate result.
+
+        Args:
+            partial_results: List of partial gather results from each rank
+            target_device: Device to move all tensors to (defaults to cuda:0 if available, else cpu)
+
+        Returns:
+            Merged gather result or None if all partials are None
+        """
+        # Filter out None results
+        valid_partials = [r for r in partial_results if r is not None]
+
+        if not valid_partials:
+            tplr.logger.warning("No valid partials to merge")
+            return None
+
+        # Determine target device for tensor consolidation
+        if target_device is None:
+            if torch.cuda.is_available():
+                try:
+                    target_device = f"cuda:{torch.cuda.current_device()}"
+                except RuntimeError:
+                    # Fall back to first available device or CPU
+                    target_device = "cpu"
+                    if torch.cuda.device_count() > 0:
+                        # Use device 0, but could be extended to find first available
+                        try:
+                            torch.cuda.set_device(0)
+                            target_device = "cuda:0"
+                        except RuntimeError:
+                            target_device = "cpu"
+            else:
+                target_device = "cpu"
+
+        # Initialize merged result from first partial
+        merged = SimpleNamespace(
+            time=0.0,
+            upload_bytes=0,
+            download_bytes=0,
+            success_rate=0.0,
+            state_dict=SimpleNamespace(),
+            uids=[],
+            global_steps=[],
+            skipped_uids=[],
+        )
+
+        # Accumulate metrics
+        total_time = 0.0
+        total_upload = 0
+        total_download = 0
+        all_uids = []
+        all_global_steps = []
+        all_skipped_uids = []
+
+        # Collect all param keys from all partials
+        all_param_keys = set()
+        for partial in valid_partials:
+            if hasattr(partial, "state_dict"):
+                all_param_keys.update(vars(partial.state_dict).keys())
+
+        # Helper function to move tensors to target device
+        def move_to_device(obj):
+            """Recursively move tensors to target device."""
+            if isinstance(obj, torch.Tensor):
+                return obj.to(target_device)
+            elif isinstance(obj, list):
+                return [move_to_device(item) for item in obj]
+            elif isinstance(obj, tuple):
+                return tuple(move_to_device(item) for item in obj)
+            elif isinstance(obj, dict):
+                return {k: move_to_device(v) for k, v in obj.items()}
+            else:
+                return obj
+
+        # Merge state_dict: concatenate lists for each param key
+        merged_state_dict = {}
+        for key in all_param_keys:
+            merged_lists = []
+            for partial in valid_partials:
+                if hasattr(partial, "state_dict"):
+                    param_data = getattr(partial.state_dict, key, None)
+                    if param_data is not None:
+                        # Move tensors to target device during merge
+                        param_data = move_to_device(param_data)
+                        if isinstance(param_data, list):
+                            merged_lists.extend(param_data)
+                        else:
+                            merged_lists.append(param_data)
+            merged_state_dict[key] = merged_lists
+
+        # Merge metrics and metadata
+        for partial in valid_partials:
+            total_time = max(total_time, getattr(partial, "time", 0.0))
+            total_upload += getattr(partial, "upload_bytes", 0)
+            total_download += getattr(partial, "download_bytes", 0)
+            all_uids.extend(getattr(partial, "uids", []))
+            all_global_steps.extend(getattr(partial, "global_steps", []))
+            all_skipped_uids.extend(getattr(partial, "skipped_uids", []))
+
+        # Calculate overall success rate
+        total_attempted = len(all_uids) + len(all_skipped_uids)
+        success_rate = len(all_uids) / total_attempted if total_attempted > 0 else 0.0
+
+        # Construct merged result
+        merged.time = total_time
+        merged.upload_bytes = total_upload
+        merged.download_bytes = total_download
+        merged.success_rate = success_rate
+        merged.state_dict = SimpleNamespace(**merged_state_dict)
+        merged.uids = all_uids
+        merged.global_steps = all_global_steps
+        merged.skipped_uids = all_skipped_uids
+
+        tplr.logger.info(
+            f"Merged {len(valid_partials)} partials: {len(all_uids)} UIDs gathered, "
+            f"{len(all_skipped_uids)} skipped ({success_rate:.0%} success)"
+        )
+
+        return merged
+
+    async def gather_distributed(
+        self,
+        *,
+        my_uid: int | None,
+        return_partials: bool = False,
+        uids: list[int],
+        world_size: int,
+        rank: int,
+        expected_compressed_params: set[str] | None = None,
+        **kwargs,
+    ) -> SimpleNamespace | list[SimpleNamespace | None] | None:
+        """
+        Distributed gather: partition UIDs across ranks, gather in parallel, then merge.
+
+        Each rank fetches a subset of UIDs, then all partials are collected and merged
+        on the master rank via all-gather.
+
+        Args:
+            my_uid: The UID of the neuron performing the gather
+            return_partials: If True, returns list of partials; if False, returns merged result
+            uids: Full list of UIDs to gather from
+            world_size: Number of distributed ranks
+            rank: Current rank
+            expected_compressed_params: Set of expected parameter names
+            **kwargs: Additional arguments passed to gather()
+
+        Returns:
+            - If return_partials=True: list of partials (one per rank; entries may be None)
+            - Else: merged SimpleNamespace
+            - None if no rank produced results
+        """
+
+        window = kwargs.get("window", None)
+        start_time = time.time()
+
+        # Step 1: Partition UIDs deterministically across ranks (use cache per window)
+        sorted_uids = sorted(uids)
+        cache_key = (window, tuple(sorted_uids), world_size)
+        partitions: list[list[int]] | None = None
+        if cache_key in self._partition_cache:
+            partitions = self._partition_cache[cache_key]
+            self._partition_cache.move_to_end(cache_key)
+        else:
+            effective_world_size = max(world_size, 1)
+            partitions = [
+                sorted_uids[r::effective_world_size]
+                for r in range(effective_world_size)
+            ]
+            self._partition_cache[cache_key] = partitions
+            while len(self._partition_cache) > 32:
+                self._partition_cache.popitem(last=False)
+
+        my_uids = partitions[rank] if rank < len(partitions) else []
+
+        tplr.log_with_context(
+            level="info",
+            message=f"[DISTRIBUTED_GATHER] Rank {rank}/{world_size} assigned {len(my_uids)}/{len(uids)} UIDs: {my_uids}",
+            window=window,
+        )
+
+        # Step 2: Each rank gathers its assigned subset
+        gather_start = time.time()
+        partial_result = None
+        if my_uids:
+            partial_result = await self.gather(
+                my_uid=my_uid,
+                uids=my_uids,
+                expected_compressed_params=expected_compressed_params,
+                **kwargs,
+            )
+        gather_time = time.time() - gather_start
+
+        # Log per-rank metrics
+        if partial_result is not None:
+            tplr.log_with_context(
+                level="info",
+                message=f"[DISTRIBUTED_GATHER] Rank {rank} partial: {len(partial_result.uids)} fetched, "
+                f"{len(partial_result.skipped_uids)} skipped, "
+                f"download={partial_result.download_bytes / 1e6:.2f}MB, "
+                f"time={gather_time:.2f}s",
+                window=window,
+            )
+        else:
+            tplr.log_with_context(
+                level="info",
+                message=f"[DISTRIBUTED_GATHER] Rank {rank} partial: no results (time={gather_time:.2f}s)",
+                window=window,
+            )
+
+        # Step 3: All-gather partial results to all ranks
+        merge_start = time.time()
+        if world_size > 1 and dist_helper.is_distributed():
+            tplr.log_with_context(
+                level="info",
+                message=f"[DISTRIBUTED_GATHER] Rank {rank} performing all-gather of partial results",
+                window=window,
+            )
+            # Call synchronously - this is a blocking barrier operation by design
+            all_partials = dist_helper.all_gather_object(partial_result)
+            tplr.log_with_context(
+                level="info",
+                message=f"[DISTRIBUTED_GATHER] Rank {rank} all-gather complete, received {len(all_partials)} partials",
+                window=window,
+            )
+        else:
+            all_partials = [partial_result]
+
+        # Normalize partial list: treat empty payloads as None for downstream filters
+        for idx, partial in enumerate(all_partials):
+            if partial is None:
+                continue
+            if not getattr(partial, "uids", []):
+                all_partials[idx] = None
+
+        # Step 4: Return partials or merged result based on flag
+        if return_partials:
+            # Return unmerged partials for incremental processing
+            if rank == 0:
+                total_uids = sum(
+                    len(getattr(p, "uids", [])) for p in all_partials if p is not None
+                )
+                tplr.log_with_context(
+                    level="info",
+                    message=f"[DISTRIBUTED_GATHER] ✓ COMPLETE (partials): {total_uids}/{len(uids)} total UIDs across {len(all_partials)} partials, "
+                    f"gather_time={gather_time:.2f}s, total_time={time.time() - start_time:.2f}s",
+                    window=window,
+                )
+            # Add rank metadata to each partial for deterministic sorting
+            for idx, partial in enumerate(all_partials):
+                if partial is not None and not hasattr(partial, "rank"):
+                    partial.rank = idx
+            return all_partials
+        else:
+            # Merge on all ranks (for consistency) - original behavior
+            merged_result = self.merge_gather_results(all_partials)
+            merge_time = time.time() - merge_start
+            total_time = time.time() - start_time
+
+            if rank == 0 and merged_result is not None:
+                tplr.log_with_context(
+                    level="info",
+                    message=f"[DISTRIBUTED_GATHER] ✓ COMPLETE: {len(merged_result.uids)}/{len(uids)} successful, "
+                    f"success_rate={merged_result.success_rate:.2%}, "
+                    f"total_download={merged_result.download_bytes / 1e6:.2f}MB, "
+                    f"gather_time={gather_time:.2f}s, merge_time={merge_time:.2f}s, total_time={total_time:.2f}s",
+                    window=window,
+                )
+
+            return merged_result
+
+    # ------------------------------------------------------------------
     # gather_with_reserve –– retry skipped gather peers with reserve tier
     # ------------------------------------------------------------------
     async def gather_with_reserve(
@@ -1935,9 +2455,10 @@ class Comms(ChainManager):
         my_uid: int | None,
         gather_uids: list[int],
         reserve_uids: list[int],
+        return_partials: bool = False,
         expected_compressed_params: set[str] | None = None,
         **kwargs,
-    ) -> SimpleNamespace | None:
+    ) -> SimpleNamespace | list[SimpleNamespace | None] | None:
         """
         Gathers gradients with a fallback mechanism using a reserve set of UIDs.
 
@@ -1951,16 +2472,27 @@ class Comms(ChainManager):
             gather_uids (list[int]): The primary list of UIDs to gather from.
             reserve_uids (list[int]): A list of fallback UIDs to use if the
                 primary gather fails for some peers.
+            return_partials (bool): If True, return list of unmerged partials for
+                incremental processing. If False (default), return merged result.
             expected_compressed_params (set[str] | None, optional): A set of
                 parameter names expected in the compressed state dict. Defaults to None.
             **kwargs: Additional arguments to be passed to the `gather` method.
 
         Returns:
-            SimpleNamespace | None: A merged namespace containing the aggregated
-                state dict and metrics from both primary and reserve gathers, or
-                None if no gradients could be collected.
+            SimpleNamespace | list[SimpleNamespace] | None: Either:
+                - A merged namespace containing aggregated state dict and metrics, or
+                - A list of unmerged partial results (if return_partials=True), or
+                - None if no gradients could be collected.
         """
+
+        tplr.logger.info(
+            f"[gather_with_reserve][Rank {dist_helper.rank}] ENTRY | gather_uids={gather_uids}, reserve_uids={reserve_uids}"
+        )
+
         if len(gather_uids + reserve_uids) == 0:
+            tplr.logger.info(
+                f"[gather_with_reserve][Rank {dist_helper.rank}] No UIDs, returning None"
+            )
             return None
 
         if not expected_compressed_params:
@@ -1974,12 +2506,72 @@ class Comms(ChainManager):
             f"gather={gather_uids} reserve={reserve_uids}"
         )
 
-        primary = await self.gather(
-            my_uid=my_uid,
-            uids=gather_uids,
-            expected_compressed_params=expected_compressed_params,
-            **kwargs,
+        # Determine if we should use distributed gather
+        use_distributed = (
+            getattr(self.hparams, "distributed_gather", False)
+            and dist_helper.world_size > 1
+            and dist_helper.is_distributed()
         )
+
+        if use_distributed:
+            tplr.logger.info(
+                f"[gather_with_reserve][Rank {dist_helper.rank}] Using DISTRIBUTED gather across {dist_helper.world_size} ranks | peers={gather_uids}"
+            )
+            try:
+                primary = await self.gather_distributed(
+                    my_uid=my_uid,
+                    uids=gather_uids,
+                    world_size=dist_helper.world_size,
+                    rank=dist_helper.rank,
+                    return_partials=return_partials,
+                    expected_compressed_params=expected_compressed_params,
+                    **kwargs,
+                )
+
+                # Check if distributed gather failed to collect any gradients
+                if primary is None or (
+                    isinstance(primary, list)
+                    and all(p is None or not getattr(p, "uids", []) for p in primary)
+                ):
+                    tplr.logger.warning(
+                        f"[gather_with_reserve][Rank {dist_helper.rank}] ⚠️ Distributed gather returned no gradients, falling back to sequential"
+                    )
+                    primary = None  # Signal to fall back
+            except Exception as e:
+                tplr.logger.warning(
+                    f"[gather_with_reserve][Rank {dist_helper.rank}] ⚠️ Distributed gather failed with error: {e}, falling back to sequential"
+                )
+                primary = None  # Signal to fall back
+
+            # Fallback to sequential if distributed failed
+            # ALL ranks must fall back together to maintain consistency
+            if primary is None:
+                if dist_helper.is_master:
+                    context_log(
+                        message=f"[gather_with_reserve] 🔄 Falling back to SEQUENTIAL gather on ALL ranks (consistency requirement)"
+                    )
+                    tplr.logger.info(
+                        f"[gather_with_reserve][Rank {dist_helper.rank}] "
+                        f"Distributed gather failed - ALL ranks falling back to sequential"
+                    )
+                # All ranks perform sequential gather to maintain consistency
+                # Sequential gather (R2 downloads) can be done independently by each rank
+                primary = await self.gather(
+                    my_uid=my_uid,
+                    uids=gather_uids,
+                    expected_compressed_params=expected_compressed_params,
+                    **kwargs,
+                )
+        else:
+            context_log(
+                message=f"[gather_with_reserve] Using SEQUENTIAL gather (single rank)"
+            )
+            primary = await self.gather(
+                my_uid=my_uid,
+                uids=gather_uids,
+                expected_compressed_params=expected_compressed_params,
+                **kwargs,
+            )
 
         # Normalise to an empty shell if absolutely nothing came back
         if primary is None:
@@ -1994,17 +2586,49 @@ class Comms(ChainManager):
                 skipped_uids=gather_uids.copy(),
             )
 
-        context_log(
-            message=f"[gather_with_reserve] ✅ primary gather "
-            f"{len(primary.uids)}/{len(gather_uids)} succeeded | "
-            f"skipped={primary.skipped_uids}"
-        )
+        # Handle logging for both merged result and partials list
+        if isinstance(primary, list):
+            # When return_partials=True, primary is a list of partials
+            total_uids = sum(
+                len(getattr(p, "uids", [])) for p in primary if p is not None
+            )
+            all_skipped = []
+            for p in primary:
+                if p is not None and hasattr(p, "skipped_uids"):
+                    all_skipped.extend(p.skipped_uids)
+            context_log(
+                message=f"[gather_with_reserve] ✅ primary gather (partials) "
+                f"{total_uids}/{len(gather_uids)} succeeded across {len(primary)} partials | "
+                f"skipped={len(all_skipped)}"
+            )
+            # Collect all UIDs from partials for missing calculation
+            all_primary_uids = []
+            for p in primary:
+                if p is not None and hasattr(p, "uids"):
+                    all_primary_uids.extend(p.uids)
+            missing = set(gather_uids) - set(all_primary_uids)
+        else:
+            # When return_partials=False, primary is a SimpleNamespace
+            context_log(
+                message=f"[gather_with_reserve] ✅ primary gather "
+                f"{len(primary.uids)}/{len(gather_uids)} succeeded | "
+                f"skipped={primary.skipped_uids}"
+            )
+            missing = set(gather_uids) - set(primary.uids)
 
         # ── 2. Retry the misses with reserve peers ─────────────────────
-        missing = set(gather_uids) - set(primary.uids)
         if missing and reserve_uids:
+            # Get all primary UIDs for checking duplicates
+            if isinstance(primary, list):
+                all_primary_uids = []
+                for p in primary:
+                    if p is not None and hasattr(p, "uids"):
+                        all_primary_uids.extend(p.uids)
+            else:
+                all_primary_uids = primary.uids
+
             # take as many reserve peers as slots we missed
-            replacements = [uid for uid in reserve_uids if uid not in primary.uids][
+            replacements = [uid for uid in reserve_uids if uid not in all_primary_uids][
                 : len(missing)
             ]
 
@@ -2013,38 +2637,89 @@ class Comms(ChainManager):
                     message=f"[gather_with_reserve] 🔄 retrying with reserve "
                     f"uids={replacements}"
                 )
-                fallback = await self.gather(my_uid=my_uid, uids=replacements, **kwargs)
+
+                # Use sequential gather for reserve (not distributed)
+                fallback = await self.gather(
+                    my_uid=my_uid,
+                    uids=replacements,
+                    expected_compressed_params=expected_compressed_params,
+                    **kwargs,
+                )
+
                 if fallback:
-                    # merge tensor‑lists inside the nested state_dict
-                    for k, v in vars(fallback.state_dict).items():
-                        merged = getattr(primary.state_dict, k, []) + v
-                        setattr(primary.state_dict, k, merged)
+                    if isinstance(primary, list):
+                        # Partials: append fallback as a new partial
+                        # First, set the rank for the fallback partial
+                        fallback.rank = len(primary)  # Use next available rank index
 
-                    primary.uids.extend(fallback.uids)
-                    primary.global_steps.extend(fallback.global_steps)
-                    primary.skipped_uids.extend(fallback.skipped_uids)
-                    primary.upload_bytes += fallback.upload_bytes
-                    primary.download_bytes += fallback.download_bytes
+                        # Add fallback as a new partial to the list
+                        primary.append(fallback)
 
-                    context_log(
-                        message=f"[gather_with_reserve] ✅ reserve gather "
-                        f"{len(fallback.uids)}/{len(replacements)} "
-                        f"succeeded | skipped={fallback.skipped_uids}"
-                    )
+                        context_log(
+                            message=f"[gather_with_reserve] ✅ reserve gather "
+                            f"{len(fallback.uids)}/{len(replacements)} succeeded | "
+                            f"skipped={fallback.skipped_uids} | added as partial {fallback.rank}"
+                        )
+                    else:
+                        # Merged result: merge tensor‑lists inside the nested state_dict
+                        for k, v in vars(fallback.state_dict).items():
+                            merged = getattr(primary.state_dict, k, []) + v
+                            setattr(primary.state_dict, k, merged)
+
+                        primary.uids.extend(fallback.uids)
+                        primary.global_steps.extend(fallback.global_steps)
+                        primary.skipped_uids.extend(fallback.skipped_uids)
+                        primary.upload_bytes += fallback.upload_bytes
+                        primary.download_bytes += fallback.download_bytes
+
+                        context_log(
+                            message=f"[gather_with_reserve] ✅ reserve gather "
+                            f"{len(fallback.uids)}/{len(replacements)} "
+                            f"succeeded | skipped={fallback.skipped_uids}"
+                        )
 
         # recompute success‑rate with respect to the *original* gather tier
         target = len(gather_uids)
-        primary.success_rate = len(primary.uids) / target if target else 0.0
 
-        context_log(
-            message=f"[gather_with_reserve] 🏁 done | "
-            f"final_success={len(primary.uids)}/{target} "
-            f"({primary.success_rate:.1%}) | total_skipped={primary.skipped_uids}"
-        )
+        if isinstance(primary, list):
+            # For partials, compute aggregate success rate
+            total_uids = sum(
+                len(getattr(p, "uids", [])) for p in primary if p is not None
+            )
+            aggregate_success_rate = total_uids / target if target else 0.0
 
-        # Return None if no gradients were successfully gathered
-        if len(primary.uids) == 0:
-            return None
+            # Add success_rate to each partial
+            for p in primary:
+                if p is not None:
+                    p.success_rate = aggregate_success_rate
+
+            all_skipped = []
+            for p in primary:
+                if p is not None and hasattr(p, "skipped_uids"):
+                    all_skipped.extend(p.skipped_uids)
+
+            context_log(
+                message=f"[gather_with_reserve] 🏁 done (partials) | "
+                f"final_success={total_uids}/{target} "
+                f"({aggregate_success_rate:.1%}) | total_skipped={len(all_skipped)}"
+            )
+
+            # Return None if no gradients were successfully gathered
+            if total_uids == 0:
+                return None
+        else:
+            # For merged result, compute simple success rate
+            primary.success_rate = len(primary.uids) / target if target else 0.0
+
+            context_log(
+                message=f"[gather_with_reserve] 🏁 done | "
+                f"final_success={len(primary.uids)}/{target} "
+                f"({primary.success_rate:.1%}) | total_skipped={primary.skipped_uids}"
+            )
+
+            # Return None if no gradients were successfully gathered
+            if len(primary.uids) == 0:
+                return None
 
         return primary
 
