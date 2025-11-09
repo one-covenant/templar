@@ -578,20 +578,6 @@ def outer_step(
                 except UnboundLocalError:
                     pass
 
-                # CRITICAL: Delete the processed entries from src_sd to free memory during the loop
-                # This is especially important for hybrid TP+FSDP where src_sd is very large
-                if on_src and src_sd is not None:
-                    try:
-                        # Clear the entries for this parameter from src_sd
-                        for suffix in ["idxs", "vals", "quant_params", "shard_metadata"]:
-                            key = name + suffix
-                            if key in src_sd:
-                                val = src_sd.pop(key, None)
-                                if torch.is_tensor(val):
-                                    del val
-                    except Exception:
-                        pass
-
         # ------- distribute/broadcast directly into p.grad, step, then free -------
         if isinstance(p, DT):
             # DTensor param: scatter shards from master
@@ -615,33 +601,16 @@ def outer_step(
                 torch.cuda.empty_cache()
                 continue
 
-            # Log memory before distribute_tensor for hybrid TP+FSDP debugging
-            if is_master and torch.cuda.is_available():
-                mem_before_dist = torch.cuda.memory_allocated(device) / 1024**3
-                tplr.logger.debug(f"[DIAG] Before distribute_tensor({name}): {mem_before_dist:.2f} GB")
-
             new_grad = distribute_tensor(
                 src_tensor,
                 device_mesh=p.device_mesh,
                 placements=p.placements,
                 src_data_rank=src_rank,
             )
-
-            # Log memory after distribute_tensor
-            if is_master and torch.cuda.is_available():
-                mem_after_dist = torch.cuda.memory_allocated(device) / 1024**3
-                mem_delta = mem_after_dist - mem_before_dist
-                if abs(mem_delta) > 0.1:  # Only log if change > 100MB
-                    tplr.logger.debug(f"[DIAG] After distribute_tensor({name}): {mem_after_dist:.2f} GB (delta: {mem_delta:+.2f} GB)")
-
             # master no longer needs the full dense grad
             if on_src:
                 del full_grad_src
                 full_grad_src = None
-
-            # CRITICAL: Delete src_tensor immediately after distribute_tensor
-            # In hybrid TP+FSDP, this may hold the full parameter and not be freed automatically
-            del src_tensor
 
             # quick sanity (view, no extra big alloc)
             local_view = new_grad.to_local()
@@ -711,44 +680,8 @@ def outer_step(
 
     # Extra safety: ensure no grads are left allocated
     optimizer.zero_grad(set_to_none=True)
-
-    # CRITICAL: Explicitly delete source state dict on master rank
-    # In hybrid TP+FSDP, src_sd contains full uncompressed gradients that must be freed
-    if on_src and src_sd is not None:
-        # Delete all tensors in src_sd
-        for key in list(src_sd.keys()):
-            val = src_sd[key]
-            if torch.is_tensor(val):
-                del val
-            src_sd[key] = None
-        src_sd.clear()
-        del src_sd
-
-    # Log memory before cleanup
-    if is_master and torch.cuda.is_available():
-        mem_before_cleanup = torch.cuda.memory_allocated(device) / 1024**3
-        tplr.logger.info(f"[DIAG] outer_step: Before cleanup: {mem_before_cleanup:.2f} GB")
-
-    # Force synchronization to ensure all FSDP operations complete
-    if ddp and torch.cuda.is_available():
-        torch.cuda.synchronize()
-        # Barrier to ensure all ranks finish before cleanup
-        dist.barrier()
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Force garbage collection after outer step in hybrid TP+FSDP mode
-        # This helps free DTensor temporaries that may not be freed immediately
-        if world_size > 1:
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    # Log memory after cleanup
-    if is_master and torch.cuda.is_available():
-        mem_after_cleanup = torch.cuda.memory_allocated(device) / 1024**3
-        mem_freed = mem_before_cleanup - mem_after_cleanup
-        tplr.logger.info(f"[DIAG] outer_step: After cleanup: {mem_after_cleanup:.2f} GB (freed: {mem_freed:.2f} GB)")
 
     # Compute final fingerprint (master rank only)
     if on_src and fingerprint is not None:
