@@ -605,9 +605,39 @@ class Miner(BaseNode, Trainer):
             else:
                 tplr.logger.info("Start accumulating...")
 
+            # Log state before inner_steps
+            if torch.cuda.is_available():
+                mem_before_train = torch.cuda.memory_allocated(self.device) / 1024**3
+                tplr.logger.info(
+                    f"[DIAG] Before inner_steps: GPU mem = {mem_before_train:.2f} GB"
+                )
+
+            # Log optimizer state
+            if hasattr(self, "inner_optimizer"):
+                opt_on_cpu = getattr(self, "_inner_opt_offloaded", False)
+                tplr.logger.info(
+                    f"[DIAG] Inner optimizer offloaded to CPU: {opt_on_cpu}"
+                )
+
+            # Log sampler info
+            if hasattr(self.sampler, "grad_accum_steps"):
+                tplr.logger.info(
+                    f"[DIAG] Sampler grad_accum_steps: {self.sampler.grad_accum_steps}"
+                )
+            tplr.logger.info(
+                f"[DIAG] Global step: {self.global_step}, Window: {step_window}, Null round: {null_round}"
+            )
+
             res = await self.inner_steps(
                 loader=self.loader, step_window=step_window, null_round=null_round
             )
+
+            # Log state after inner_steps
+            if torch.cuda.is_available():
+                mem_after_train = torch.cuda.memory_allocated(self.device) / 1024**3
+                tplr.logger.info(
+                    f"[DIAG] After inner_steps: GPU mem = {mem_after_train:.2f} GB"
+                )
 
             # Restore parameters from CPU after inner_steps
             restore_start = time.time()
@@ -920,6 +950,13 @@ class Miner(BaseNode, Trainer):
             torch.cuda.synchronize()
             update_start = tplr.T()
 
+            # Log memory state before outer step
+            if torch.cuda.is_available():
+                mem_before = torch.cuda.memory_allocated(self.device) / 1024**3
+                tplr.logger.info(
+                    f"[DIAG] Before outer_step: GPU mem = {mem_before:.2f} GB"
+                )
+
             # Only perform outer step and increment counter if we have gradients to apply
             stats = None
             if should_update:
@@ -928,6 +965,15 @@ class Miner(BaseNode, Trainer):
                     1  # Increment only when we actually do an outer step
                 )
                 model_update_time = tplr.T() - update_start
+
+                # Log memory state after outer step
+                if torch.cuda.is_available():
+                    mem_after = torch.cuda.memory_allocated(self.device) / 1024**3
+                    mem_delta = mem_after - mem_before
+                    tplr.logger.info(
+                        f"[DIAG] After outer_step: GPU mem = {mem_after:.2f} GB (delta: {mem_delta:+.2f} GB)"
+                    )
+
                 if stats is not None and self.is_master:
                     tplr.logger.info(
                         f"{tplr.P(step_window, model_update_time)} Updated model (Outer step #{self.global_step}) | "
