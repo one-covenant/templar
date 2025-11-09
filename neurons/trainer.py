@@ -133,6 +133,14 @@ class Trainer:
         self.inner_scheduler = self.get_inner_scheduler()
         self.inner_scheduler_step_count = 0  # Track scheduler steps for flatten window
 
+        # Get warmup_inner_steps from config
+        optimizer_config = getattr(self.hparams, "optimizer", {})
+        optimizer_type = optimizer_config.get("type", "adamw").lower()
+        opt_config = optimizer_config.get(optimizer_type, {})
+        scheduler_config = opt_config.get("scheduler", {})
+        self.warmup_inner_steps = scheduler_config.get("warmup_inner_steps", 0)
+        self.warmup_steps_taken = 0  # Track warmup steps from restart/init
+
         tplr.logger.info("[Init] optimizers & schedulers constructed")
         return
 
@@ -864,11 +872,33 @@ class Trainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                         if not null_round:
+                            # Apply warmup LR scaling if we're in warmup period
+                            original_lrs = []
+                            if self.warmup_steps_taken < self.warmup_inner_steps:
+                                warmup_scale = (
+                                    self.warmup_steps_taken + 1
+                                ) / self.warmup_inner_steps
+                                for param_group in self.inner_optimizer.param_groups:
+                                    original_lrs.append(param_group["lr"])
+                                    param_group["lr"] = param_group["lr"] * warmup_scale
+
                             # Unscale, clip, then step via GradScaler if using fp16
                             self.scaler.unscale_(self.inner_optimizer)
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                             self.scaler.step(self.inner_optimizer)
                             self.scaler.update()
+
+                            # Restore original LR after warmup scaling
+                            if self.warmup_steps_taken < self.warmup_inner_steps:
+                                for i, param_group in enumerate(
+                                    self.inner_optimizer.param_groups
+                                ):
+                                    param_group["lr"] = original_lrs[i]
+
+                            # Increment warmup counter
+                            if self.warmup_steps_taken < self.warmup_inner_steps:
+                                self.warmup_steps_taken += 1
+
                             # Step scheduler unless we're in flatten window
                             if not self.should_skip_scheduler_step():
                                 self.inner_scheduler.step()
