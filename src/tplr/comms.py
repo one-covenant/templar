@@ -1800,12 +1800,15 @@ class Comms(ChainManager):
                                 )
                                 valid_response = False
                                 break
-                            # totalks stores integers, not tensors
-                            totalk = (
-                                totalk_value
-                                if isinstance(totalk_value, int)
-                                else totalk_value.numel()
-                            )
+                            # totalks can be integers, tensors, or dicts (new format: {"local": ..., "global": ...})
+                            if isinstance(totalk_value, int):
+                                totalk = totalk_value
+                            elif isinstance(totalk_value, dict):
+                                # Extract from dict format: prefer "global", fallback to "local"
+                                totalk = totalk_value.get("global", totalk_value.get("local"))
+                            else:
+                                # Assume it's a tensor
+                                totalk = totalk_value.numel()
                             # Get corresponding vals tensor for 12-bit unpacking
                             vals_tensor = state_dict_resp.get(base_name + "vals", None)
                             try:
