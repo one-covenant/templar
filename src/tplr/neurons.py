@@ -331,15 +331,7 @@ def outer_step(
     Returns:
       Fingerprint dict containing gradient statistics (master rank only), or None.
     """
-    if is_master:
-        tplr.logger.info(f"[DIAG] outer_step: model.training={model.training}")
-
     model.train()
-
-    if is_master:
-        tplr.logger.info(
-            f"[DIAG] outer_step: after model.train(), model.training={model.training}"
-        )
 
     # Free any existing grads entirely (do not allocate zeros)
     optimizer.zero_grad(set_to_none=True)

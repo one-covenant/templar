@@ -693,29 +693,7 @@ class Trainer:
 
         # --- Prefetch inner optimizer states back to GPU, if they were offloaded ---
         # Do this once per window, not per micro-batch.
-        if self.is_master:
-            was_offloaded = getattr(self, "_inner_opt_offloaded", False)
-            tplr.logger.info(
-                f"[DIAG] Starting inner_steps, optimizer offloaded: {was_offloaded}"
-            )
-            tplr.logger.info(
-                f"[DIAG] inner_steps: model.training={self.model.training}"
-            )
-
-        self.model.train()  # Ensure model is in training mode
-
-        if self.is_master:
-            tplr.logger.info(
-                f"[DIAG] inner_steps: after model.train(), model.training={self.model.training}"
-            )
-
         self.prefetch_inner_optimizer_states()
-
-        if self.is_master:
-            now_offloaded = getattr(self, "_inner_opt_offloaded", False)
-            tplr.logger.info(
-                f"[DIAG] After prefetch, optimizer offloaded: {now_offloaded}"
-            )
 
         # Initialize profiler if config is available (from BaseNode)
         prof_config = getattr(self, "_prof_config", None)
@@ -804,15 +782,6 @@ class Trainer:
                 # 3. Forward + backward
                 # ------------------------------------------------------------------ #
                 forward_start = time.time()
-
-                # Log memory before forward pass on first batch
-                if batch_count == 0 and self.is_master:
-                    if torch.cuda.is_available():
-                        mem = torch.cuda.memory_allocated(self.device) / 1024**3
-                        tplr.logger.info(
-                            f"[DIAG] Before first forward: GPU mem = {mem:.2f} GB"
-                        )
-
                 with tp.record_function("Forward Pass") if prof else nullcontext():
                     with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                         outputs = self.model(input_ids, labels)
@@ -822,19 +791,6 @@ class Trainer:
                     loss = calculated_loss / self.sampler.grad_accum_steps
                     loss_item = calculated_loss.detach().item()
                 forward_time = time.time() - forward_start
-
-                # Log if forward time is unusually long or on first few batches
-                if self.is_master and (forward_time > 50.0 or batch_count < 3):
-                    if torch.cuda.is_available():
-                        mem = torch.cuda.memory_allocated(self.device) / 1024**3
-                        if forward_time > 50.0:
-                            tplr.logger.warning(
-                                f"[DIAG] Slow forward pass ({forward_time:.2f}s)! GPU mem = {mem:.2f} GB, batch_size = {local_bs}, seq_len = {input_ids.shape[1]}"
-                            )
-                        else:
-                            tplr.logger.info(
-                                f"[DIAG] Batch {batch_count} forward: {forward_time:.2f}s, GPU mem = {mem:.2f} GB, batch_size = {local_bs}, seq_len = {input_ids.shape[1]}"
-                            )
 
                 # -------------------------------------------------------------- #
                 # 3-a.  Back-prop with no_sync() on non-final micro-batches
@@ -864,12 +820,6 @@ class Trainer:
 
                 batch_count += 1
                 window_changed = self.current_window != step_window
-
-                # Log if window changes during training
-                if window_changed and self.is_master:
-                    tplr.logger.warning(
-                        f"[DIAG] Window changed during training! step_window={step_window}, current_window={self.current_window}, batch_count={batch_count}"
-                    )
 
                 # ------------------------------------------------------------------ #
                 # 4. Decide *together* whether to take an optimiser step

@@ -1805,9 +1805,7 @@ class Comms(ChainManager):
                                 totalk = totalk_value
                             elif isinstance(totalk_value, dict):
                                 # Extract from dict format: prefer "global", fallback to "local"
-                                totalk = totalk_value.get(
-                                    "global", totalk_value.get("local")
-                                )
+                                totalk = totalk_value.get("global", totalk_value.get("local"))
                             else:
                                 # Assume it's a tensor
                                 totalk = totalk_value.numel()
