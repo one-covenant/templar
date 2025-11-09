@@ -2852,13 +2852,13 @@ async def test_get_peer_list(comms_instance):
 
         # Mock s3_get_object to return peer list data based on the key
         async def mock_s3_get_object(key, **kwargs):
-            if "15" in key:
+            if "peers_15_" in key:
                 return {
                     "peers": [1, 2, 3],
                     "reserve_peers": [4, 5],
                     "first_effective_window": 15,
                 }
-            elif "10" in key:
+            elif "peers_10_" in key:
                 return {
                     "peers": [6, 7],
                     "reserve_peers": [8, 9],
