@@ -34,6 +34,7 @@ from typing import cast
 import bittensor as bt
 import numpy as np
 import torch
+import torch.distributed as dist
 import uvloop
 from torch.amp.grad_scaler import GradScaler
 from torch.distributed.tensor import DTensor as DT
@@ -465,6 +466,20 @@ class Miner(BaseNode, Trainer):
                 await tplr.neurons.update_peers(
                     instance=self, window=step_window, peer_start=peer_start
                 )
+                # Refresh commitments to get updated bucket info for all peers
+                self.comms.commitments = await self.comms.get_commitments()
+
+            # Broadcast peer list from master to all ranks for distributed gather
+            if dist_helper.world_size > 1 and dist_helper.is_distributed():
+                peers_list = [self.comms.peers] if self.is_master else [None]
+                dist.broadcast_object_list(peers_list, src=0)
+                self.comms.peers = peers_list[0]
+
+                if not self.is_master:
+                    tplr.logger.info(
+                        f"[Rank {dist_helper.rank}] Received peers from master: {self.comms.peers}"
+                    )
+
             peer_update_time = tplr.T() - peer_start
 
             # 2. Load data
@@ -702,27 +717,93 @@ class Miner(BaseNode, Trainer):
             gather_time = 0.0
             should_update = True
 
-            if self.is_master:
-                gather_start = tplr.T()
-                tplr.logger.info("Waiting on gather task...")
+            # Check if distributed gather is enabled
+            use_distributed_gather = (
+                getattr(self.hparams, "distributed_gather", False)
+                and dist_helper.world_size > 1
+                and dist_helper.is_distributed()
+            )
+
+            gather_start = tplr.T()
+
+            # Log gather mode
+            if use_distributed_gather:
+                tplr.logger.info(
+                    f"[Rank {dist_helper.rank}] Starting distributed gather from {len(self.comms.peers)} peer(s) (world_size={dist_helper.world_size})"
+                )
+            elif self.is_master:
+                tplr.logger.info(
+                    f"Starting sequential gather from {len(self.comms.peers)} peer(s)"
+                )
+
+            # For distributed gather, all ranks must participate
+            # For sequential gather, only master rank performs the operation
+            if self.is_master or use_distributed_gather:
                 gather_result = await self.comms.gather_with_reserve(
                     my_uid=self.uid,
                     gather_uids=self.comms.peers,
-                    reserve_uids=self.comms.reserve_peers,
+                    reserve_uids=[],  # Miners don't use reserve peers
+                    return_partials=use_distributed_gather,  # Return partials for distributed, merged for sequential
                     window=step_window,
                     key="gradient",
                     timeout=90,
                     device=str(self.device),
                     local=False,
-                    stale_retention=100,
                     totalks=self.totalks,
                     compressor=self.compressor,
                     time_min=time_min,
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
                 )
-                tplr.logger.info("Gather task completed!")
                 gather_time = tplr.T() - gather_start
+
+                # Log gather completion
+                if use_distributed_gather:
+                    if gather_result is not None:
+                        # Handle both partials (list) and merged result (SimpleNamespace)
+                        if isinstance(gather_result, list):
+                            # Count total UIDs across all partials
+                            all_uids = set()
+                            for partial in gather_result:
+                                if partial is not None and hasattr(partial, "uids"):
+                                    all_uids.update(partial.uids)
+                            num_successful = len(all_uids)
+                            num_skipped = len(self.comms.peers) - num_successful
+                            success_rate = (
+                                num_successful / len(self.comms.peers)
+                                if self.comms.peers
+                                else 0.0
+                            )
+
+                            tplr.logger.info(
+                                f"[Rank {dist_helper.rank}] Distributed gather complete: {num_successful}/{len(self.comms.peers)} successful, "
+                                f"{num_skipped} skipped, success_rate={success_rate:.2%} across {len(gather_result)} partials, "
+                                f"time={gather_time:.2f}s"
+                            )
+                        else:
+                            tplr.logger.info(
+                                f"[Rank {dist_helper.rank}] Distributed gather complete: {len(gather_result.uids)}/{len(self.comms.peers)} successful, "
+                                f"{len(gather_result.skipped_uids)} skipped, success_rate={gather_result.success_rate:.2%}, "
+                                f"time={gather_time:.2f}s"
+                            )
+                    else:
+                        tplr.logger.warning(
+                            f"[Rank {dist_helper.rank}] Distributed gather failed - no gradients collected from peers"
+                        )
+                else:
+                    # Sequential gather logging (master only)
+                    if gather_result is not None:
+                        tplr.logger.info(
+                            f"Sequential gather complete: {len(gather_result.uids)}/{len(self.comms.peers)} successful, "
+                            f"{len(gather_result.skipped_uids)} skipped, "
+                            f"success_rate={gather_result.success_rate:.2%}, "
+                            f"time={gather_time:.2f}s"
+                        )
+                    else:
+                        tplr.logger.warning(
+                            "Sequential gather failed - no gradients collected from peers"
+                        )
+
                 should_update = gather_result is not None
 
             # Broadcast whether we should update to all ranks
@@ -801,12 +882,26 @@ class Miner(BaseNode, Trainer):
 
                 # Add successful peers information
                 if gather_result is not None:
+                    # Handle both partials (list) and merged result (SimpleNamespace)
+                    if isinstance(gather_result, list):
+                        # Extract UIDs from all partials
+                        all_uids = []
+                        all_skipped = []
+                        for partial in gather_result:
+                            if partial is not None:
+                                all_uids.extend(getattr(partial, "uids", []))
+                                all_skipped.extend(getattr(partial, "skipped_uids", []))
+                        successful_uids = set(all_uids)
+                        skipped_uids = set(all_skipped)
+                    else:
+                        # Single merged result
+                        successful_uids = set(getattr(gather_result, "uids", []))
+                        skipped_uids = set(getattr(gather_result, "skipped_uids", []))
+
                     debug_dict["successful_peers"] = sorted(
-                        list(set(self.comms.peers) - set(gather_result.skipped_uids))
+                        list(set(self.comms.peers) - skipped_uids)
                     )
-                    debug_dict["skipped_peers"] = sorted(
-                        list(gather_result.skipped_uids)
-                    )
+                    debug_dict["skipped_peers"] = sorted(list(skipped_uids))
 
                 # Store the debug dictionary
                 await self.comms.put(
@@ -841,9 +936,31 @@ class Miner(BaseNode, Trainer):
                     sum(momentum_norms) / len(momentum_norms) if momentum_norms else 0
                 )
                 window_total_time = tplr.T() - window_start
-                gather_success_rate = (
-                    gather_result.success_rate * 100 if gather_result else 0.0
-                )
+
+                # Calculate success rate and extract skipped UIDs (handle both list and SimpleNamespace)
+                if gather_result is None:
+                    gather_success_rate = 0.0
+                    skipped_uids_list = []
+                elif isinstance(gather_result, list):
+                    # Extract UIDs from all partials
+                    total_uids = 0
+                    total_skipped = 0
+                    skipped_uids_list = []
+                    for partial in gather_result:
+                        if partial is not None:
+                            total_uids += len(getattr(partial, "uids", []))
+                            partial_skipped = getattr(partial, "skipped_uids", [])
+                            total_skipped += len(partial_skipped)
+                            skipped_uids_list.extend(partial_skipped)
+                    total_attempted = total_uids + total_skipped
+                    gather_success_rate = (
+                        (total_uids / total_attempted * 100)
+                        if total_attempted > 0
+                        else 0.0
+                    )
+                else:
+                    gather_success_rate = gather_result.success_rate * 100
+                    skipped_uids_list = list(getattr(gather_result, "skipped_uids", []))
                 inner_lr = self.inner_scheduler.get_last_lr()[0]
 
                 # Only log to WandB when we've performed an outer step
@@ -907,9 +1024,7 @@ class Miner(BaseNode, Trainer):
                         "n_gather_peers": int(len(self.comms.peers)),
                         "gather_success_rate": gather_success_rate,
                         "gather_peers": json.dumps(self.comms.peers),
-                        "skipped_peers": json.dumps(
-                            gather_result.skipped_uids if gather_result else []
-                        ),
+                        "skipped_peers": json.dumps(skipped_uids_list),
                         "window_total_time": window_total_time,
                         "peer_update_time": peer_update_time,
                         "compression_time": compression_time,

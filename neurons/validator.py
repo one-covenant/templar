@@ -89,6 +89,50 @@ def timer(name: str, wandb_obj=None, step=None, metrics_logger=None):
 
 class Validator(BaseNode, Trainer):
     # ────────────────────────────────────────────────────────────────────
+    # Helper methods for handling partials vs merged gather results
+    # ────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _get_uids_from_gather_result(gather_result) -> list[int]:
+        """Extract UIDs from either partials (list) or merged result (SimpleNamespace)."""
+        if isinstance(gather_result, list):
+            # Combine UIDs from all partials
+            all_uids = []
+            for partial in gather_result:
+                if partial is not None:
+                    all_uids.extend(getattr(partial, "uids", []))
+            return all_uids
+        else:
+            return list(getattr(gather_result, "uids", []))
+
+    @staticmethod
+    def _get_skipped_uids_from_gather_result(gather_result) -> list[int]:
+        """Extract skipped UIDs from either partials (list) or merged result (SimpleNamespace)."""
+        if isinstance(gather_result, list):
+            # Combine skipped UIDs from all partials
+            all_skipped = []
+            for partial in gather_result:
+                if partial is not None:
+                    all_skipped.extend(getattr(partial, "skipped_uids", []))
+            return list(set(all_skipped))  # Deduplicate
+        else:
+            return list(getattr(gather_result, "skipped_uids", []))
+
+    @staticmethod
+    def _get_success_rate_from_gather_result(gather_result) -> float:
+        """Calculate success rate from either partials (list) or merged result (SimpleNamespace)."""
+        if isinstance(gather_result, list):
+            total_uids = len(Validator._get_uids_from_gather_result(gather_result))
+            total_skipped = len(
+                Validator._get_skipped_uids_from_gather_result(gather_result)
+            )
+            total_attempted = total_uids + total_skipped
+            if total_attempted == 0:
+                return 0.0
+            return total_uids / total_attempted
+        else:
+            return float(getattr(gather_result, "success_rate", 0.0))
+
+    # ────────────────────────────────────────────────────────────────────
     # Offload / reload aggregated gather results (CPU pinning helpers)
     # ────────────────────────────────────────────────────────────────────
     def offload_gather_results(self, gather_result, *, log: bool = True) -> None:
@@ -928,6 +972,13 @@ class Validator(BaseNode, Trainer):
             # In OpenSkill, ranks start at 1 (best) and increase for worse performers
             scores = [self.current_window_scores[uid] for uid in window_uids]
 
+            # Ensure all UIDs have ratings initialized before rating
+            for uid in window_uids:
+                if uid not in self.openskill_ratings:
+                    self.openskill_ratings[uid] = self.openskill_model.rating(
+                        name=str(uid)
+                    )
+
             # Create teams list for OpenSkill
             teams = [[self.openskill_ratings[uid]] for uid in window_uids]
 
@@ -1338,6 +1389,25 @@ class Validator(BaseNode, Trainer):
                 # Non-master ranks don't need eval_peers
                 self.eval_peers = {}
 
+            # Broadcast peers list from master to all ranks (needed for distributed gather)
+            if dist_helper.world_size > 1 and dist_helper.is_distributed():
+                peers_list = (
+                    [self.comms.peers, self.comms.reserve_peers]
+                    if self.is_master
+                    else [None, None]
+                )
+                dist.broadcast_object_list(peers_list, src=0)
+                self.comms.peers = peers_list[0]
+                self.comms.reserve_peers = peers_list[1]
+
+                if not self.is_master:
+                    tplr.log_with_context(
+                        level="info",
+                        message=f"[Rank {dist_helper.rank}] Received peers from master: gather={self.comms.peers}, reserve={self.comms.reserve_peers}",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+
             if self.is_master:
                 tplr.log_with_context(
                     level="info",
@@ -1379,7 +1449,11 @@ class Validator(BaseNode, Trainer):
                 # Apply penalties to all inactive peers
                 _ = self.penalize_inactive_peers()
 
-                sync_block = (self.sync_window + 1) * self.hparams.blocks_per_window
+            # Calculate time window for gather (needed by all ranks for distributed gather)
+            sync_block = (self.sync_window + 1) * self.hparams.blocks_per_window
+
+            # Only master queries timestamp, then broadcasts to all ranks
+            if self.is_master:
                 ts_value = self.query_block_timestamp(sync_block)
                 if ts_value is None:
                     tplr.log_with_context(
@@ -1389,11 +1463,22 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                     )
                     ts_value = time.time()
-                time_min = datetime.fromtimestamp(ts_value, tz=timezone.utc)
-                time_max = time_min + timedelta(
-                    seconds=self.hparams.time_window_delta_seconds
-                )
+            else:
+                ts_value = 0.0
 
+            # Broadcast timestamp from master to all ranks
+            ts_tensor = torch.tensor(
+                [ts_value], dtype=torch.float64, device=self.device
+            )
+            dist_helper.broadcast(ts_tensor, src=0)
+            ts_value = float(ts_tensor.item())
+
+            time_min = datetime.fromtimestamp(ts_value, tz=timezone.utc)
+            time_max = time_min + timedelta(
+                seconds=self.hparams.time_window_delta_seconds
+            )
+
+            if self.is_master:
                 # Log the time window we're using
                 tplr.log_with_context(
                     level="info",
@@ -1444,12 +1529,38 @@ class Validator(BaseNode, Trainer):
             gather_result = None
             skip_window = False
 
-            # Only master rank performs the gather operation
-            if self.is_master:
+            # Check if distributed gather is enabled
+            use_distributed_gather = (
+                getattr(self.hparams, "distributed_gather", False)
+                and dist_helper.world_size > 1
+                and dist_helper.is_distributed()
+            )
+
+            # Log gather mode
+            if use_distributed_gather:
+                tplr.log_with_context(
+                    level="info",
+                    message=f"[Rank {dist_helper.rank}] Starting distributed gather from {len(self.comms.peers)} peer(s) (world_size={dist_helper.world_size})",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
+            elif self.is_master:
+                tplr.log_with_context(
+                    level="info",
+                    message=f"Starting sequential gather from {len(self.comms.peers)} peer(s)",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
+
+            # For distributed gather, all ranks must participate
+            # For sequential gather, only master rank performs the operation
+            if self.is_master or use_distributed_gather:
+                # Request partials for incremental processing in outer_step
                 gather_result = await self.comms.gather_with_reserve(
                     my_uid=self.uid,
                     gather_uids=self.comms.peers,
                     reserve_uids=self.comms.reserve_peers,
+                    return_partials=use_distributed_gather,  # Return partials for distributed, merged for sequential
                     window=self.sync_window,
                     key="gradient",
                     timeout=90,
@@ -1462,6 +1573,45 @@ class Validator(BaseNode, Trainer):
                     expected_compressed_params=self.expected_compressed_params,
                 )
 
+                # Log gather completion
+                if use_distributed_gather:
+                    if gather_result is not None:
+                        # Handle both partials (list) and merged result (SimpleNamespace)
+                        # Show quality metrics for both partials and merged results
+                        uids = self._get_uids_from_gather_result(gather_result)
+                        skipped_uids = self._get_skipped_uids_from_gather_result(
+                            gather_result
+                        )
+                        success_rate = self._get_success_rate_from_gather_result(
+                            gather_result
+                        )
+
+                        if isinstance(gather_result, list):
+                            tplr.log_with_context(
+                                level="info",
+                                message=f"[Rank {dist_helper.rank}] Distributed gather complete: {len(uids)}/{len(self.comms.peers)} successful, "
+                                f"{len(skipped_uids)} skipped, success_rate={success_rate:.2%} across {len(gather_result)} partials",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                            )
+                        else:
+                            tplr.log_with_context(
+                                level="info",
+                                message=f"[Rank {dist_helper.rank}] Distributed gather complete: {len(uids)}/{len(self.comms.peers)} successful, "
+                                f"{len(skipped_uids)} skipped, success_rate={success_rate:.2%}",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                            )
+                    else:
+                        tplr.log_with_context(
+                            level="warning",
+                            message=f"[Rank {dist_helper.rank}] Distributed gather failed - no gradients collected",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+
+            # Only master checks and broadcasts skip decision
+            if self.is_master:
                 if gather_result is None:
                     tplr.log_with_context(
                         level="error",
@@ -1494,21 +1644,29 @@ class Validator(BaseNode, Trainer):
 
             # Only master performs additional gather processing
             if self.is_master and gather_result is not None:
-                t = asyncio.create_task(self.upload_gather_results(gather_result))
+                # Merge partials for upload (artifacts need merged format)
+                upload_result = (
+                    self.comms.merge_gather_results(gather_result)
+                    if isinstance(gather_result, list)
+                    else gather_result
+                )
+                t = asyncio.create_task(self.upload_gather_results(upload_result))
                 self._bg_tasks.add(t)
                 t.add_done_callback(self._bg_tasks.discard)
 
                 overlap_start = time.time()
+                # Partial-aware overlap check (works with both partials and merged results)
                 idx_overlap = await tplr.neurons.check_uid_index_overlap(
                     self,
-                    gather_result,
+                    gather_result,  # Can be partials or merged, function handles both
                     self.sync_window,
                     overlap_threshold=self.hparams.idx_overlap_threshold,
                 )
                 overlap_time = time.time() - overlap_start
+                gather_uids = self._get_uids_from_gather_result(gather_result)
                 tplr.log_with_context(
                     level="info",
-                    message=f"check_uid_index_overlap completed in {overlap_time:.3f}s | UIDs checked: {len(gather_result.uids)} | Overlaps found: {len(idx_overlap)}",
+                    message=f"check_uid_index_overlap completed in {overlap_time:.3f}s | UIDs checked: {len(gather_uids)} | Overlaps found: {len(idx_overlap)}",
                     sync_window=self.sync_window,
                     current_window=self.current_window,
                 )
@@ -1526,8 +1684,8 @@ class Validator(BaseNode, Trainer):
                 # Offload aggregated gather results to pinned CPU to free GPU memory
                 self.offload_gather_results(gather_result, log=True)
 
-                skipped_uids = gather_result.skipped_uids
-                success_rate = gather_result.success_rate
+                skipped_uids = self._get_skipped_uids_from_gather_result(gather_result)
+                success_rate = self._get_success_rate_from_gather_result(gather_result)
 
             # Synchronize all ranks after gather processing
             dist_helper.safe_barrier("post_gather", self.local_rank)
@@ -1551,7 +1709,7 @@ class Validator(BaseNode, Trainer):
             gather_peers_with_history = 0
 
             if self.is_master and gather_result is not None:
-                actual_gather_uids = list(gather_result.uids)
+                actual_gather_uids = self._get_uids_from_gather_result(gather_result)
 
                 mean_final_intended = (
                     float(self.final_scores[intended_gather_uids].mean().item())
@@ -1707,6 +1865,7 @@ class Validator(BaseNode, Trainer):
                 # Calculate norms from gather result
                 clip_norm_dict = {}
                 if gather_result is not None:
+                    # compute_peer_val_norms handles both partials and merged results
                     clip_norm_dict = self.compute_peer_val_norms(gather_result)
             else:
                 # Non-master ranks prepare empty structures
@@ -2361,6 +2520,12 @@ class Validator(BaseNode, Trainer):
                 use_dct=self.hparams.use_dct,
                 wandb_run=self.wandb if self.is_master else None,
                 global_step=self.global_step,
+                memory_budget_mb=getattr(
+                    self.hparams, "gradient_memory_budget_mb", None
+                ),
+                batch_size_override=getattr(
+                    self.hparams, "incremental_batch_size", None
+                ),
             )
             self.global_step += 1  # Increment only when we actually do an outer step
 
@@ -3080,16 +3245,21 @@ class Validator(BaseNode, Trainer):
             dict: Synchronization metrics and score
         """
         # Fetch the miner's debug dictionary
-        debug_result = await self.comms.get(
+        debug_result = await self.comms.get_with_retry(
             uid=str(eval_uid),
-            window=self.sync_window - 1,
+            window=self.sync_window,
             key="debug",
+            timeout=20,
             local=False,
             stale_retention=10,
         )
 
-        # Check if we got a valid result
-        if not debug_result.success:
+        # Check if we got a valid result (get_with_retry returns None on timeout)
+        if debug_result is None or not debug_result.success:
+            tplr.logger.warning(
+                f"Failed to fetch debug dict for UID {eval_uid} from window {self.sync_window}: "
+                f"error={getattr(debug_result, 'error', 'unknown')}"
+            )
             return {
                 "success": False,
                 "error": "Failed to retrieve debug dictionary",
@@ -3669,16 +3839,84 @@ class Validator(BaseNode, Trainer):
 
     def compute_peer_val_norms(
         self,
-        gather_result: SimpleNamespace,
+        gather_result: SimpleNamespace | list[SimpleNamespace],
     ) -> dict[str, torch.Tensor]:
-        # clip_norm is basically always true in the repo 8/13/2025
-        # In this case, leave it to refactor later
-        clip_norm = True
+        """
+        Compute median L2 norms across all peers for each parameter.
 
+        Args:
+            gather_result: Either a merged SimpleNamespace or list of partials
+
+        Returns:
+            Dictionary mapping parameter names to median norms
+        """
         clip_norm_dict = {}
-        state_dict = gather_result.state_dict
-        if not state_dict:
-            raise ValueError("Must have gather_result.state_dict to compute norms")
+
+        # Handle both merged results and partials
+        if isinstance(gather_result, list):
+            # Partials: collect vals from all partials for each parameter
+            # Use model's first parameter device as target (typically cuda:0)
+            target_device = next(self.model.parameters()).device
+
+            # Helper to recursively move all tensors to target device
+            def move_to_device_recursive(obj):
+                if torch.is_tensor(obj):
+                    return obj.to(target_device)
+                elif isinstance(obj, dict):
+                    return {k: move_to_device_recursive(v) for k, v in obj.items()}
+                elif isinstance(obj, (list, tuple)):
+                    return type(obj)(move_to_device_recursive(item) for item in obj)
+                else:
+                    return obj
+
+            for n, p in self.model.named_parameters():
+                vals_key = n + "vals"
+                quant_key = n + "quant_params"
+
+                # Collect vals and quant_params from all partials
+                all_vals = []
+                all_quant_params = []
+
+                for partial in gather_result:
+                    # Skip None partials (ranks that gathered 0 peers)
+                    if partial is None:
+                        continue
+
+                    state_dict = partial.state_dict
+                    if not state_dict:
+                        continue
+
+                    vals = getattr(state_dict, vals_key, None)
+                    quant_params = getattr(state_dict, quant_key, None)
+
+                    if vals is not None:
+                        # vals is a list of tensors, one per peer in this partial
+                        # Move all tensors (including nested) to target device
+                        for v in vals:
+                            all_vals.append(move_to_device_recursive(v))
+                        # quant_params is also a list if present
+                        if quant_params is not None:
+                            for qp in quant_params:
+                                all_quant_params.append(move_to_device_recursive(qp))
+
+                if not all_vals:
+                    continue
+
+                # Dequantize all collected values (now all on same device)
+                vals_f32 = self.compressor.maybe_dequantize_values(
+                    all_vals,
+                    all_quant_params if all_quant_params else None,
+                    target_device,
+                )
+
+                # Compute median norm across all peers from all partials
+                norms = torch.stack([torch.norm(v, p=2) for v in vals_f32]).to(p.device)
+                clip_norm_dict[vals_key] = torch.median(norms)
+        else:
+            # Merged result: original logic
+            state_dict = gather_result.state_dict
+            if not state_dict:
+                raise ValueError("Must have gather_result.state_dict to compute norms")
 
         for n, p in self.model.named_parameters():
             vals_key = n + "vals"

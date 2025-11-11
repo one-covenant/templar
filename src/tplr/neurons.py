@@ -19,6 +19,7 @@
 import asyncio
 import gc
 import math
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -42,6 +43,30 @@ if TYPE_CHECKING:
     from neurons.validator import Validator
 
 NeuronT = TypeVar("NeuronT", "Miner", "Validator")
+
+
+def _resolve_cuda_device(device: str | torch.device | None) -> torch.device | None:
+    """Return a torch.device for CUDA operations if available."""
+    if not torch.cuda.is_available():
+        return None
+
+    if device is None:
+        try:
+            current_index = torch.cuda.current_device()
+        except RuntimeError:
+            if torch.cuda.device_count() == 0:
+                return None
+            return torch.device("cuda:0")
+        return torch.device(f"cuda:{current_index}")
+
+    try:
+        resolved = torch.device(device)
+    except (TypeError, ValueError, RuntimeError):
+        if torch.cuda.device_count() == 0:
+            return None
+        return torch.device("cuda:0")
+
+    return resolved if resolved.type == "cuda" else None
 
 
 def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = False):
@@ -226,6 +251,534 @@ def outer_step(
     model: nn.Module,
     optimizer: Optimizer,
     *,
+    gather_result: SimpleNamespace | list[SimpleNamespace] | None,
+    transformer: tplr.compress.ChunkingTransformer,
+    compressor: tplr.compress.TopKCompressor,
+    xshapes: dict,
+    totalks: dict,
+    device: str,
+    is_master: bool,
+    world_size: int,
+    use_dct: bool = False,
+    wandb_run: Run | None = None,
+    global_step: int | None = None,
+    memory_budget_mb: float | None = None,
+    batch_size_override: int | None = None,
+) -> dict | None:
+    """
+    Memory-minimizing variant with incremental partial processing:
+      - Accepts either a single gather_result OR a list of partials
+      - When given partials, processes them in batches to bound memory
+      - Batch size is auto-calculated from memory_budget_mb or manually set
+      - Builds and applies ONE param's grad at a time
+      - Calls optimizer.step() per param (others have grad=None, so they're skipped)
+      - Frees all temporaries and grad immediately after each step
+
+    Args:
+        gather_result: Either a single SimpleNamespace or list of partial results
+        memory_budget_mb: Optional memory budget in MB for auto-calculating batch size
+        batch_size_override: If set, use this batch size instead of auto-calculation
+
+    Returns:
+      Fingerprint dict containing gradient statistics (master rank only), or None.
+    """
+    # Handle list of partials by processing incrementally
+    if isinstance(gather_result, list):
+        return _outer_step_incremental(
+            model=model,
+            optimizer=optimizer,
+            partials=gather_result,
+            transformer=transformer,
+            compressor=compressor,
+            xshapes=xshapes,
+            totalks=totalks,
+            device=device,
+            is_master=is_master,
+            world_size=world_size,
+            use_dct=use_dct,
+            wandb_run=wandb_run,
+            global_step=global_step,
+            memory_budget_mb=memory_budget_mb,
+            batch_size_override=batch_size_override,
+        )
+
+    # Original single-result processing
+    return _outer_step_single(
+        model=model,
+        optimizer=optimizer,
+        gather_result=gather_result,
+        transformer=transformer,
+        compressor=compressor,
+        xshapes=xshapes,
+        totalks=totalks,
+        device=device,
+        is_master=is_master,
+        world_size=world_size,
+        use_dct=use_dct,
+        wandb_run=wandb_run,
+        global_step=global_step,
+        memory_budget_mb=memory_budget_mb,
+    )
+
+
+def _estimate_partial_memory_mb(partial: SimpleNamespace) -> float:
+    """
+    Estimate memory usage of a partial result in MB by measuring actual tensor sizes.
+
+    Args:
+        partial: Partial result from distributed gather
+
+    Returns:
+        Estimated memory in MB
+    """
+    if partial is None:
+        return 0.0
+
+    def _iter_tensors(obj):
+        if isinstance(obj, torch.Tensor):
+            yield obj
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                yield from _iter_tensors(item)
+        elif isinstance(obj, dict):
+            for item in obj.values():
+                yield from _iter_tensors(item)
+        elif isinstance(obj, SimpleNamespace):
+            yield from _iter_tensors(vars(obj))
+
+    total_bytes = 0
+
+    # Measure actual tensor sizes in state_dict (supports NS, dict, lists)
+    if hasattr(partial, "state_dict"):
+        for tensor in _iter_tensors(partial.state_dict):
+            total_bytes += tensor.element_size() * tensor.nelement()
+
+    # Add overhead for device consolidation and accumulation (30% overhead)
+    total_bytes = int(total_bytes * 1.3)
+
+    mb = total_bytes / (1024 * 1024)
+
+    # Log measurement for debugging
+    num_uids = len(getattr(partial, "uids", []))
+    if num_uids > 0 and mb > 0:
+        tplr.logger.debug(
+            f"Measured partial memory: {mb:.1f} MB ({num_uids} UIDs, {mb / num_uids:.1f} MB/UID)"
+        )
+
+    return mb
+
+
+def _calculate_optimal_batch_size(
+    partials: list[SimpleNamespace],
+    memory_budget_mb: float | None,
+    safety_factor: float = 0.7,
+) -> int:
+    """
+    Calculate optimal batch size for processing partials based on memory budget.
+
+    Args:
+        partials: List of partial results
+        memory_budget_mb: Memory budget in MB (None = no batching)
+        safety_factor: Use only this fraction of budget for safety (default: 0.7)
+
+    Returns:
+        Batch size (1 = process one at a time, >1 = process multiple together)
+    """
+    if memory_budget_mb is None or not partials:
+        return 1  # No batching, process one at a time
+
+    # Estimate average partial size
+    valid_partials = [p for p in partials if p is not None]
+    if not valid_partials:
+        return 1
+
+    # Use first few partials to estimate average size
+    sample_size = min(3, len(valid_partials))
+    total_estimated_mb = sum(
+        _estimate_partial_memory_mb(valid_partials[i]) for i in range(sample_size)
+    )
+    avg_partial_mb = total_estimated_mb / sample_size
+
+    if avg_partial_mb <= 0:
+        return 1
+
+    # Calculate how many partials can fit in budget
+    available_budget_mb = memory_budget_mb * safety_factor
+    max_batch_size = int(available_budget_mb / avg_partial_mb)
+
+    # Clamp to reasonable range [1, num_partials]
+    batch_size = max(1, min(max_batch_size, len(valid_partials)))
+
+    tplr.logger.info(
+        f"Calculated batch size: {batch_size} partials "
+        f"(avg {avg_partial_mb:.0f}MB per partial, "
+        f"{available_budget_mb:.0f}MB available of {memory_budget_mb:.0f}MB budget)"
+    )
+
+    return batch_size
+
+
+def _merge_partial_batch(
+    batch: list[SimpleNamespace],
+    device: str,
+) -> SimpleNamespace | None:
+    """
+    Merge a batch of partials into a single temporary merged result.
+
+    Args:
+        batch: List of partial results to merge
+        device: Target device for merged tensors
+
+    Returns:
+        Merged result or None if batch is empty
+    """
+    from tplr.comms import Comms
+
+    if not batch:
+        return None
+
+    # Use existing merge logic
+    merged = Comms.merge_gather_results(batch, target_device=device)
+
+    return merged
+
+
+def _outer_step_incremental(
+    model: nn.Module,
+    optimizer: Optimizer,
+    *,
+    partials: list[SimpleNamespace],
+    transformer: tplr.compress.ChunkingTransformer,
+    compressor: tplr.compress.TopKCompressor,
+    xshapes: dict,
+    totalks: dict,
+    device: str,
+    is_master: bool,
+    world_size: int,
+    use_dct: bool = False,
+    wandb_run: Run | None = None,
+    global_step: int | None = None,
+    memory_budget_mb: float | None = None,
+    batch_size_override: int | None = None,
+) -> dict | None:
+    """
+    Incremental outer step that processes partials in batches.
+
+    This approach bounds memory usage by:
+    1. Batching multiple partials together based on memory budget
+    2. Processing batches in deterministic order (sorted by rank if available)
+    3. Applying all parameters from one batch before moving to next
+    4. Freeing memory after each batch is fully processed
+    5. Accumulating statistics across all partials
+
+    Args:
+        partials: List of partial results from distributed gather
+        memory_budget_mb: Optional memory budget in MB for auto-calculating batch size
+        batch_size_override: If set, use this batch size instead of auto-calculation
+
+    Returns:
+        Combined fingerprint dict from all partials (master rank only), or None.
+    """
+    import gc
+
+    import torch.cuda
+
+    cuda_device = _resolve_cuda_device(device)
+
+    # Calculate optimal batch size based on memory budget
+    if batch_size_override is not None:
+        batch_size = batch_size_override
+        tplr.logger.info(f"Using override batch size: {batch_size} partials per batch")
+    else:
+        batch_size = _calculate_optimal_batch_size(partials, memory_budget_mb)
+
+    # Track applied UIDs to prevent duplicates
+    applied_uids = set()
+
+    # Accumulate fingerprint statistics across all partials
+    combined_fingerprint: dict | None = None
+    if is_master:
+        combined_fingerprint = {
+            "param_norms": {},
+            "param_means": {},
+            "total_norm_sq": 0.0,
+            "total_elements": 0,
+            "partials_processed": 0,
+        }
+
+    # Sort partials deterministically (by rank if available, otherwise by index)
+    def _get_partial_rank(partial: SimpleNamespace) -> int:
+        """Extract rank from partial metadata, default to 0."""
+        if hasattr(partial, "rank"):
+            return partial.rank
+        # Try to infer from metadata
+        if hasattr(partial, "state_dict"):
+            sd = partial.state_dict
+            if isinstance(sd, SimpleNamespace) and hasattr(sd, "metadata"):
+                meta = sd.metadata
+                if isinstance(meta, dict) and "rank" in meta:
+                    return meta["rank"]
+        return 0
+
+    sorted_partials = sorted(enumerate(partials), key=lambda x: _get_partial_rank(x[1]))
+
+    # Filter out None partials
+    valid_partials = [(idx, p) for idx, p in sorted_partials if p is not None]
+
+    if not valid_partials:
+        tplr.logger.warning("No valid partials to process")
+        return combined_fingerprint
+
+    # Track initial memory if budget is specified
+    initial_memory_mb = None
+    if memory_budget_mb is not None and cuda_device is not None:
+        initial_memory_mb = torch.cuda.memory_allocated(cuda_device) / (1024**2)
+
+    # Track failed batches for error recovery
+    failed_partials = []
+
+    # Process partials in batches
+    num_batches = (len(valid_partials) + batch_size - 1) // batch_size
+    tplr.logger.info(
+        f"Processing {len(valid_partials)} partials in {num_batches} batch(es) of size {batch_size}"
+    )
+
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, len(valid_partials))
+        batch_partials = [p for _, p in valid_partials[batch_start:batch_end]]
+
+        # Collect UIDs from this batch to check for duplicates
+        batch_uids = set()
+        for partial in batch_partials:
+            if partial is not None:
+                batch_uids.update(getattr(partial, "uids", []))
+
+        # Check for duplicate UIDs
+        duplicates = applied_uids & batch_uids
+        if duplicates:
+            tplr.logger.warning(
+                f"Skipping batch {batch_idx + 1}: {len(duplicates)} duplicate UIDs"
+            )
+            continue
+
+        # Start processing this batch with error recovery
+        try:
+            batch_start_time = time.time()
+
+            # Merge batch of partials (handles device consolidation even for single partial)
+            merged_batch = _merge_partial_batch(batch_partials, device)
+            if merged_batch is None:
+                tplr.logger.warning(
+                    f"Batch {batch_idx + 1}: Merge returned None, skipping"
+                )
+                continue
+
+            if len(batch_partials) == 1:
+                tplr.logger.debug(
+                    f"Batch {batch_idx + 1}/{num_batches}: Processing single partial "
+                    f"with {len(getattr(merged_batch, 'uids', []))} UIDs"
+                )
+            else:
+                tplr.logger.info(
+                    f"Batch {batch_idx + 1}/{num_batches}: Merged {len(batch_partials)} partials "
+                    f"→ {len(getattr(merged_batch, 'uids', []))} UIDs"
+                )
+
+            # Apply this batch using the single-result logic
+            batch_fingerprint = _outer_step_single(
+                model=model,
+                optimizer=optimizer,
+                gather_result=merged_batch,
+                transformer=transformer,
+                compressor=compressor,
+                xshapes=xshapes,
+                totalks=totalks,
+                device=device,
+                is_master=is_master,
+                world_size=world_size,
+                use_dct=use_dct,
+                wandb_run=None,  # Don't log per-batch, only at the end
+                global_step=None,
+            )
+
+            batch_time = time.time() - batch_start_time
+            tplr.logger.debug(
+                f"Batch {batch_idx + 1}/{num_batches} completed in {batch_time:.2f}s"
+            )
+
+            # Accumulate statistics from this batch
+            if (
+                is_master
+                and batch_fingerprint is not None
+                and combined_fingerprint is not None
+            ):
+                # Merge parameter-level statistics
+                for param_name, norm in batch_fingerprint.get(
+                    "param_norms", {}
+                ).items():
+                    if param_name not in combined_fingerprint["param_norms"]:
+                        combined_fingerprint["param_norms"][param_name] = 0.0
+                    # Accumulate squared norms (will sqrt at the end)
+                    combined_fingerprint["param_norms"][param_name] += norm**2
+
+                for param_name, mean in batch_fingerprint.get(
+                    "param_means", {}
+                ).items():
+                    if param_name not in combined_fingerprint["param_means"]:
+                        combined_fingerprint["param_means"][param_name] = []
+                    combined_fingerprint["param_means"][param_name].append(mean)
+
+                # Accumulate global statistics
+                combined_fingerprint["total_norm_sq"] += batch_fingerprint.get(
+                    "total_norm_sq", 0.0
+                )
+                combined_fingerprint["total_elements"] += batch_fingerprint.get(
+                    "total_elements", 0
+                )
+                combined_fingerprint["partials_processed"] += len(batch_partials)
+
+            # Mark UIDs as applied
+            applied_uids.update(batch_uids)
+
+            # Aggressive memory cleanup after each batch
+            del batch_fingerprint
+            del merged_batch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if cuda_device is not None:
+                    torch.cuda.synchronize(cuda_device)
+                else:
+                    torch.cuda.synchronize()
+
+                # Check memory budget if specified
+                if memory_budget_mb is not None and cuda_device is not None:
+                    current_memory_mb = torch.cuda.memory_allocated(cuda_device) / (
+                        1024**2
+                    )
+                    if current_memory_mb > memory_budget_mb:
+                        tplr.logger.warning(
+                            f"Memory budget exceeded: {current_memory_mb:.0f}MB > {memory_budget_mb:.0f}MB "
+                            f"after batch {batch_idx + 1}/{num_batches}"
+                        )
+        except Exception as e:
+            # Graceful degradation: log error and continue with next batch
+            batch_uids_list = list(batch_uids) if batch_uids else []
+            failed_partials.append(
+                {
+                    "batch_idx": batch_idx,
+                    "num_partials": len(batch_partials),
+                    "uids": batch_uids_list,
+                    "error": str(e),
+                }
+            )
+            tplr.logger.error(
+                f"Failed to process batch {batch_idx + 1}/{num_batches} "
+                f"({len(batch_partials)} partials, {len(batch_uids_list)} UIDs): {e}. "
+                f"Continuing with next batch..."
+            )
+            # Continue to next batch without breaking the loop
+            continue
+
+    # Log summary of failed batches if any
+    if failed_partials:
+        total_failed_uids = sum(len(f["uids"]) for f in failed_partials)
+        tplr.logger.warning(
+            f"❌ {len(failed_partials)} batch(es) failed to process "
+            f"({total_failed_uids} UIDs affected)"
+        )
+        for f in failed_partials:
+            tplr.logger.warning(
+                f"  Batch {f['batch_idx'] + 1}: {f['num_partials']} partials, "
+                f"{len(f['uids'])} UIDs - {f['error']}"
+            )
+
+    # Finalize combined fingerprint
+    if is_master and combined_fingerprint is not None:
+        # Compute final norms (sqrt of accumulated squared norms)
+        for param_name in combined_fingerprint["param_norms"]:
+            combined_fingerprint["param_norms"][param_name] = math.sqrt(
+                combined_fingerprint["param_norms"][param_name]
+            )
+
+        # Average the means
+        for param_name in combined_fingerprint["param_means"]:
+            means_list = combined_fingerprint["param_means"][param_name]
+            combined_fingerprint["param_means"][param_name] = sum(means_list) / len(
+                means_list
+            )
+
+        # Compute global L2 norm
+        combined_fingerprint["global_l2_norm"] = math.sqrt(
+            combined_fingerprint["total_norm_sq"]
+        )
+
+        # Add metadata
+        combined_fingerprint["total_uids_applied"] = len(applied_uids)
+
+        # Log completion summary
+        tplr.logger.info(
+            f"Applied gradients from {len(applied_uids)} UIDs "
+            f"(processed {combined_fingerprint['partials_processed']} partials incrementally)"
+        )
+
+        # Log failed batches if any (already logged above at lines 618-629, but keep for backwards compat)
+        # Note: failed_partials now contains batch info, not individual partials
+
+        # Always log memory usage if budget is configured
+        final_memory_mb = None
+        utilization_pct = None
+        budget_exceeded = None
+
+        if memory_budget_mb is not None and cuda_device is not None:
+            final_memory_mb = torch.cuda.memory_allocated(cuda_device) / (1024**2)
+            utilization_pct = (
+                (final_memory_mb / memory_budget_mb * 100)
+                if memory_budget_mb > 0
+                else 0
+            )
+            budget_exceeded = 0 if final_memory_mb > memory_budget_mb else 1
+
+            if final_memory_mb > memory_budget_mb:
+                tplr.logger.warning(
+                    f"⚠️  GPU Memory: {final_memory_mb:.0f}MB / {memory_budget_mb:.0f}MB "
+                    f"({utilization_pct:.0f}% - EXCEEDED by {final_memory_mb - memory_budget_mb:.0f}MB)"
+                )
+            else:
+                tplr.logger.info(
+                    f"GPU Memory: {final_memory_mb:.0f}MB / {memory_budget_mb:.0f}MB "
+                    f"({utilization_pct:.0f}% utilized)"
+                )
+
+        # Log to W&B if requested
+        if wandb_run is not None and global_step is not None:
+            wandb_metrics = {
+                "outer_step/partials_processed": combined_fingerprint[
+                    "partials_processed"
+                ],
+                "outer_step/unique_uids_applied": len(applied_uids),
+            }
+
+            # Add memory metrics if available
+            if final_memory_mb is not None:
+                wandb_metrics.update(
+                    {
+                        "outer_step/gpu_memory_allocated_mb": final_memory_mb,
+                        "outer_step/memory_budget_utilization_percent": utilization_pct,
+                        "outer_step/memory_budget_violation": budget_exceeded,
+                    }
+                )
+
+            wandb_run.log(wandb_metrics, step=global_step)
+
+    return combined_fingerprint
+
+
+def _outer_step_single(
+    model: nn.Module,
+    optimizer: Optimizer,
+    *,
     gather_result: SimpleNamespace | None,
     transformer: tplr.compress.ChunkingTransformer,
     compressor: tplr.compress.TopKCompressor,
@@ -237,8 +790,11 @@ def outer_step(
     use_dct: bool = False,
     wandb_run: Run | None = None,
     global_step: int | None = None,
+    memory_budget_mb: float | None = None,
 ) -> dict | None:
     """
+    Original single-result outer step implementation.
+
     Memory-minimizing variant:
       - Builds and applies ONE param's grad at a time.
       - Calls optimizer.step() per param (others have grad=None, so they're skipped).
@@ -255,6 +811,7 @@ def outer_step(
     ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
     src_rank = 0
     on_src = is_master or not ddp
+    cuda_device = _resolve_cuda_device(device)
 
     # Only master reads aggregated payload (others rely on broadcasts).
     # Accept both SimpleNamespace and plain dict payloads.
@@ -472,6 +1029,38 @@ def outer_step(
     # Compute final fingerprint (master rank only)
     if on_src and fingerprint is not None:
         fingerprint["global_l2_norm"] = math.sqrt(fingerprint["total_norm_sq"])
+
+    # Log memory metrics if budget is configured (same as incremental path)
+    if on_src and memory_budget_mb is not None and cuda_device is not None:
+        final_memory_mb = torch.cuda.memory_allocated(cuda_device) / (1024**2)
+        utilization_pct = (
+            (final_memory_mb / memory_budget_mb * 100) if memory_budget_mb > 0 else 0
+        )
+        budget_exceeded = 0 if final_memory_mb > memory_budget_mb else 1
+
+        if final_memory_mb > memory_budget_mb:
+            tplr.logger.warning(
+                f"⚠️  GPU Memory: {final_memory_mb:.0f}MB / {memory_budget_mb:.0f}MB "
+                f"({utilization_pct:.0f}% - EXCEEDED by {final_memory_mb - memory_budget_mb:.0f}MB)"
+            )
+        else:
+            tplr.logger.info(
+                f"GPU Memory: {final_memory_mb:.0f}MB / {memory_budget_mb:.0f}MB "
+                f"({utilization_pct:.0f}% utilized)"
+            )
+
+        # Add memory metrics to WandB
+        if wandb_run is not None and global_step is not None:
+            wandb_run.log(
+                {
+                    "outer_step/gpu_memory_allocated_mb": final_memory_mb,
+                    "outer_step/memory_budget_utilization_percent": utilization_pct,
+                    "outer_step/memory_budget_violation": budget_exceeded,
+                },
+                step=global_step,
+            )
+
+    if on_src and fingerprint is not None:
         return fingerprint
     return None
 
@@ -1006,7 +1595,7 @@ async def catchup_with_aggregation_server(
         if instance.is_master and (start_w - checkpoint_current_window) % 5 == 0:
             log_memory_usage(f"After window {start_w} cleanup")
         # ──────────────────────────────────────────────────────────────────────
-        # 3) Debug‑dict comparison to estimate “how many steps behind” we are
+        # 3) Debug‑dict comparison to estimate "how many steps behind" we are
         # ──────────────────────────────────────────────────────────────────────
         try:
             if instance.is_master:
@@ -1148,13 +1737,19 @@ async def compare_model_with_debug_dict(
         param_count += abs_vec.numel()
 
         # --- element-wise steps-behind -----------------------------------
+        # Use learning_rate as the baseline step size for more stable comparison
+        # param_avg_change can be very small when model is converged, leading to inflated step ratios
         if param_avg_change and name in param_avg_change:
-            step_vec = torch.clamp(
-                param_avg_change[name].to(curr_slice.device), min=min_step_size
-            )
-            if step_vec.numel() != abs_vec.numel():
+            # Take the maximum of param_avg_change and learning_rate to avoid division by tiny numbers
+            param_change_vec = param_avg_change[name].to(curr_slice.device)
+            if param_change_vec.numel() != abs_vec.numel():
                 # fallback if stored slice has wrong length
                 step_vec = abs_vec.new_full(abs_vec.size(), learning_rate)
+            else:
+                # Use max of param_avg_change and learning_rate for stability
+                step_vec = torch.maximum(
+                    param_change_vec, abs_vec.new_full(abs_vec.size(), learning_rate)
+                )
         else:
             step_vec = abs_vec.new_full(abs_vec.size(), learning_rate)
 
@@ -1199,7 +1794,7 @@ async def compare_model_with_debug_dict(
 @torch.no_grad()
 async def check_uid_index_overlap(
     neuron: NeuronT,
-    gather_result: SimpleNamespace,
+    gather_result: SimpleNamespace | list[SimpleNamespace],
     window: int,
     *,
     overlap_threshold: float = 0.90,
@@ -1208,10 +1803,36 @@ async def check_uid_index_overlap(
     For every peer-pair compute the per-chunk *set* overlap of their top-k index
     lists on each parameter.  A pair is flagged **only if the size-weighted
     average across *all* checked parameters** is ≥ `overlap_threshold`.
+
+    Now supports both merged results and partial results directly without merging.
     """
 
-    # ── 0. basic sanity ───────────────────────────────────────────────────
-    uids: list[int] = list(getattr(gather_result, "uids", []))
+    # ── 0. Extract UIDs and state_dicts from either partials or merged ────
+    if isinstance(gather_result, list):
+        # Partials: collect UIDs and state_dicts from all partials
+        all_uids: list[int] = []
+        all_state_dicts: list = []
+        # Create UID-to-partial mapping for O(1) lookup (optimization for O(n×m) → O(n))
+        uid_to_partial: dict[int, tuple[SimpleNamespace, int]] = {}
+
+        for partial in gather_result:
+            if partial is not None:
+                partial_uids = getattr(partial, "uids", [])
+                all_uids.extend(partial_uids)
+                # Store state_dict along with its UIDs for later lookup
+                for idx, uid in enumerate(partial_uids):
+                    all_state_dicts.append(partial.state_dict)
+                    # Map UID to (partial, index_in_partial) for O(1) lookup
+                    uid_to_partial[uid] = (partial, idx)
+
+        uids = all_uids
+        # state_dicts[i] corresponds to uids[i]
+    else:
+        # Merged result: traditional path
+        uids = list(getattr(gather_result, "uids", []))
+        # All UIDs share the same merged state_dict
+        all_state_dicts = [gather_result.state_dict] * len(uids)
+        uid_to_partial = None  # Not needed for merged results
     Ptot = len(uids)
     if Ptot < 2:
         tplr.logger.info("[overlap] <2 peers – skip")
@@ -1243,27 +1864,59 @@ async def check_uid_index_overlap(
     # ── 2. iterate over parameters that have compressed indices ───────────
     for pname, _ in neuron.model.named_parameters():
         idx_key = pname + "idxs"
-        idxs_all = getattr(gather_result.state_dict, idx_key, None)
-        if idxs_all is None:
-            continue
-
-        # Get values for unpacking shape
         vals_key = pname + "vals"
-        vals_all = getattr(gather_result.state_dict, vals_key, None)
-        if vals_all is None:
-            continue
 
         # Unpack all 12-bit packed indices using values shape
+        # Now each UID has its own state_dict
         unpacked_indices = []
+        valid_uids_for_param = []
+
         for i in range(Ptot):
-            idx_data = idxs_all[i] if isinstance(idxs_all, list) else idxs_all
-            val_data = vals_all[i] if isinstance(vals_all, list) else vals_all
+            state_dict = all_state_dicts[i]
+
+            # Get indices and values from this UID's state_dict
+            if isinstance(gather_result, list):
+                # Partials: use O(1) lookup instead of O(m) search
+                # Direct lookup instead of searching (O(n×m) → O(n) optimization)
+                if uids[i] not in uid_to_partial:
+                    continue
+
+                partial, uid_idx_in_partial = uid_to_partial[uids[i]]
+                state_dict = partial.state_dict
+
+                idxs_list = getattr(state_dict, idx_key, None)
+                vals_list = getattr(state_dict, vals_key, None)
+
+                if (
+                    idxs_list is None
+                    or vals_list is None
+                    or uid_idx_in_partial >= len(idxs_list)
+                ):
+                    continue
+
+                idx_data = idxs_list[uid_idx_in_partial]
+                val_data = vals_list[uid_idx_in_partial]
+            else:
+                # Merged: traditional indexing
+                idxs_list = getattr(state_dict, idx_key, None)
+                vals_list = getattr(state_dict, vals_key, None)
+
+                if idxs_list is None or vals_list is None:
+                    continue
+
+                idx_data = idxs_list[i] if isinstance(idxs_list, list) else idxs_list
+                val_data = vals_list[i] if isinstance(vals_list, list) else vals_list
 
             # 12-bit packed format - use values shape for unpacking
             unpacked = unpack_12bit_indices(
                 idx_data.to(neuron.config.device), val_data.shape
             )
             unpacked_indices.append(unpacked)
+            valid_uids_for_param.append(i)
+
+        if len(unpacked_indices) < 2:
+            # Not enough peers have this parameter
+            continue
 
         idxs_tensor = torch.stack(unpacked_indices, dim=0)
         P, *chunk_dims, k = idxs_tensor.shape
@@ -1272,6 +1925,7 @@ async def check_uid_index_overlap(
 
         param_weight = C * k  # size weight
 
+        # Compare pairs using original UID indices for consistent keys
         for i in range(P):
             for j in range(i + 1, P):
                 a = idxs_flat[i].unsqueeze(-1)  # (C,k,1)
@@ -1282,7 +1936,10 @@ async def check_uid_index_overlap(
                 total_weighted_sum += mean_frac * param_weight
                 total_weight += param_weight
 
-                acc = pair_acc[(i, j)]
+                # Use original UID indices (from valid_uids_for_param) for pair keys
+                uid_idx_i = valid_uids_for_param[i]
+                uid_idx_j = valid_uids_for_param[j]
+                acc = pair_acc[(uid_idx_i, uid_idx_j)]
                 acc[0] += mean_frac * param_weight
                 acc[1] += param_weight
 
