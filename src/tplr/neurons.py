@@ -1737,13 +1737,19 @@ async def compare_model_with_debug_dict(
         param_count += abs_vec.numel()
 
         # --- element-wise steps-behind -----------------------------------
+        # Use learning_rate as the baseline step size for more stable comparison
+        # param_avg_change can be very small when model is converged, leading to inflated step ratios
         if param_avg_change and name in param_avg_change:
-            step_vec = torch.clamp(
-                param_avg_change[name].to(curr_slice.device), min=min_step_size
-            )
-            if step_vec.numel() != abs_vec.numel():
+            # Take the maximum of param_avg_change and learning_rate to avoid division by tiny numbers
+            param_change_vec = param_avg_change[name].to(curr_slice.device)
+            if param_change_vec.numel() != abs_vec.numel():
                 # fallback if stored slice has wrong length
                 step_vec = abs_vec.new_full(abs_vec.size(), learning_rate)
+            else:
+                # Use max of param_avg_change and learning_rate for stability
+                step_vec = torch.maximum(
+                    param_change_vec, abs_vec.new_full(abs_vec.size(), learning_rate)
+                )
         else:
             step_vec = abs_vec.new_full(abs_vec.size(), learning_rate)
 

@@ -3245,16 +3245,21 @@ class Validator(BaseNode, Trainer):
             dict: Synchronization metrics and score
         """
         # Fetch the miner's debug dictionary
-        debug_result = await self.comms.get(
+        debug_result = await self.comms.get_with_retry(
             uid=str(eval_uid),
-            window=self.sync_window - 1,
+            window=self.sync_window,
             key="debug",
+            timeout=20,
             local=False,
             stale_retention=10,
         )
 
-        # Check if we got a valid result
-        if not debug_result.success:
+        # Check if we got a valid result (get_with_retry returns None on timeout)
+        if debug_result is None or not debug_result.success:
+            tplr.logger.warning(
+                f"Failed to fetch debug dict for UID {eval_uid} from window {self.sync_window}: "
+                f"error={getattr(debug_result, 'error', 'unknown')}"
+            )
             return {
                 "success": False,
                 "error": "Failed to retrieve debug dictionary",
