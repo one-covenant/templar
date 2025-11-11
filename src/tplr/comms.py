@@ -43,7 +43,8 @@ from tqdm import tqdm as std_tqdm
 
 import tplr
 from tplr.chain import ChainManager
-from tplr.compress import TopKCompressor, unpack_12bit_indices
+from tplr.compress import TopKCompressor
+from tplr.compression import unpack_12bit_indices
 from tplr.config import BUCKET_SECRETS, client_config
 from tplr.schemas import Bucket, CommsGetResult
 

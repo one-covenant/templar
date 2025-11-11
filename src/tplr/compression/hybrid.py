@@ -464,10 +464,7 @@ class BitStreamReader:
         return self.bit_off >= self.total_bits - 7
 
 
-# ---------------------------
-# Header parsing
-# ---------------------------
-def _parse_global_header(payload: BytesLike) -> Tuple[int, int, List[int], int]:
+def _parse_global_header(payload: BytesLike) -> Tuple[int, int, list[int], int]:
     """
     Layout:
       4B "CGRP"
@@ -506,14 +503,12 @@ def _parse_global_header(payload: BytesLike) -> Tuple[int, int, List[int], int]:
         b = int.from_bytes(raw[off:off+2], "little", signed=False)
         B_choices.append(b)
         off += 2
-
     return C, K, B_choices, off * 8
 
 
-
-def _decode_row_variant_b(stream: BitStreamReader, M: int, k_rice: int, use_bitmap: int,
-                          row_payload_bytes: int, row_header_bits: int,
-                          K: int) -> List[int]:
+def _decode_row(stream: BitStreamReader, M: int, k_rice: int, use_bitmap: int,
+                row_payload_bytes: int, row_header_bits: int,
+                K: int) -> list[int]:
     """
     Stream is positioned just AFTER the 16-bit length.
     Decode EXACTLY K deltas (first is Rice; tail is bitmap or Rice),
@@ -525,7 +520,7 @@ def _decode_row_variant_b(stream: BitStreamReader, M: int, k_rice: int, use_bitm
     # header
     _ = stream.read_bits(row_header_bits)
 
-    deltas: List[int] = []
+    deltas: list[int] = []
 
     # first (Rice)
     q0, hit_end = stream.read_unary_bounded(row_end_bit)
@@ -567,7 +562,7 @@ def _decode_row_variant_b(stream: BitStreamReader, M: int, k_rice: int, use_bitm
     return vals
 
 
-def decode_batch_rows(payload: BytesLike) -> List[List[int]]:
+def decode_batch_rows(payload: BytesLike) -> tuple[list[list[int]], int, int]:
     C, K, B_choices, header_end_bit = _parse_global_header(payload)
     num_B = len(B_choices)
 
@@ -584,8 +579,7 @@ def decode_batch_rows(payload: BytesLike) -> List[List[int]]:
     ROW_HEADER_BITS = 1 + B_choice_bits
 
     stream = BitStreamReader(payload, bit_offset_start=header_end_bit)
-    rows_out: List[List[int]] = []
-
+    rows_out: list[list[int]] = []
     while stream.bits_remaining() >= 16:
         row_payload_bytes = stream.read_bits(16)
         if row_payload_bytes == 0 and stream.is_at_end():
@@ -605,7 +599,7 @@ def decode_batch_rows(payload: BytesLike) -> List[List[int]]:
 
         # Rewind header; decode the row with exact K
         stream.bit_off -= ROW_HEADER_BITS
-        row_vals = _decode_row_variant_b(
+        row_vals = _decode_row(
             stream, M=M, k_rice=k_rice, use_bitmap=use_bitmap,
             row_payload_bytes=row_payload_bytes, row_header_bits=ROW_HEADER_BITS,
             K=K
@@ -613,7 +607,7 @@ def decode_batch_rows(payload: BytesLike) -> List[List[int]]:
         if not row_vals:
             break
         rows_out.append(row_vals)
-    return rows_out
+    return rows_out, C, num_B
 
 
 if __name__ == "__main__":

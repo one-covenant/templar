@@ -34,7 +34,6 @@ from torch.optim.lr_scheduler import LRScheduler
 from wandb.sdk.wandb_run import Run
 
 import tplr
-from tplr.compress import unpack_12bit_indices
 from tplr.distributed import dist_helper
 
 if TYPE_CHECKING:
