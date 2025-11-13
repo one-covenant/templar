@@ -391,17 +391,36 @@ class Validator(BaseNode, Trainer):
 
         self.xshapes = {}
         self.totalks = {}
+
+        import time
+        total_compress_time = 0.0
+        total_encode_time = 0.0
         for n, p in self.model.named_parameters():
+            tplr.logger.info(f"[COMPRESS START] {n}: shape={p.shape}")
+
+            encode_start = time.time()
             enc = self.transformer.encode(
                 torch.empty(p.shape, dtype=torch.float16, device=self.device),
                 use_dct=self.hparams.use_dct,
             )
+            encode_time = time.time() - encode_start
+
+            compress_start = time.time()
             _, _, xshape, totalk, _ = self.compressor.compress(
                 enc,
                 self.hparams.topk_compression,
             )
+            compress_time = time.time() - compress_start
+
             self.xshapes[n] = xshape
             self.totalks[n] = totalk
+
+            total_encode_time += encode_time
+            total_compress_time += compress_time
+
+            tplr.logger.info(f"[COMPRESS TIMING] {n}: encode={encode_time:.3f}s, compress={compress_time:.3f}s, shape={p.shape}")
+
+        tplr.logger.info(f"[COMPRESS TIMING TOTAL] encode={total_encode_time:.3f}s, compress={total_compress_time:.3f}s")
 
         self.openskill_model = PlackettLuce(
             beta=self.hparams.openskill_beta, tau=self.hparams.openskill_tau

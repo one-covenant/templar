@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor as DT
 
 import tplr
 
-from tplr.compression import encode_batch_rows, decode_batch_rows
+from tplr.compression import encode_batch_rows, decode_batch_rows, encode_sparsification
 
 # ─────────── type aliases ────────────────────────────────────────────────
 # primitive shapes
@@ -50,7 +50,7 @@ ValT: TypeAlias = torch.Tensor
 # Boolean flag that propagates the chosen quantisation mode
 Q = TypeVar("Q", Literal[True], Literal[False])
 
-_DEFAULT_B_CHOICES: tuple[int, ...] = (64, 128)
+_DEFAULT_B_CHOICES: tuple[int, ...] = (32, 64)
 
 
 class ChunkingTransformer:
@@ -324,12 +324,8 @@ class TopKCompressor(Generic[Q]):
 
         # Flatten to [rows, k] for the codec
         idx2d = idx_int64.reshape(-1, topk).contiguous()
-        payload, _meta = encode_batch_rows(idx2d, C=totalk, B_choices=_DEFAULT_B_CHOICES)
-        idx_bytes = torch.tensor(
-            np.frombuffer(payload, dtype=np.uint8).copy(),
-            dtype=torch.uint8,
-            device="cpu",
-        )
+        val2d = val.reshape(-1, topk).contiguous()
+        idx_bytes, val, _meta = encode_sparsification(idx2d, val2d, C=totalk, B_choices=_DEFAULT_B_CHOICES)
 
         # Apply 8-bit quantization if enabled
         if self.use_quantization:
@@ -377,8 +373,8 @@ class TopKCompressor(Generic[Q]):
             if C != totalk:
                 raise ValueError(f"Index payload C={C} but expected {totalk}")
             k = val.shape[-1]
-            #if any(len(r) != k for r in rows_list):
-            #    raise ValueError("Row-wise topk size mismatch in index payload")
+            if any(len(r) != k for r in rows_list):
+               raise ValueError("Row-wise topk size mismatch in index payload")
             idx_int64 = torch.tensor(
                 rows_list, dtype=torch.int64, device=p.device
             ).view(*val.shape)
@@ -390,6 +386,10 @@ class TopKCompressor(Generic[Q]):
         # Ensure val has the same dtype as x for scatter operation
         if val.dtype != x.dtype:
             val = val.to(dtype=x.dtype)
+
+        if x.ndim == 1:
+            idx_int64 = idx_int64.flatten()
+            val = val.flatten()
 
         x.scatter_reduce_(
             dim=-1, index=idx_int64, src=val, reduce="mean", include_self=False

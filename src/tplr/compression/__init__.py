@@ -17,6 +17,7 @@
 # DEALINGS IN THE SOFTWARE.
 
 from .hybrid import (
+    encode_sparsification,
     decode_batch_rows,  # decoder (CPU)
     encode_batch_rows,  # GPU-accelerated encoder → bytes + perm + meta
 )
@@ -30,5 +31,6 @@ __all__ = [
     "encode_batch_rows",
     "decode_batch_rows",
     "pack_12bit_indices",
-    "unpack_12bit_indices"
+    "unpack_12bit_indices",
+    "encode_sparsification"
 ]

@@ -10,12 +10,28 @@ import triton.language as tl
 BytesLike = Union[bytes, bytearray, np.ndarray, torch.Tensor]
 
 
+def encode_sparsification(
+    idx: torch.Tensor,
+    vals: torch.Tensor,
+    C: int,
+    B_choices: Tuple[int, ...] = (64, 128)
+) -> Tuple[bytes, torch.Tensor, Dict]:
+    dev = idx.device
+    payload, meta, perm = encode_batch_rows(idx, C=C, B_choices=B_choices)
+    vals = torch.gather(vals, dim=1, index=perm.to(dev))
+    idx_bytes = torch.tensor(
+        np.frombuffer(payload, dtype=np.uint8).copy(),
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    return idx_bytes, vals, meta
+
 def encode_batch_rows(
         idx: torch.Tensor,
         *,
         C: int,
         B_choices: Tuple[int, ...] = (64, 128)
-) -> Tuple[bytes, Dict]:
+) -> Tuple[bytes, Dict, torch.Tensor]:
     """
     Compresses a 2D int64 tensor of Top-K indices into a byte string
     using a per-row adaptive Rice/Bitmap compression scheme on the GPU.
@@ -33,7 +49,6 @@ def encode_batch_rows(
             - meta (dict): Metadata about the compression.
     """
 
-    # --- 1. Input Validation & Setup ---
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this function.")
 
@@ -54,8 +69,10 @@ def encode_batch_rows(
             "B_hist": {b: 0 for b in B_choices}
         }
 
-    dev = torch.device("cuda")
-    idx = idx.to(dev, non_blocking=True)
+    if not idx.is_cuda:
+        idx = idx.cuda()
+    idx = idx.contiguous()
+    dev = idx.device
 
     # Calculate k_rice parameters (log2(C // B))
     k_rice_choices = tuple(int(math.log2(C // b)) for b in B_choices)
@@ -73,10 +90,8 @@ def encode_batch_rows(
 
     # --- 2. GPU Preprocessing: Sort & Delta Encode ---
 
-    # Sort each row for delta encoding
-    idx_sorted, _ = torch.sort(idx, dim=1)
-
     # Delta encode: val[0], val[1]-val[0], val[2]-val[1], ...
+    idx_sorted, idx_perm = torch.sort(idx, dim=1)
     delta = torch.cat(
         (idx_sorted[:, :1], idx_sorted[:, 1:] - idx_sorted[:, :-1]),
         dim=1
@@ -190,7 +205,7 @@ def encode_batch_rows(
         # header+payload, no 16-bit length, before byte-rounding
         "B_hist": B_hist,
     }
-    return payload_bytes, meta
+    return payload_bytes, meta, idx_perm
 
 
 # --- Triton Kernel 1: Cost Analysis ---
