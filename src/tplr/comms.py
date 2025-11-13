@@ -1663,7 +1663,7 @@ class Comms(ChainManager):
         start_time = time.time()
         end_time = start_time + timeout
         tried_after_time_max = False
-        time_max_grace_period = 3.0
+        time_max_grace_period = 10.0  # Increased from 3.0 for better clock skew tolerance
         consecutive_not_found = 0  # Track consecutive NOT_FOUND errors
         max_consecutive_not_found = 5  # Give up after 5 consecutive NOT_FOUND (2.5s)
 

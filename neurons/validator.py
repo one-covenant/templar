@@ -1563,7 +1563,7 @@ class Validator(BaseNode, Trainer):
                     return_partials=use_distributed_gather,  # Return partials for distributed, merged for sequential
                     window=self.sync_window,
                     key="gradient",
-                    timeout=90,
+                    timeout=150,  # Increased from 90 to allow more time for gradient gathering
                     device=cast(str, self.device),
                     local=False,
                     totalks=self.totalks,
@@ -3249,7 +3249,7 @@ class Validator(BaseNode, Trainer):
             uid=str(eval_uid),
             window=self.sync_window,
             key="debug",
-            timeout=20,
+            timeout=60,
             local=False,
             stale_retention=10,
         )
