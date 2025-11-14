@@ -10,34 +10,18 @@ import triton.language as tl
 BytesLike = Union[bytes, bytearray, np.ndarray, torch.Tensor]
 
 
-def encode_sparsification(
-    idx: torch.Tensor,
-    vals: torch.Tensor,
-    C: int,
-    B_choices: Tuple[int, ...] = (64, 128)
-) -> Tuple[bytes, torch.Tensor, Dict]:
-    dev = idx.device
-    payload, meta, perm = encode_batch_rows(idx, C=C, B_choices=B_choices)
-    vals = torch.gather(vals, dim=1, index=perm.to(dev))
-    idx_bytes = torch.tensor(
-        np.frombuffer(payload, dtype=np.uint8).copy(),
-        dtype=torch.uint8,
-        device="cpu",
-    )
-    return idx_bytes, vals, meta
-
-def encode_batch_rows(
-        idx: torch.Tensor,
+def encode_batch_rows_sorted(
+        idx_sorted: torch.Tensor,
         *,
         C: int,
         B_choices: Tuple[int, ...] = (64, 128)
-) -> Tuple[bytes, Dict, torch.Tensor]:
+) -> Tuple[bytes, Dict]:
     """
-    Compresses a 2D int64 tensor of Top-K indices into a byte string
+    Compresses a 2D tensor of Top-K indices into a byte string
     using a per-row adaptive Rice/Bitmap compression scheme on the GPU.
 
     Args:
-        idx (torch.Tensor): [rows, k] int64 tensor of indices.
+        idx_sorted (torch.Tensor): [rows, k] sorted tensor of indices.
         C (int): The total number of columns (0 <= idx < C).
         B_choices (tuple[int, ...]): Block sizes to evaluate.
                                      Must be powers of two.
@@ -52,8 +36,8 @@ def encode_batch_rows(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this function.")
 
-    if not isinstance(idx, torch.Tensor) or idx.ndim != 2 or idx.dtype != torch.int64:
-        raise ValueError(f"idx must be a 2D int64 tensor, got {idx.shape} {idx.dtype}")
+    if not isinstance(idx_sorted, torch.Tensor) or idx_sorted.ndim != 2:
+        raise ValueError(f"idx must be a 2D int64 tensor, got {idx_sorted.shape}")
 
     if not all(isinstance(b, int) and (b & (b - 1) == 0) and b > 0 for b in B_choices):
         raise ValueError(f"All B_choices must be powers of two, got {B_choices}")
@@ -61,7 +45,7 @@ def encode_batch_rows(
     if not all(C % b == 0 for b in B_choices):
         raise ValueError(f"All B_choices must evenly divide C={C}, got {B_choices}")
 
-    num_rows, k_dim = idx.shape
+    num_rows, k_dim = idx_sorted.shape
     if num_rows == 0:
         return b"", {
             "total_bits": 0,
@@ -69,10 +53,10 @@ def encode_batch_rows(
             "B_hist": {b: 0 for b in B_choices}
         }
 
-    if not idx.is_cuda:
-        idx = idx.cuda()
-    idx = idx.contiguous()
-    dev = idx.device
+    if not idx_sorted.is_cuda:
+        idx_sorted = idx_sorted.cuda()
+    idx_sorted = idx_sorted.contiguous()
+    dev = idx_sorted.device
 
     # Calculate k_rice parameters (log2(C // B))
     k_rice_choices = tuple(int(math.log2(C // b)) for b in B_choices)
@@ -88,27 +72,19 @@ def encode_batch_rows(
     # Row header: 1 bit (bitmap/rice) + B_choice_bits
     ROW_HEADER_BITS = 1 + B_choice_bits
 
-    # --- 2. GPU Preprocessing: Sort & Delta Encode ---
-
     # Delta encode: val[0], val[1]-val[0], val[2]-val[1], ...
-    idx_sorted, idx_perm = torch.sort(idx, dim=1)
     delta = torch.cat(
         (idx_sorted[:, :1], idx_sorted[:, 1:] - idx_sorted[:, :-1]),
         dim=1
     )
-    # Ensure all deltas are non-negative
-    delta = torch.clamp(delta, min=0)
 
     # --- 3. Kernel 1: Cost Analysis ---
 
     # Output tensors for cost kernel
     costs = torch.empty((num_rows, num_B_choices), dtype=torch.int32, device=dev)
     is_bitmap = torch.empty((num_rows, num_B_choices), dtype=torch.int8, device=dev)
-
-    # Grid is 1D, one program per row
     grid = (num_rows,)
 
-    # Launch cost kernel
     # k_dim is passed as constexpr for tl.arange, but B_choices are dynamic
     cost_kernel[grid](
         delta,
@@ -187,15 +163,8 @@ def encode_batch_rows(
         ROW_HEADER_BITS=ROW_HEADER_BITS,
     )
 
-    # --- 7. Copy to CPU and Return ---
+    payload_cpu = payload_buf.cpu()
 
-    # Copy buffer from GPU to CPU
-    payload_cpu = payload_buf.cpu().numpy()
-
-    # Convert to final bytes object
-    payload_bytes = payload_cpu.tobytes()
-
-    # --- meta ---
     b_counts = torch.bincount(best_B_idx, minlength=len(B_choices))
     B_hist = {b: c.item() for b, c in zip(B_choices, b_counts)}
     meta = {
@@ -205,10 +174,8 @@ def encode_batch_rows(
         # header+payload, no 16-bit length, before byte-rounding
         "B_hist": B_hist,
     }
-    return payload_bytes, meta, idx_perm
+    return payload_cpu, meta
 
-
-# --- Triton Kernel 1: Cost Analysis ---
 
 @triton.jit
 def cost_kernel(
@@ -484,7 +451,7 @@ def _parse_global_header(payload: BytesLike) -> Tuple[int, int, list[int], int]:
     Layout:
       4B "CGRP"
       4B C (uint32 LE)
-      2B K (uint16 LE)              <-- NEW
+      2B K (uint16 LE)
       1B num_B
       2B * num_B  (each B, uint16 LE)
     Returns: (C, K, B_choices, header_end_bit_offset)
@@ -506,7 +473,7 @@ def _parse_global_header(payload: BytesLike) -> Tuple[int, int, list[int], int]:
         raise ValueError("Bad magic; expected 'CGRP'")
 
     C     = int.from_bytes(raw[4:8],  "little", signed=False)
-    K     = int.from_bytes(raw[8:10], "little", signed=False)   # NEW
+    K     = int.from_bytes(raw[8:10], "little", signed=False)
     num_B = raw[10]
     need  = 4 + 4 + 2 + 1 + 2 * num_B
     if len(raw) < need:
@@ -622,7 +589,7 @@ def decode_batch_rows(payload: BytesLike) -> tuple[list[list[int]], int, int]:
         if not row_vals:
             break
         rows_out.append(row_vals)
-    return rows_out, C, num_B
+    return rows_out, C, len(rows_out)
 
 
 if __name__ == "__main__":

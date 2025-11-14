@@ -13,7 +13,7 @@ from tplr.compress import (
     _idct
 )
 
-from tplr.compression import encode_batch_rows, pack_12bit_indices, unpack_12bit_indices
+from tplr.compression import encode_batch_rows_sorted, pack_12bit_indices, unpack_12bit_indices
 
 
 class TestTopKCompressor:
@@ -70,7 +70,7 @@ class TestTopKCompressor:
         assert qparams is not None
         assert len(qparams) == 5  # shift, scale, offset, lookup, orig_dtype
 
-    def test_decompress_2d_with_rice_bitmap_format(
+    def test_decompress_with_rice_bitmap_format(
             self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test that decompress can handle Rice/bitmap encoded format"""
@@ -84,12 +84,11 @@ class TestTopKCompressor:
         original_indices = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int64)
 
         # Pack using the new encoder format
-        payload, _, _ = encode_batch_rows(original_indices, C=totalk)
-        idx = torch.tensor(np.frombuffer(payload, dtype=np.uint8), dtype=torch.uint8)
+        idx_bytes, _ = encode_batch_rows_sorted(original_indices, C=totalk)
         val = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=torch.float32)
 
         # Test decompression with packed format
-        result = compress_instance.decompress(p, idx, val, xshape, totalk)
+        result = compress_instance.decompress(p, idx_bytes, val, xshape, totalk)
         assert result.shape == xshape
         assert result.dtype == p.dtype
 
@@ -107,15 +106,8 @@ class TestTopKCompressor:
         idx2_orig = torch.tensor([[4, 5], [6, 7]], dtype=torch.int64)
 
         # Pack them using the new encoder format
-        payload1, _, _ = encode_batch_rows(idx1_orig, C=totalk)
-        idx1_packed = torch.tensor(
-            np.frombuffer(payload1, dtype=np.uint8), dtype=torch.uint8
-        )
-
-        payload2, _, _ = encode_batch_rows(idx2_orig, C=totalk)
-        idx2_packed = torch.tensor(
-            np.frombuffer(payload2, dtype=np.uint8), dtype=torch.uint8
-        )
+        idx1_packed, _ = encode_batch_rows_sorted(idx1_orig, C=totalk)
+        idx2_packed, _ = encode_batch_rows_sorted(idx2_orig, C=totalk)
 
         idx_list = [idx1_packed, idx2_packed]
 
@@ -130,40 +122,7 @@ class TestTopKCompressor:
         assert result.shape == xshape
         assert result.dtype == p.dtype
 
-    def test_compress_decompress_round_trip_1d(
-            self, compress_instance: TopKCompressor[Literal[False]]
-    ):
-        x = torch.zeros(128,)  # 1024 elements total, last dim=128
-        x[0] = 1.0
-        x[1] = 2.0
-        x[2] = 3.0
-        x[3] = 4.0
-        topk = 4
-
-        idx, val, xshape, totalk = compress_instance.compress(x, topk)
-
-        # Verify we got the top-k values
-        assert idx.dtype == torch.uint8, (
-            "Expected uint8 for Rice/bitmap encoded indices"
-        )
-        assert val.shape[-1] == topk
-
-        # Decompress
-        p = torch.zeros_like(x)
-        result = compress_instance.decompress(p, idx, val, xshape, totalk)
-
-        # Verify shape
-        assert result.shape == x.shape
-
-        # Verify the top values were preserved
-        assert result.abs().max() > 0, "Decompressed tensor should have non-zero values"
-
-        # The top 4 values should be approximately 4, 3, 2, 1
-        top_vals = torch.topk(result.abs().flatten(), k=4).values
-        expected_vals = torch.tensor([4.0, 3.0, 2.0, 1.0])
-        assert torch.allclose(top_vals, expected_vals, atol=1e-5)
-
-    def test_compress_decompress_round_trip_2d(
+    def test_compress_decompress_round_trip(
             self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test full compress-decompress round trip"""
@@ -197,6 +156,36 @@ class TestTopKCompressor:
         top_vals = torch.topk(result.abs().flatten(), k=4).values
         expected_vals = torch.tensor([4.0, 3.0, 2.0, 1.0])
         assert torch.allclose(top_vals, expected_vals, atol=1e-5)
+
+    def test_encode_compress_decompress_round_trip(
+            self, compress_instance: TopKCompressor[Literal[False]]
+    ):
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer1 = nn.Linear(32, 64)
+                self.layer2 = nn.Linear(64, 256)
+
+        target_chunk = 16
+        transform = ChunkingTransformer( SimpleModel(), target_chunk)
+        x = torch.zeros(256, 64)
+        x[0, 0] = 1.0
+        x[1, 1] = 2.0
+        x[2, 2] = 3.0
+        x[3, 3] = 4.0
+
+        topk = 4
+        encoded = transform.encode(x)
+        idxs, vals, xshape, totalk = compress_instance.compress(
+            encoded, topk
+        )
+
+        p = torch.zeros_like(x)
+        decompressed = compress_instance.decompress(
+            p, idxs, vals, xshape, totalk
+        )
+        assert torch.allclose(encoded, decompressed, atol=1e-5)
+
 
     def test_rice_bitmap_index_value_range(
             self, compress_instance: TopKCompressor[Literal[False]]
@@ -235,10 +224,7 @@ class TestTopKCompressor:
 
         # Create test data with Rice/bitmap encoded format
         idx_orig = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)  # Even count
-        payload, _, _ = encode_batch_rows(idx_orig, C=totalk)
-        idx_packed = torch.tensor(
-            np.frombuffer(payload, dtype=np.uint8), dtype=torch.uint8
-        )
+        idx_packed, _ = encode_batch_rows_sorted(idx_orig, C=totalk)
         idx = [idx_packed]
         val = [torch.tensor([[10.0, 20.0, 30.0, 40.0]], dtype=torch.float32)]
 

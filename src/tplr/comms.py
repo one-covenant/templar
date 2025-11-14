@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from functools import partial
 from types import SimpleNamespace
 from typing import Any, Literal, cast
+import numpy as np
 
 import aiofiles
 import bittensor as bt
@@ -44,7 +45,7 @@ from tqdm import tqdm as std_tqdm
 import tplr
 from tplr.chain import ChainManager
 from tplr.compress import TopKCompressor
-from tplr.compression import unpack_12bit_indices
+from tplr.compression import decode_batch_rows
 from tplr.config import BUCKET_SECRETS, client_config
 from tplr.schemas import Bucket, CommsGetResult
 
@@ -2479,10 +2480,8 @@ class Comms(ChainManager):
         """
         Validates the integrity and format of compressed gradient indices.
 
-        This is a crucial security and stability check to ensure that gradients
-        received from peers are well-formed. It verifies that indices are within
-        the expected bounds and that the compression format (e.g., 12-bit packing)
-        is correctly applied.
+        This ensures indices are within bounds and that the **new Rice/bitmap**
+        codec payload matches the provided values tensor shape (top‑k).
 
         Args:
             param_name (str): The name of the parameter being checked.
@@ -2495,7 +2494,7 @@ class Comms(ChainManager):
 
         Raises:
             ValueError: If any validation check fails, such as out-of-bounds
-                indices, incorrect data types, or malformed packed data.
+                indices, incorrect data types, or malformed payload.
         """
         allowed_topk = (
             min(self.hparams.topk_compression, totalk)
@@ -2503,44 +2502,61 @@ class Comms(ChainManager):
             else min(allowed_topk, totalk)
         )
 
-        def _bounds_check(t: torch.Tensor):
-            """fast min/max bounds check"""
-            if t.numel() == 0:
-                raise ValueError(f"[{param_name}] empty index list")
-            if t.min().item() < 0 or t.max().item() >= totalk:
-                bad = t[(t < 0) | (t >= totalk)][0].item()
-                raise ValueError(
-                    f"[{param_name}] Index {bad} out of bounds (totalk = {totalk})"
-                )
+        if not isinstance(idxs, torch.Tensor):
+            raise ValueError(
+                f"[{param_name}] Expected tensor for indices, got {type(idxs)}"
+            )
+        if vals is None:
+            raise ValueError(
+                f"[{param_name}] Values tensor required for index validation"
+            )
+        if idxs.dtype != torch.uint8:
+            raise ValueError(
+                f"[{param_name}] Expected uint8 (Rice/bitmap payload), got {idxs.dtype}"
+            )
+        if idxs.numel() == 0:
+            raise ValueError(f"[{param_name}] Empty indices payload")
 
-        # Handle 12-bit packed index format only
-        if isinstance(idxs, torch.Tensor):
-            if idxs.dtype != torch.uint8:
-                raise ValueError(
-                    f"[{param_name}] Expected uint8 for 12-bit packed indices, got {idxs.dtype}"
-                )
-            # 12-bit packed format is the only supported format
-            if vals is None:
-                raise ValueError(
-                    f"[{param_name}] Values tensor required to validate 12-bit packed indices"
-                )
-            if idxs.numel() == 0:
-                raise ValueError(f"[{param_name}] Empty packed indices tensor")
+        # Decode (CPU) and perform structural checks
+        try:
+            payload_bytes = idxs.detach().cpu().numpy().tobytes()
+            rows_list, C, N = decode_batch_rows(payload_bytes)
+        except Exception as e:
+            raise ValueError(f"[{param_name}] Failed to decode indices payload: {e}")
 
-            # Unpack using the values shape
-            try:
-                unpacked = unpack_12bit_indices(idxs, vals.shape)
-                # Validate that the last dimension matches allowed_topk
-                if unpacked.shape[-1] != allowed_topk:
-                    raise ValueError(
-                        f"[{param_name}] Invalid topk dimension: "
-                        f"shape[-1]={unpacked.shape[-1]} but expected {allowed_topk}"
-                    )
-                _bounds_check(unpacked)
-            except Exception as e:
-                raise ValueError(f"[{param_name}] Failed to unpack 12-bit indices: {e}")
-        else:
-            raise ValueError(f"[{param_name}] Expected tensor but got {type(idxs)}")
+        if C != totalk:
+            raise ValueError(
+                f"[{param_name}] Payload column size C={C} but expected {totalk}"
+            )
+
+        # compute expected rows from values shape (flatten all but last dim)
+        if vals.ndim == 0:
+            raise ValueError(f"[{param_name}] Values tensor has no top‑k dimension")
+        expected_rows = int(np.prod(vals.shape[:-1])) if vals.ndim > 1 else 1
+        if N != expected_rows:
+            raise ValueError(
+                f"[{param_name}] Payload rows N={N} but values imply {expected_rows}"
+            )
+
+        k = vals.shape[-1]
+        if k != allowed_topk:
+            raise ValueError(
+                f"[{param_name}] Values top‑k={k} but allowed_topk={allowed_topk}"
+            )
+        if any(len(r) != k for r in rows_list):
+            raise ValueError(
+                f"[{param_name}] At least one row has mismatched top‑k size"
+            )
+
+        # bounds check without materialising full tensor
+        max_idx = max((max(r) if len(r) > 0 else -1) for r in rows_list)
+        min_idx = (
+            min((min(r) if len(r) > 0 else 0) for r in rows_list) if rows_list else 0
+        )
+        if min_idx < 0 or max_idx >= totalk:
+            raise ValueError(
+                f"[{param_name}] Index out of bounds (min={min_idx}, max={max_idx}, totalk={totalk})"
+            )
 
     async def s3_get_object_size(self, bucket: Bucket, key: str) -> int | None:
         """

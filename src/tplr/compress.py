@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor as DT
 
 import tplr
 
-from tplr.compression import encode_batch_rows, decode_batch_rows, encode_sparsification
+from tplr.compression import encode_batch_rows_sorted, decode_batch_rows
 
 # ─────────── type aliases ────────────────────────────────────────────────
 # primitive shapes
@@ -323,9 +323,13 @@ class TopKCompressor(Generic[Q]):
         val = torch.gather(x, dim=-1, index=idx_int64)
 
         # Flatten to [rows, k] for the codec
-        idx2d = idx_int64.reshape(-1, topk).contiguous()
-        val2d = val.reshape(-1, topk).contiguous()
-        idx_bytes, val, _meta = encode_sparsification(idx2d, val2d, C=totalk, B_choices=_DEFAULT_B_CHOICES)
+        idx2d = idx_int64.reshape(-1, topk).to(torch.int32)
+        val2d = val.reshape(-1, topk)
+
+        # sort indices and apply same perm to values
+        idx_sorted, perm = torch.sort(idx2d, dim=1)
+        val = torch.gather(val2d, dim=1, index=perm)
+        idx_bytes, _meta = encode_batch_rows_sorted(idx_sorted, C=totalk, B_choices=_DEFAULT_B_CHOICES)
 
         # Apply 8-bit quantization if enabled
         if self.use_quantization:
@@ -387,9 +391,9 @@ class TopKCompressor(Generic[Q]):
         if val.dtype != x.dtype:
             val = val.to(dtype=x.dtype)
 
-        if x.ndim == 1:
-            idx_int64 = idx_int64.flatten()
-            val = val.flatten()
+        if len(xshape) > 2:
+            idx_int64 = rearrange(idx_int64, "(y x) h -> y x h", y=xshape[0])
+            val = rearrange(val, "(y x) h -> y x h", y=xshape[0])
 
         x.scatter_reduce_(
             dim=-1, index=idx_int64, src=val, reduce="mean", include_self=False
