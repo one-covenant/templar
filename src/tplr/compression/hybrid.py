@@ -15,7 +15,7 @@ def encode_batch_rows_sorted(
         *,
         C: int,
         B_choices: Tuple[int, ...] = (64, 128)
-) -> Tuple[bytes, Dict]:
+) -> Tuple[BytesLike, Dict]:
     """
     Compresses a 2D tensor of Top-K indices into a byte string
     using a per-row adaptive Rice/Bitmap compression scheme on the GPU.
@@ -61,12 +61,7 @@ def encode_batch_rows_sorted(
     # Calculate k_rice parameters (log2(C // B))
     k_rice_choices = tuple(int(math.log2(C // b)) for b in B_choices)
     num_B_choices = len(B_choices)
-
-    # Create tensors for dynamic kernel
-    B_choices_tensor = torch.tensor(B_choices, dtype=torch.int32, device=dev)
     k_rice_choices_tensor = torch.tensor(k_rice_choices, dtype=torch.int32, device=dev)
-
-    # Bits needed to store the B_choice index
     B_choice_bits = (num_B_choices - 1).bit_length()
 
     # Row header: 1 bit (bitmap/rice) + B_choice_bits
@@ -78,8 +73,6 @@ def encode_batch_rows_sorted(
         dim=1
     )
 
-    # --- 3. Kernel 1: Cost Analysis ---
-
     # Output tensors for cost kernel
     costs = torch.empty((num_rows, num_B_choices), dtype=torch.int32, device=dev)
     is_bitmap = torch.empty((num_rows, num_B_choices), dtype=torch.int8, device=dev)
@@ -90,15 +83,13 @@ def encode_batch_rows_sorted(
         delta,
         costs,
         is_bitmap,
-        C=C,
         k_dim=k_dim,
         num_rows=num_rows,
         num_B_choices=num_B_choices,
-        B_choices_ptr=B_choices_tensor,
         k_rice_choices_ptr=k_rice_choices_tensor,
     )
 
-    # --- 4. Post-Kernel 1: pick best B/mode & compute layout ---
+    # pick best B/mode & compute layout
 
     # Best choice per row
     min_costs, best_B_idx = torch.min(costs, dim=1)
@@ -147,7 +138,6 @@ def encode_batch_rows_sorted(
         list(global_header_py), dtype=torch.uint8, device=dev
     )
 
-    # --- pack kernel ---
     pack_kernel[(num_rows,)](
         delta,
         payload_buf,
@@ -155,23 +145,19 @@ def encode_batch_rows_sorted(
         row_payload_bytes,  # already int32
         best_B_idx.to(torch.int32),
         is_bitmap_choice,  # int32 0/1
-        B_choices_tensor,
         k_rice_choices_tensor,
         num_rows,
-        C=C,
         k_dim=k_dim,
         ROW_HEADER_BITS=ROW_HEADER_BITS,
     )
 
     payload_cpu = payload_buf.cpu()
-
     b_counts = torch.bincount(best_B_idx, minlength=len(B_choices))
     B_hist = {b: c.item() for b, c in zip(B_choices, b_counts)}
     meta = {
         "total_bits": total_bits,  # includes 16-bit length and byte padding
         "avg_bits_per_row": float(row_bits_aligned.float().mean().item()),
         "avg_payload_bits_per_row": float(row_payload_bits.float().mean().item()),
-        # header+payload, no 16-bit length, before byte-rounding
         "B_hist": B_hist,
     }
     return payload_cpu, meta
@@ -182,12 +168,10 @@ def cost_kernel(
         delta_ptr,              # (rows, k_dim) IN
         costs_ptr,              # (rows, num_B_choices) OUT
         is_bitmap_ptr,          # (rows, num_B_choices) OUT (bool/int)
-        C: tl.int32,
         k_dim: tl.constexpr,    # constexpr for tl.arange
         num_rows: tl.int32,
         num_B_choices: tl.int32,
-        B_choices_ptr,          # IN (tensor)
-        k_rice_choices_ptr,     # IN (tensor)
+        k_rice_choices_ptr,     # (num_B_choices,) int32
 ):
     """
     Calculates the compressed bit cost for each row for each B in B_choices.
@@ -204,31 +188,22 @@ def cost_kernel(
     # Load the entire row of delta-encoded values into SRAM
     row_base = row_idx * k_dim
     delta = tl.load(delta_ptr + row_base + i)
-
-    # Also load the first delta as a scalar for q0 (avoids illegal q[0] indexing)
     delta0 = tl.load(delta_ptr + row_base)
 
-    # Iterate over B choices dynamically
     b_idx = 0
     while b_idx < num_B_choices:
-        # Dynamic parameters for this choice
-        B      = tl.load(B_choices_ptr + b_idx)
+        # k_rice and M = 1 << k_rice
         k_rice = tl.load(k_rice_choices_ptr + b_idx)
 
-        # Rice modulus
-        M = C // B
-
-        # Vectorized q for the row and scalar q0 for the first element
-        q  = delta // M
-        q0 = delta0 // M
+        # q via shift, r via mask
+        q = delta >> k_rice
+        q0 = delta0 >> k_rice
 
         # Pure Rice cost: sum(unary(q)) + sum(r)   where unary(q) has (q + 1) bits,
         # and r contributes k_rice bits per element.
         rice_cost = tl.sum(q + 1) + k_dim * k_rice
 
-        # Variant B bitmap cost:
-        # - first element written with full Rice: (q0 + 1 + k_rice)
-        # - remaining (k_dim - 1) elements written as (1 + k_rice) each
+        # Bitmap cost: first element full Rice, tail has (1 + k_rice) bits
         #   (1 bit for q in {0,1} + k_rice bits for r)
         bitmap_cost = (q0 + 1 + k_rice) + (k_dim - 1) * (1 + k_rice)
         # equivalently: bitmap_cost = k_dim * (1 + k_rice) + q0
@@ -244,11 +219,12 @@ def cost_kernel(
         out_offset = row_idx * num_B_choices + b_idx
         tl.store(costs_ptr + out_offset, min_cost)
         # make sure is_bitmap is exactly 0/1 in memory
-        tl.store(is_bitmap_ptr + out_offset, tl.where(use_bitmap, 1, 0))
+        tl.store(
+            is_bitmap_ptr + out_offset,
+            tl.where(use_bitmap, 1, 0).to(tl.int32),
+        )
         b_idx += 1
 
-
-# --- Triton Kernel 2: Bit-Stream Packing ---
 
 @triton.jit
 def write_nbits(u8_ptr, bit_off_i32, value_u32, nbits_i32):
@@ -264,20 +240,18 @@ def write_nbits(u8_ptr, bit_off_i32, value_u32, nbits_i32):
     ONE_U32 = tl.full((), 1, dtype=tl.uint32)
 
     while j < nbits_i32:
-        pos      = bit_off_i32 + j
+        pos = bit_off_i32 + j
         byte_idx = (pos >> 3).to(tl.int32)
-        bit_idx  = (pos & 7).to(tl.int32)
+        bit_idx = (pos & 7).to(tl.int32)
 
-        old_u8   = tl.load(u8_ptr + byte_idx)
-        old_u32  = old_u8.to(tl.uint32)
+        old_u8 = tl.load(u8_ptr + byte_idx)
+        old_u32 = old_u8.to(tl.uint32)
 
-        vbit     = (value_u32 >> j) & ONE_U32
-        mask     = ONE_U32 << bit_idx
-        new_u32  = (old_u32 & (~mask)) | (vbit << bit_idx)
+        vbit = (value_u32 >> j) & ONE_U32
+        mask = ONE_U32 << bit_idx
+        new_u32 = (old_u32 & (~mask)) | (vbit << bit_idx)
         tl.store(u8_ptr + byte_idx, new_u32.to(tl.uint8))
-
         j += 1
-
     return bit_off_i32 + nbits_i32
 
 
@@ -289,10 +263,8 @@ def pack_kernel(
     row_payload_bytes_ptr,  # (rows,) IN  int32
     best_B_idx_ptr,         # (rows,) IN  int32
     is_bitmap_ptr,          # (rows,) IN  int32 (0/1)
-    B_choices_ptr,          # [num_B] IN int32
     k_rice_choices_ptr,     # [num_B] IN int32
     num_rows: tl.int32,
-    C: tl.constexpr,
     k_dim: tl.int32,        # dynamic
     ROW_HEADER_BITS: tl.constexpr,
 ):
@@ -305,20 +277,19 @@ def pack_kernel(
         return
 
     # per-row meta
-    bit_off_i32       = tl.load(row_bit_offsets_ptr + row_idx).to(tl.int32)
+    bit_off_i32 = tl.load(row_bit_offsets_ptr + row_idx).to(tl.int32)
     payload_bytes_i32 = tl.load(row_payload_bytes_ptr + row_idx).to(tl.int32)
-    b_idx_i32         = tl.load(best_B_idx_ptr + row_idx).to(tl.int32)
-    use_bitmap_i32    = (tl.load(is_bitmap_ptr + row_idx) & 1).to(tl.int32)
+    b_idx_i32 = tl.load(best_B_idx_ptr + row_idx).to(tl.int32)
+    use_bitmap_i32 = (tl.load(is_bitmap_ptr + row_idx) & 1).to(tl.int32)
 
     # params
-    B_i32      = tl.load(B_choices_ptr + b_idx_i32).to(tl.int32)
     k_rice_i32 = tl.load(k_rice_choices_ptr + b_idx_i32).to(tl.int32)
-    M_i32      = (C // B_i32).to(tl.int32)
+    M_i32 = (tl.full((), 1, dtype=tl.int32) << k_rice_i32)
 
     ONE_U32 = tl.full((), 1, dtype=tl.uint32)
     ZERO_U32 = tl.full((), 0, dtype=tl.uint32)
-    ONE_I32  = tl.full((), 1, dtype=tl.int32)
-    THIRTY_ONE_I32 = tl.full((), 31, dtype=tl.int32)  # **cap chunks at 31**
+    ONE_I32 = tl.full((), 1, dtype=tl.int32)
+    THIRTY_ONE_I32 = tl.full((), 31, dtype=tl.int32)
 
     # 16-bit length
     bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32,
@@ -336,8 +307,8 @@ def pack_kernel(
     # ---- first delta: ALWAYS Rice ----
     if k_dim > 0:
         v0 = tl.load(delta_ptr + base).to(tl.int32)
-        q0 = (v0 // M_i32).to(tl.int32)
-        r0 = (v0 %  M_i32).to(tl.int32)
+        q0 = (v0 >> k_rice_i32).to(tl.int32)
+        r0 = (v0 & (M_i32 - 1)).to(tl.int32)
 
         # q0 ones in chunks of <=31, then a single 0
         q_left = q0
@@ -346,17 +317,15 @@ def pack_kernel(
             ones  = (ONE_U32 << chunk) - ONE_U32
             bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ones, chunk)
             q_left -= chunk
-        bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ZERO_U32, ONE_I32)
+        bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ZERO_U32, ONE_I32) # terminating 0
+        bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, r0.to(tl.uint32), k_rice_i32) # remainder
 
-        # remainder
-        bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, r0.to(tl.uint32), k_rice_i32)
-
-    # ---- tail ----
+    # tail deltas
     i = 1
     while i < k_dim:
         v = tl.load(delta_ptr + base + i).to(tl.int32)
-        q = (v // M_i32).to(tl.int32)
-        r = (v %  M_i32).to(tl.int32)
+        q = (v >> k_rice_i32).to(tl.int32)
+        r = (v & (M_i32 - 1)).to(tl.int32)
 
         # Rice unary only if NOT bitmap
         q_left = tl.where(use_bitmap_i32 != 0, tl.full((), 0, dtype=tl.int32), q)
@@ -375,14 +344,9 @@ def pack_kernel(
 
         # remainder always
         bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, r.to(tl.uint32), k_rice_i32)
-
         i += 1
 
 
-
-# ---------------------------
-# Bitstream reader (LSB-first)
-# ---------------------------
 class BitStreamReader:
     """
     LSB-first bit reader over a bytes-like buffer (torch.uint8, np.uint8, or Python bytes).
@@ -601,9 +565,8 @@ if __name__ == "__main__":
     idx = torch.topk(x.abs(), k=K, dim=-1, largest=True, sorted=False).indices
 
     idx, _ = torch.sort(idx, dim=1)
-    payload, _ = encode_batch_rows(idx, C=COLS, B_choices=(64, 128, 256))
-    decoded = decode_batch_rows(payload)
-    dec = [torch.tensor(r, dtype=torch.int64) for r in decoded]
+    payload, _ = encode_batch_rows_sorted(idx, C=COLS, B_choices=(64, 128, 256))
+    decoded, _, _ = decode_batch_rows(payload)
     ok = True
     idx = [row for row in idx]
     for r in range(ROWS):
