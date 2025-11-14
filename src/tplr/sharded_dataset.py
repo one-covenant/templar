@@ -221,7 +221,19 @@ class ShardedDatasetManager:
         self.comms = comms
 
         # should comms glob to know all file paths?
-        self.max_dataset_idx = 10  # bucket_glob_files_idx
+        self.max_dataset_idx = 14  # bucket_glob_files_idx
+
+    @staticmethod
+    def remap_shard_index(shard_index: int) -> int:
+        """Remaps shard 7 to shard 13, keeps all other indices unchanged.
+
+        Args:
+            shard_index: The original shard index.
+
+        Returns:
+            The remapped shard index (13 if input was 7, otherwise unchanged).
+        """
+        return 13 if shard_index == 7 else shard_index
 
     def prepare_shard(self, shard_index: int) -> asyncio.Task:
         """Prepares a shard for use, downloading it if necessary.
@@ -232,10 +244,14 @@ class ShardedDatasetManager:
         Returns:
             An asyncio Task that completes when the download is finished
         """
+        # Remap shard 7 to shard 13
+        remapped_shard = self.remap_shard_index(shard_index)
         tokens_file, ids_file = SharedShardedDataset.locate_shards(
-            shard_index, file_prefix=self.file_prefix
+            remapped_shard, file_prefix=self.file_prefix
         )
-        tplr.logger.info(f"Preparing shard {shard_index} at {tokens_file}")
+        tplr.logger.info(
+            f"Preparing shard {shard_index} (remapped to {remapped_shard}) at {tokens_file}"
+        )
 
         if os.path.exists(tokens_file) and os.path.exists(ids_file):
             # if exist, return completed task
@@ -286,6 +302,9 @@ class ShardedDatasetManager:
         Returns:
             An instance of `SharedShardedDataset`.
         """
+        # Remap shard 7 to shard 13
+        remapped_shard = self.remap_shard_index(shard_index)
+
         # Only rank 0 downloads the shard, others wait
         if self.rank == 0:
             download_task = self.prepare_shard(shard_index)
@@ -293,7 +312,7 @@ class ShardedDatasetManager:
         # Non-master ranks will just check if files exist (downloaded by rank 0)
 
         dataset = SharedShardedDataset(
-            shard_index=shard_index,
+            shard_index=remapped_shard,
             sequence_length=self.sequence_length,
             rank=self.rank,
             world_size=self.world_size,
