@@ -13,7 +13,7 @@ from tplr.compress import (
     _idct
 )
 
-from tplr.compression import encode_batch_rows_sorted, pack_12bit_indices, unpack_12bit_indices
+from tplr.compression import encode_batch_rows, pack_12bit_indices, unpack_12bit_indices
 
 
 class TestTopKCompressor:
@@ -84,7 +84,7 @@ class TestTopKCompressor:
         original_indices = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int64)
 
         # Pack using the new encoder format
-        idx_bytes, _ = encode_batch_rows_sorted(original_indices, C=totalk)
+        idx_bytes, _ = encode_batch_rows(original_indices, C=totalk)
         val = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=torch.float32)
 
         # Test decompression with packed format
@@ -106,8 +106,8 @@ class TestTopKCompressor:
         idx2_orig = torch.tensor([[4, 5], [6, 7]], dtype=torch.int64)
 
         # Pack them using the new encoder format
-        idx1_packed, _ = encode_batch_rows_sorted(idx1_orig, C=totalk)
-        idx2_packed, _ = encode_batch_rows_sorted(idx2_orig, C=totalk)
+        idx1_packed, _ = encode_batch_rows(idx1_orig, C=totalk)
+        idx2_packed, _ = encode_batch_rows(idx2_orig, C=totalk)
 
         idx_list = [idx1_packed, idx2_packed]
 
@@ -224,7 +224,7 @@ class TestTopKCompressor:
 
         # Create test data with Rice/bitmap encoded format
         idx_orig = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)  # Even count
-        idx_packed, _ = encode_batch_rows_sorted(idx_orig, C=totalk)
+        idx_packed, _ = encode_batch_rows(idx_orig, C=totalk)
         idx = [idx_packed]
         val = [torch.tensor([[10.0, 20.0, 30.0, 40.0]], dtype=torch.float32)]
 

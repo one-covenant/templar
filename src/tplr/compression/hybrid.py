@@ -1,6 +1,6 @@
 import math
 from typing import Dict
-from typing import List, Tuple, Union
+from typing import Tuple, Union
 
 import numpy as np
 import torch
@@ -10,18 +10,28 @@ import triton.language as tl
 BytesLike = Union[bytes, bytearray, np.ndarray, torch.Tensor]
 
 
-def encode_batch_rows_sorted(
-        idx_sorted: torch.Tensor,
+@torch.no_grad()
+def encode_batch_rows(
+        idx: torch.Tensor,
         *,
         C: int,
+        use_delta: bool = True,
         B_choices: Tuple[int, ...] = (64, 128)
 ) -> Tuple[BytesLike, Dict]:
     """
-    Compresses a 2D tensor of Top-K indices into a byte string
+    Compresses a 2D int64 tensor of Top-K indices into a byte string
     using a per-row adaptive Rice/Bitmap compression scheme on the GPU.
 
+    Layout:
+    0..3   : "CGRP"         (magic)
+    4..7   : C      (uint32 LE)
+    8..9   : K      (uint16 LE)
+    10..13 : R      (uint32 LE, num_rows)
+    14     : num_B  (uint8)
+    15..   : B_choices (num_B * uint16 LE)
+
     Args:
-        idx_sorted (torch.Tensor): [rows, k] sorted tensor of indices.
+        idx (torch.Tensor): [rows, k] int64 tensor of indices.
         C (int): The total number of columns (0 <= idx < C).
         B_choices (tuple[int, ...]): Block sizes to evaluate.
                                      Must be powers of two.
@@ -36,8 +46,8 @@ def encode_batch_rows_sorted(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this function.")
 
-    if not isinstance(idx_sorted, torch.Tensor) or idx_sorted.ndim != 2:
-        raise ValueError(f"idx must be a 2D int64 tensor, got {idx_sorted.shape}")
+    if not isinstance(idx, torch.Tensor) or idx.ndim != 2:
+        raise ValueError(f"idx must be a 2D int64 tensor, got {idx.shape} {idx.dtype}")
 
     if not all(isinstance(b, int) and (b & (b - 1) == 0) and b > 0 for b in B_choices):
         raise ValueError(f"All B_choices must be powers of two, got {B_choices}")
@@ -45,7 +55,7 @@ def encode_batch_rows_sorted(
     if not all(C % b == 0 for b in B_choices):
         raise ValueError(f"All B_choices must evenly divide C={C}, got {B_choices}")
 
-    num_rows, k_dim = idx_sorted.shape
+    num_rows, k_dim = idx.shape
     if num_rows == 0:
         return b"", {
             "total_bits": 0,
@@ -53,10 +63,22 @@ def encode_batch_rows_sorted(
             "B_hist": {b: 0 for b in B_choices}
         }
 
-    if not idx_sorted.is_cuda:
-        idx_sorted = idx_sorted.cuda()
-    idx_sorted = idx_sorted.contiguous()
-    dev = idx_sorted.device
+    if not idx.is_cuda:
+        idx = idx.cuda()
+    idx = idx.contiguous()
+    dev = idx.device
+
+    if use_delta:
+        # v[0], v[1]-v[0], v[2]-v[1], ...
+        vals = torch.cat(
+            (idx[:, :1], idx[:, 1:] - idx[:, :-1]),
+            dim=1,
+        )
+    else:
+        vals = idx
+
+    # Cast to int32 for Triton kernels
+    vals = vals.to(torch.int32)
 
     # Calculate k_rice parameters (log2(C // B))
     k_rice_choices = tuple(int(math.log2(C // b)) for b in B_choices)
@@ -67,20 +89,15 @@ def encode_batch_rows_sorted(
     # Row header: 1 bit (bitmap/rice) + B_choice_bits
     ROW_HEADER_BITS = 1 + B_choice_bits
 
-    # Delta encode: val[0], val[1]-val[0], val[2]-val[1], ...
-    delta = torch.cat(
-        (idx_sorted[:, :1], idx_sorted[:, 1:] - idx_sorted[:, :-1]),
-        dim=1
-    )
-
     # Output tensors for cost kernel
     costs = torch.empty((num_rows, num_B_choices), dtype=torch.int32, device=dev)
     is_bitmap = torch.empty((num_rows, num_B_choices), dtype=torch.int8, device=dev)
     grid = (num_rows,)
 
+    # Launch cost kernel
     # k_dim is passed as constexpr for tl.arange, but B_choices are dynamic
     cost_kernel[grid](
-        delta,
+        vals,
         costs,
         is_bitmap,
         k_dim=k_dim,
@@ -116,14 +133,16 @@ def encode_batch_rows_sorted(
     # Build global header bytes
     header_list = []
     header_list.append(b"CGRP")  # 4B magic
-    header_list.append(int(C).to_bytes(4, "little"))  # 4B C (uint32 LE)
-    header_list.append(int(k_dim).to_bytes(2, "little"))  # 2B K (uint16 LE)  <--- NEW
-    header_list.append(bytes([len(B_choices)]))  # 1B num_B
+    header_list.append(int(C).to_bytes(4, "little"))       # 4B C (uint32 LE)
+    header_list.append(int(k_dim).to_bytes(2, "little"))   # 2B K (uint16 LE)
+    header_list.append(int(num_rows).to_bytes(4, "little"))  # 4B R (uint32 LE) NEW
+    header_list.append(bytes([len(B_choices)]))            # 1B num_B
     for b in B_choices:
-        header_list.append(int(b).to_bytes(2, "little"))  # 2B per B (uint16 LE)
+        header_list.append(int(b).to_bytes(2, "little"))   # 2B per B (uint16 LE)
 
     global_header_py = b"".join(header_list)
     global_header_len_bytes = len(global_header_py)
+    # this is 15 + 2 * len(B_choices)
 
     # shift row starts by header
     row_bit_offsets = row_bit_offsets + global_header_len_bytes * 8
@@ -139,7 +158,7 @@ def encode_batch_rows_sorted(
     )
 
     pack_kernel[(num_rows,)](
-        delta,
+        vals,
         payload_buf,
         row_bit_offsets.to(torch.int32),
         row_payload_bytes,  # already int32
@@ -151,16 +170,16 @@ def encode_batch_rows_sorted(
         ROW_HEADER_BITS=ROW_HEADER_BITS,
     )
 
-    payload_cpu = payload_buf.cpu()
     b_counts = torch.bincount(best_B_idx, minlength=len(B_choices))
     B_hist = {b: c.item() for b, c in zip(B_choices, b_counts)}
     meta = {
         "total_bits": total_bits,  # includes 16-bit length and byte padding
         "avg_bits_per_row": float(row_bits_aligned.float().mean().item()),
         "avg_payload_bits_per_row": float(row_payload_bits.float().mean().item()),
+        # header+payload, no 16-bit length, before byte-rounding
         "B_hist": B_hist,
     }
-    return payload_cpu, meta
+    return payload_buf, meta
 
 
 @triton.jit
@@ -185,7 +204,7 @@ def cost_kernel(
     # Lane indices for this row (constexpr width)
     i = tl.arange(0, k_dim)
 
-    # Load the entire row of delta-encoded values into SRAM
+    # Load entire row of delta-encoded values into SRAM
     row_base = row_idx * k_dim
     delta = tl.load(delta_ptr + row_base + i)
     delta0 = tl.load(delta_ptr + row_base)
@@ -199,17 +218,13 @@ def cost_kernel(
         q = delta >> k_rice
         q0 = delta0 >> k_rice
 
-        # Pure Rice cost: sum(unary(q)) + sum(r)   where unary(q) has (q + 1) bits,
-        # and r contributes k_rice bits per element.
+        # Pure Rice cost: sum(q + 1) + k_dim * k_rice
         rice_cost = tl.sum(q + 1) + k_dim * k_rice
 
         # Bitmap cost: first element full Rice, tail has (1 + k_rice) bits
-        #   (1 bit for q in {0,1} + k_rice bits for r)
         bitmap_cost = (q0 + 1 + k_rice) + (k_dim - 1) * (1 + k_rice)
-        # equivalently: bitmap_cost = k_dim * (1 + k_rice) + q0
 
         # Allow bitmap only if tail q are in {0,1}
-        # Compute tail max with a masked reduction (ignore lane 0)
         q_tail_max = tl.max(tl.where(i > 0, q, 0))
         bitmap_allowed = q_tail_max <= 1
 
@@ -227,14 +242,18 @@ def cost_kernel(
 
 
 @triton.jit
-def write_nbits(u8_ptr, bit_off_i32, value_u32, nbits_i32):
+def write_nbits(
+    u8_ptr, # uint8* global buffer
+    bit_off_i32, # scalar tl.int32 bit offset
+    value_u32, # scalar tl.uint32, up to 32 bits used
+    nbits_i32, # scalar tl.int32, number of bits to write
+):
     """
-    Write `nbits_i32` bits from `value_u32` at bit offset `bit_off_i32` (LSB-first).
-    All args are Triton scalars:
-      - bit_off_i32 : tl.int32
-      - value_u32   : tl.uint32 (<= 32 bits)
-      - nbits_i32   : tl.int32
-    Returns new bit offset (tl.int32).
+    Writes `nbits_i32` least-significant bits of `value_u32` into `u8_ptr`
+    starting at bit offset `bit_off_i32` in LSB-first order.
+
+    This is still a bit-at-a-time writer; higher-level kernels have been
+    adjusted to use int32 + shift/mask ahead of time.
     """
     j = tl.full((), 0, dtype=tl.int32)
     ONE_U32 = tl.full((), 1, dtype=tl.uint32)
@@ -269,7 +288,7 @@ def pack_kernel(
     ROW_HEADER_BITS: tl.constexpr,
 ):
     """
-    Variant B: first delta Rice (unary = q ones then 0) + r; tail bitmap or Rice.
+    First delta Rice (unary = q ones then 0) + r; tail bitmap or Rice.
     Bit order: LSB-first.
     """
     row_idx = tl.program_id(0)
@@ -304,7 +323,7 @@ def pack_kernel(
 
     base = row_idx * k_dim
 
-    # ---- first delta: ALWAYS Rice ----
+    # first delta: ALWAYS Rice
     if k_dim > 0:
         v0 = tl.load(delta_ptr + base).to(tl.int32)
         q0 = (v0 >> k_rice_i32).to(tl.int32)
@@ -314,7 +333,7 @@ def pack_kernel(
         q_left = q0
         while q_left > 0:
             chunk = tl.minimum(q_left, THIRTY_ONE_I32)
-            ones  = (ONE_U32 << chunk) - ONE_U32
+            ones = (ONE_U32 << chunk) - ONE_U32
             bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ones, chunk)
             q_left -= chunk
         bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ZERO_U32, ONE_I32) # terminating 0
@@ -331,14 +350,14 @@ def pack_kernel(
         q_left = tl.where(use_bitmap_i32 != 0, tl.full((), 0, dtype=tl.int32), q)
         while q_left > 0:
             chunk = tl.minimum(q_left, THIRTY_ONE_I32)
-            ones  = (ONE_U32 << chunk) - ONE_U32
+            ones = (ONE_U32 << chunk) - ONE_U32
             bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ones, chunk)
             q_left -= chunk
         n_term = tl.where(use_bitmap_i32 != 0, tl.full((), 0, dtype=tl.int32), ONE_I32)
         bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, ZERO_U32, n_term)
 
         # bitmap q only if bitmap
-        q_bit  = tl.where(q > 0, ONE_U32, ZERO_U32)
+        q_bit = tl.where(q > 0, ONE_U32, ZERO_U32)
         n_qbit = tl.where(use_bitmap_i32 != 0, ONE_I32, tl.full((), 0, dtype=tl.int32))
         bit_off_i32 = write_nbits(u8_payload_ptr, bit_off_i32, q_bit, n_qbit)
 
@@ -347,213 +366,480 @@ def pack_kernel(
         i += 1
 
 
-class BitStreamReader:
+@triton.jit
+def read_nbits_triton(u8_ptr, bit_off_i32, nbits_i32, limit_bit_i32):
     """
-    LSB-first bit reader over a bytes-like buffer (torch.uint8, np.uint8, or Python bytes).
-    - read_bits(n): reads n bits, returning an integer whose bit j is the j-th bit read.
-    - read_unary_bounded(end_bit): reads '1's until a '0' or end_bit; returns (q, hit_end)
+    GPU version of BitStreamReader.read_bits (LSB-first), but bounds-safe.
+
+    Reads `nbits_i32` bits starting at `bit_off_i32`, but never loads beyond
+    bit index `limit_bit_i32` (masked loads return 0 out-of-bounds).
+
+    Returns: (value_u32, new_bit_off_i32)
     """
-    __slots__ = ("buf", "total_bits", "bit_off")
+    j = tl.full((), 0, dtype=tl.int32)
+    val_u32 = tl.full((), 0, dtype=tl.uint32)
+    ONE_U32 = tl.full((), 1, dtype=tl.uint32)
+    ZERO_U8 = tl.full((), 0, dtype=tl.uint8)
 
-    def __init__(self, payload: BytesLike, bit_offset_start: int = 0):
-        if isinstance(payload, torch.Tensor):
-            assert payload.dtype == torch.uint8
-            self.buf = payload.cpu().numpy().tobytes()
-        elif isinstance(payload, np.ndarray):
-            assert payload.dtype == np.uint8
-            self.buf = payload.tobytes()
-        elif isinstance(payload, (bytes, bytearray)):
-            self.buf = bytes(payload)
-        else:
-            raise TypeError("Unsupported payload type for BitStreamReader")
+    while j < nbits_i32:
+        pos = bit_off_i32 + j
+        in_bounds = pos < limit_bit_i32
 
-        self.total_bits = len(self.buf) * 8
-        self.bit_off = int(bit_offset_start)
+        byte_idx = (pos >> 3).to(tl.int32)
+        bit_idx = (pos & 7).to(tl.int32)
 
-    def read_bits(self, n_bits: int) -> int:
-        """Read n_bits in LSB-first order; returns value with bit j equal to j-th bit read."""
-        if n_bits == 0:
-            return 0
-        if self.bit_off + n_bits > self.total_bits:
-            raise EOFError("Attempt to read past end of bitstream")
-        val = 0
-        start = self.bit_off
-        for j in range(n_bits):
-            pos = start + j
-            b = self.buf[pos >> 3]
-            bit = (b >> (pos & 7)) & 1
-            val |= (bit << j)
-        self.bit_off = start + n_bits
-        return val
+        # Masked load: if in_bounds==0, we load ZERO_U8 instead of touching memory.
+        u8 = tl.load(u8_ptr + byte_idx, mask=in_bounds, other=ZERO_U8)
+        u32 = u8.to(tl.uint32)
+        bit = (u32 >> bit_idx) & ONE_U32
 
-    def read_unary_bounded(self, end_bit: int) -> Tuple[int, bool]:
-        """
-        Read unary as q ones followed by a single 0, *bounded* by end_bit.
-        Returns: (q, hit_end)
-          - q: number of 1s seen before the terminating 0
-          - hit_end: True if we reached end_bit before seeing the terminating 0
-        """
-        q = 0
-        while self.bit_off < end_bit:
-            bit = self.read_bits(1)
-            if bit == 1:
-                q += 1
-            else:
-                return q, False
-        return q, True  # ran out of bits without seeing the terminating 0
+        val_u32 |= (bit << j)
+        j += 1
 
-    def bits_remaining(self) -> int:
-        return self.total_bits - self.bit_off
-
-    def is_at_end(self) -> bool:
-        """True if only up to 7 padding bits remain globally."""
-        return self.bit_off >= self.total_bits - 7
+    new_bit_off = bit_off_i32 + nbits_i32
+    return val_u32, new_bit_off
 
 
-def _parse_global_header(payload: BytesLike) -> Tuple[int, int, list[int], int]:
+@triton.jit
+def read_unary_bounded_triton(u8_ptr, bit_off_i32, end_bit_i32):
     """
+    GPU version of BitStreamReader.read_unary_bounded(end_bit).
+    Reads '1's until a '0' or end_bit.
+    Returns: (q_i32, new_bit_off_i32, hit_end_i32)
+      - q_i32: number of 1s before the terminating 0
+      - hit_end_i32: 1 if we reached end_bit without seeing 0
+                     0 if we saw a terminating 0
+    """
+    ONE_U32 = tl.full((), 1, dtype=tl.uint32)
+    q_i32 = tl.full((), 0, dtype=tl.int32)
+    hit_end_i32 = tl.full((), 1, dtype=tl.int32)
+
+    cond = bit_off_i32 < end_bit_i32
+    while cond:
+        pos = bit_off_i32
+        byte_idx = (pos >> 3).to(tl.int32)
+        bit_idx = (pos & 7).to(tl.int32)
+
+        u8 = tl.load(u8_ptr + byte_idx)
+        u32 = u8.to(tl.uint32)
+        bit = (u32 >> bit_idx) & ONE_U32
+
+        bit_off_i32 += 1
+
+        is_one = (bit == ONE_U32)
+        q_i32 += is_one.to(tl.int32)
+
+        # If bit is 0, we did NOT hit end
+        hit_end_i32 = tl.where(is_one, hit_end_i32,
+                               tl.full((), 0, dtype=tl.int32))
+
+        # Continue only if we are still inside the row and last bit was 1
+        cond = (bit_off_i32 < end_bit_i32) & is_one
+
+    return q_i32, bit_off_i32, hit_end_i32
+
+
+@triton.jit
+def parse_header_kernel(
+    u8_payload_ptr,           # (total_bytes,) uint8
+    C_out_ptr,                # (1,) int32
+    K_out_ptr,                # (1,) int32
+    R_out_ptr,                # (1,) int32  NEW: num_rows
+    num_B_out_ptr,            # (1,) int32
+    B_choices_out_ptr,        # (MAX_B_CHOICES,) int32
+    header_bytes_out_ptr,     # (1,) int32
+    error_flag_ptr,           # (1,) int32
+    total_bytes: tl.int32,
+    MAX_B_CHOICES: tl.constexpr,
+):
+    """
+    Parse the global header entirely on GPU.
+
     Layout:
-      4B "CGRP"
-      4B C (uint32 LE)
-      2B K (uint16 LE)
-      1B num_B
-      2B * num_B  (each B, uint16 LE)
-    Returns: (C, K, B_choices, header_end_bit_offset)
+      0..3   : "CGRP"
+      4..7   : C (uint32 LE)
+      8..9   : K (uint16 LE)
+      10..13 : R (uint32 LE, num_rows)
+      14     : num_B (uint8)
+      15..   : B_choices (num_B * 2 bytes, uint16 LE)
     """
+
+    pid = tl.program_id(0)
+    if pid != 0:
+        return
+
+    # ---- init outputs / error ----
+    C_val = tl.full((), 0, dtype=tl.int32)
+    K_val = tl.full((), 0, dtype=tl.int32)
+    R_val = tl.full((), 0, dtype=tl.int32)
+    num_B_val = tl.full((), 0, dtype=tl.int32)
+    header_bytes_i32 = tl.full((), 0, dtype=tl.int32)
+    err = tl.full((), 0, dtype=tl.int32)
+
+    # ---- basic size + magic checks ----
+    # Minimum header size: 15 bytes (without B_choices)
+    if total_bytes < 15:
+        err = 1
+    else:
+        # Magic "CGRP" = [67, 71, 82, 80]
+        m0 = tl.load(u8_payload_ptr + 0)
+        m1 = tl.load(u8_payload_ptr + 1)
+        m2 = tl.load(u8_payload_ptr + 2)
+        m3 = tl.load(u8_payload_ptr + 3)
+        cond_magic = (m0 == 67) & (m1 == 71) & (m2 == 82) & (m3 == 80)
+        bad_magic = cond_magic == 0
+        err = tl.where(bad_magic, tl.full((), 2, dtype=tl.int32), err)
+
+    # ---- C, K, R, num_B ----
+    if err == 0:
+        # C (uint32 LE at bytes 4..7)
+        b4 = tl.load(u8_payload_ptr + 4).to(tl.int32)
+        b5 = tl.load(u8_payload_ptr + 5).to(tl.int32)
+        b6 = tl.load(u8_payload_ptr + 6).to(tl.int32)
+        b7 = tl.load(u8_payload_ptr + 7).to(tl.int32)
+        C_val = b4 | (b5 << 8) | (b6 << 16) | (b7 << 24)
+
+        # K (uint16 LE at bytes 8..9)
+        b8 = tl.load(u8_payload_ptr + 8).to(tl.int32)
+        b9 = tl.load(u8_payload_ptr + 9).to(tl.int32)
+        K_val = b8 | (b9 << 8)
+
+        # R (uint32 LE at bytes 10..13)
+        b10 = tl.load(u8_payload_ptr + 10).to(tl.int32)
+        b11 = tl.load(u8_payload_ptr + 11).to(tl.int32)
+        b12 = tl.load(u8_payload_ptr + 12).to(tl.int32)
+        b13 = tl.load(u8_payload_ptr + 13).to(tl.int32)
+        R_val = b10 | (b11 << 8) | (b12 << 16) | (b13 << 24)
+
+        # num_B at byte 14
+        num_B_val = tl.load(u8_payload_ptr + 14).to(tl.int32)
+        invalid_num_B = (num_B_val <= 0) | (num_B_val > MAX_B_CHOICES)
+        err = tl.where(invalid_num_B, tl.full((), 3, dtype=tl.int32), err)
+
+    # ---- read B_choices in a structured loop (no break/return) ----
+    off = tl.full((), 15, dtype=tl.int32)  # B_choices start at byte 15
+    i = tl.full((), 0, dtype=tl.int32)
+
+    while i < MAX_B_CHOICES:
+        need_this = (i < num_B_val) & (err == 0)
+
+        if need_this:
+            cond_in_bounds = (off + 1) < total_bytes
+            if cond_in_bounds:
+                lo = tl.load(u8_payload_ptr + off).to(tl.int32)
+                hi = tl.load(u8_payload_ptr + off + 1).to(tl.int32)
+                B_val = lo | (hi << 8)
+                tl.store(B_choices_out_ptr + i, B_val)
+                off += 2
+            else:
+                err = tl.full((), 4, dtype=tl.int32)
+                tl.store(B_choices_out_ptr + i, tl.full((), 0, dtype=tl.int32))
+        else:
+            tl.store(B_choices_out_ptr + i, tl.full((), 0, dtype=tl.int32))
+
+        i += 1
+
+    # header_bytes = 15 + 2 * num_B  (only meaningful if err == 0)
+    if err == 0:
+        header_bytes_i32 = 15 + (num_B_val * 2)
+
+    # ---- store outputs ----
+    tl.store(C_out_ptr, C_val)
+    tl.store(K_out_ptr, K_val)
+    tl.store(R_out_ptr, R_val)
+    tl.store(num_B_out_ptr, num_B_val)
+    tl.store(header_bytes_out_ptr, header_bytes_i32)
+    tl.store(error_flag_ptr, err)
+
+
+@triton.jit
+def scan_rows_kernel(
+    u8_payload_ptr,           # (total_bytes,) uint8
+    row_bit_offsets_ptr,      # (num_rows,) int32  (bit offset of 16-bit length)
+    row_payload_bytes_ptr,    # (num_rows,) int32
+    best_B_idx_ptr,           # (num_rows,) int32
+    use_bitmap_ptr,           # (num_rows,) int32 (0/1)
+    header_end_bit: tl.int32,
+    total_bits: tl.int32,
+    num_rows: tl.int32,
+    ROW_HEADER_BITS: tl.constexpr,
+):
+    """
+    Sequential scan of all rows (1 program). For each row r:
+
+      bit_off:  bit offset of 16-bit payload length
+      length:   row_payload_bytes[r]
+      header:   ((b_idx << 1) | use_bitmap) in ROW_HEADER_BITS bits
+      rest:     payload_bits - ROW_HEADER_BITS bits
+
+    Assumes the bitstream is valid and has enough bits for num_rows rows.
+    """
+    pid = tl.program_id(0)
+    if pid != 0:
+        return
+
+    bit_off_i32 = header_end_bit
+    r = tl.full((), 0, dtype=tl.int32)
+    SIXTEEN_I32 = tl.full((), 16, dtype=tl.int32)
+
+    while r < num_rows:
+        # bit offset at the start of the 16-bit length for this row
+        tl.store(row_bit_offsets_ptr + r, bit_off_i32)
+
+        # read 16-bit payload length (bytes)
+        length_u32, bit_off_after_len = read_nbits_triton(
+            u8_payload_ptr, bit_off_i32, SIXTEEN_I32, total_bits
+        )
+        length_i32 = length_u32.to(tl.int32)
+        tl.store(row_payload_bytes_ptr + r, length_i32)
+
+        # read row header bits: ((b_idx << 1) | use_bitmap)
+        header_u32, bit_off_after_header = read_nbits_triton(
+            u8_payload_ptr,
+            bit_off_after_len,
+            tl.full((), ROW_HEADER_BITS, dtype=tl.int32),
+            total_bits,
+        )
+        header_i32 = header_u32.to(tl.int32)
+        use_bitmap_i32 = header_i32 & 1
+        best_B_idx_i32 = header_i32 >> 1
+
+        tl.store(best_B_idx_ptr + r, best_B_idx_i32)
+        tl.store(use_bitmap_ptr + r, use_bitmap_i32)
+
+        # skip remainder of this row's payload
+        payload_bits_i32 = length_i32 * 8
+        rem_bits_i32 = payload_bits_i32 - ROW_HEADER_BITS
+        bit_off_i32 = bit_off_after_header + rem_bits_i32
+        r += 1
+
+
+@triton.jit
+def decode_rows_kernel(
+    u8_payload_ptr,           # (total_bytes,) uint8
+    out_vals_ptr,             # (num_rows * K,) int32
+    row_bit_offsets_ptr,      # (num_rows,) int32 (bit offset of 16-bit length)
+    row_payload_bytes_ptr,    # (num_rows,) int32
+    best_B_idx_ptr,           # (num_rows,) int32
+    use_bitmap_ptr,           # (num_rows,) int32
+    k_rice_choices_ptr,       # (num_B,) int32
+    num_rows: tl.int32,
+    K: tl.int32,
+    ROW_HEADER_BITS: tl.constexpr,
+):
+    """
+    Fully GPU decode of Rice/bitmap rows.
+
+    For each row:
+      - Start at bit offset of 16-bit length
+      - Skip 16-bit length
+      - Skip header bits (we already know b_idx/use_bitmap from scan)
+      - First value: full Rice (unary + remainder)
+      - Tail: Rice or bitmap+remainder
+    """
+    row_idx = tl.program_id(0)
+    if row_idx >= num_rows:
+        return
+
+    # Per-row metadata
+    row_start_bit_i32 = tl.load(row_bit_offsets_ptr + row_idx).to(tl.int32)
+    payload_bytes_i32 = tl.load(row_payload_bytes_ptr + row_idx).to(tl.int32)
+    best_B_idx_i32 = tl.load(best_B_idx_ptr + row_idx).to(tl.int32)
+    use_bitmap_i32 = (tl.load(use_bitmap_ptr + row_idx) & 1).to(tl.int32)
+
+    # k_rice and M for this row
+    k_rice_i32 = tl.load(k_rice_choices_ptr + best_B_idx_i32).to(tl.int32)
+    M_i32 = (tl.full((), 1, dtype=tl.int32) << k_rice_i32)
+
+    # Bit range of this row
+    bit_after_len_i32 = row_start_bit_i32 + 16
+    row_end_bit_i32 = bit_after_len_i32 + payload_bytes_i32 * 8
+
+    # Skip header bits (we already know the contents)
+    header_dummy_u32, bit_off_i32 = read_nbits_triton(
+        u8_payload_ptr,
+        bit_after_len_i32,
+        tl.full((), ROW_HEADER_BITS, dtype=tl.int32),
+        row_end_bit_i32,  # limit = end of this row
+    )
+
+    base_out = row_idx * K
+    ONE_I32 = tl.full((), 1, dtype=tl.int32)
+
+    # ---- first value: ALWAYS full Rice ----
+    if K > 0:
+        q0_i32, bit_off_i32, hit_end0_i32 = read_unary_bounded_triton(
+            u8_payload_ptr,
+            bit_off_i32,
+            row_end_bit_i32,
+        )
+        r0_u32, bit_off_i32 = read_nbits_triton(
+            u8_payload_ptr,
+            bit_off_i32,
+            k_rice_i32,
+            row_end_bit_i32,  # limit
+        )
+        r0_i32 = r0_u32.to(tl.int32)
+        v0_i32 = q0_i32 * M_i32 + r0_i32
+        tl.store(out_vals_ptr + base_out, v0_i32)
+
+    # ---- tail values ----
+    i = tl.full((), 1, dtype=tl.int32)
+    while i < K:
+        if use_bitmap_i32 != 0:
+            # Bitmap mode: q is 1 bit in {0,1}
+            q_bit_u32, bit_off_i32 = read_nbits_triton(
+                u8_payload_ptr,
+                bit_off_i32,
+                ONE_I32,
+                row_end_bit_i32,
+            )
+            q_i32 = q_bit_u32.to(tl.int32)
+
+            r_u32, bit_off_i32 = read_nbits_triton(
+                u8_payload_ptr,
+                bit_off_i32,
+                k_rice_i32,
+                row_end_bit_i32,
+            )
+            r_i32 = r_u32.to(tl.int32)
+        else:
+            # Full Rice mode
+            q_i32, bit_off_i32, hit_end_i32 = read_unary_bounded_triton(
+                u8_payload_ptr,
+                bit_off_i32,
+                row_end_bit_i32,
+            )
+            r_u32, bit_off_i32 = read_nbits_triton(
+                u8_payload_ptr,
+                bit_off_i32,
+                k_rice_i32,
+                row_end_bit_i32,
+            )
+            r_i32 = r_u32.to(tl.int32)
+
+        v_i32 = q_i32 * M_i32 + r_i32
+        tl.store(out_vals_ptr + base_out + i, v_i32)
+        i += 1
+
+
+def decode_batch_rows(
+    payload: BytesLike,
+    use_delta: bool = True,
+    max_num_B: int = 16,
+) -> tuple[torch.Tensor, int, int]:
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("decode_batch_rows_gpu requires CUDA")
+
+    # --- Move payload to CUDA (if needed) ---
     if isinstance(payload, torch.Tensor):
         assert payload.dtype == torch.uint8
-        raw = payload.cpu().numpy().tobytes()
+        payload_gpu = payload if payload.is_cuda else payload.cuda()
     elif isinstance(payload, np.ndarray):
         assert payload.dtype == np.uint8
-        raw = payload.tobytes()
+        payload_gpu = torch.from_numpy(payload).to("cuda", dtype=torch.uint8)
     elif isinstance(payload, (bytes, bytearray)):
-        raw = bytes(payload)
+        arr = np.frombuffer(bytes(payload), dtype=np.uint8)
+        payload_gpu = torch.from_numpy(arr).to("cuda", dtype=torch.uint8)
     else:
         raise TypeError("Unsupported payload type")
 
-    if len(raw) < 11:
-        raise ValueError("Payload too short for global header")
-    if raw[:4] != b"CGRP":
-        raise ValueError("Bad magic; expected 'CGRP'")
+    payload_gpu = payload_gpu.contiguous()
+    dev = payload_gpu.device
+    total_bytes = int(payload_gpu.numel())
+    if total_bytes == 0:
+        empty = torch.empty((0, 0), dtype=torch.int64, device=dev)
+        return empty, 0, 0
 
-    C     = int.from_bytes(raw[4:8],  "little", signed=False)
-    K     = int.from_bytes(raw[8:10], "little", signed=False)
-    num_B = raw[10]
-    need  = 4 + 4 + 2 + 1 + 2 * num_B
-    if len(raw) < need:
-        raise ValueError("Payload shorter than header requires")
+    total_bits = total_bytes * 8
 
-    B_choices = []
-    off = 11
-    for _ in range(num_B):
-        b = int.from_bytes(raw[off:off+2], "little", signed=False)
-        B_choices.append(b)
-        off += 2
-    return C, K, B_choices, off * 8
+    # --- 1) Parse global header on GPU (now also gets num_rows = R) ---
+    C_out = torch.empty(1, dtype=torch.int32, device=dev)
+    K_out = torch.empty(1, dtype=torch.int32, device=dev)
+    R_out = torch.empty(1, dtype=torch.int32, device=dev)      # NEW
+    num_B_out = torch.empty(1, dtype=torch.int32, device=dev)
+    B_choices_out = torch.empty(max_num_B, dtype=torch.int32, device=dev)
+    header_bytes_out = torch.empty(1, dtype=torch.int32, device=dev)
+    err_flag = torch.zeros(1, dtype=torch.int32, device=dev)
 
+    parse_header_kernel[(1,)](
+        payload_gpu,
+        C_out,
+        K_out,
+        R_out,
+        num_B_out,
+        B_choices_out,
+        header_bytes_out,
+        err_flag,
+        total_bytes,
+        MAX_B_CHOICES=max_num_B,
+    )
 
-def _decode_row(stream: BitStreamReader, M: int, k_rice: int, use_bitmap: int,
-                row_payload_bytes: int, row_header_bits: int,
-                K: int) -> list[int]:
-    """
-    Stream is positioned just AFTER the 16-bit length.
-    Decode EXACTLY K deltas (first is Rice; tail is bitmap or Rice),
-    then align to end-of-row (row_payload_bytes*8).
-    """
-    start_bit   = stream.bit_off
-    row_end_bit = start_bit + row_payload_bytes * 8
+    torch.cuda.synchronize()
+    err = int(err_flag.cpu().item())
+    if err != 0:
+        raise ValueError(f"parse_header_kernel failed with error code {err}")
 
-    # header
-    _ = stream.read_bits(row_header_bits)
+    C = int(C_out.cpu().item())
+    K = int(K_out.cpu().item())
+    num_rows = int(R_out.cpu().item())           # NEW
+    num_B = int(num_B_out.cpu().item())
+    header_bytes = int(header_bytes_out.cpu().item())
+    B_choices_list = [int(x) for x in B_choices_out[:num_B].cpu().tolist()]
+    header_end_bit = header_bytes * 8
 
-    deltas: list[int] = []
-
-    # first (Rice)
-    q0, hit_end = stream.read_unary_bounded(row_end_bit)
-    if hit_end or stream.bit_off + k_rice > row_end_bit:
-        stream.bit_off = row_end_bit
-        return []
-    r0 = stream.read_bits(k_rice)
-    deltas.append(q0 * M + r0)
-
-    # Tail: exactly K-1 more
-    for _ in range(K - 1):
-        if use_bitmap:
-            need = 1 + k_rice
-            if stream.bit_off + need > row_end_bit:
-                # not enough bits; treat as malformed/padded
-                break
-            q = stream.read_bits(1)
-            r = stream.read_bits(k_rice)
-        else:
-            # Rice
-            if stream.bit_off >= row_end_bit:
-                break
-            q, hit_end = stream.read_unary_bounded(row_end_bit)
-            if hit_end or stream.bit_off + k_rice > row_end_bit:
-                break
-            r = stream.read_bits(k_rice)
-        deltas.append(q * M + r)
-
-    # align to end of row explicitly
-    stream.bit_off = row_end_bit
-
-    # prefix sum
-    if not deltas:
-        return []
-    vals = [0] * len(deltas)
-    vals[0] = deltas[0]
-    for i in range(1, len(deltas)):
-        vals[i] = vals[i-1] + deltas[i]
-    return vals
-
-
-def decode_batch_rows(payload: BytesLike) -> tuple[list[list[int]], int, int]:
-    C, K, B_choices, header_end_bit = _parse_global_header(payload)
-    num_B = len(B_choices)
-
-    # derive M/k_rice per choice
-    M_choices, k_rice_choices = [], []
-    for B in B_choices:
+    # --- 2) Build k_rice choices on CPU -> move to GPU ---
+    k_rice_choices = []
+    for B in B_choices_list:
         M = C // B
         if M <= 0 or (M & (M - 1)) != 0:
             raise ValueError(f"M=C//B={M} not power of two for B={B}")
-        M_choices.append(M)
         k_rice_choices.append(int(math.log2(M)))
+    k_rice_choices_tensor = torch.tensor(
+        k_rice_choices, dtype=torch.int32, device=dev
+    )
 
-    B_choice_bits  = (num_B - 1).bit_length()
+    B_choice_bits = (num_B - 1).bit_length()
     ROW_HEADER_BITS = 1 + B_choice_bits
 
-    stream = BitStreamReader(payload, bit_offset_start=header_end_bit)
-    rows_out: list[list[int]] = []
-    while stream.bits_remaining() >= 16:
-        row_payload_bytes = stream.read_bits(16)
-        if row_payload_bytes == 0 and stream.is_at_end():
-            break
+    # --- 3) Scan rows on GPU to get per-row metadata ---
+    row_bit_offsets = torch.empty(num_rows, dtype=torch.int32, device=dev)
+    row_payload_bytes = torch.empty(num_rows, dtype=torch.int32, device=dev)
+    best_B_idx = torch.empty(num_rows, dtype=torch.int32, device=dev)
+    use_bitmap = torch.empty(num_rows, dtype=torch.int32, device=dev)
 
-        # Peek header to learn best_B_idx & use_bitmap
-        if stream.bits_remaining() < ROW_HEADER_BITS:
-            break
-        header = stream.read_bits(ROW_HEADER_BITS)
-        use_bitmap = header & 1
-        best_B_idx = header >> 1
+    scan_rows_kernel[(1,)](
+        payload_gpu,
+        row_bit_offsets,
+        row_payload_bytes,
+        best_B_idx,
+        use_bitmap,
+        header_end_bit,
+        int(total_bits),
+        int(num_rows),
+        ROW_HEADER_BITS=ROW_HEADER_BITS,
+    )
 
-        if not (0 <= best_B_idx < num_B):
-            break
-        M = M_choices[best_B_idx]
-        k_rice = k_rice_choices[best_B_idx]
+    # --- 4) Decode rows in parallel on GPU ---
+    out_vals = torch.empty((num_rows, K), dtype=torch.int32, device=dev)
+    decode_rows_kernel[(num_rows,)](
+        payload_gpu,
+        out_vals,
+        row_bit_offsets,
+        row_payload_bytes,
+        best_B_idx,
+        use_bitmap,
+        k_rice_choices_tensor,
+        int(num_rows),
+        int(K),
+        ROW_HEADER_BITS=ROW_HEADER_BITS,
+    )
 
-        # Rewind header; decode the row with exact K
-        stream.bit_off -= ROW_HEADER_BITS
-        row_vals = _decode_row(
-            stream, M=M, k_rice=k_rice, use_bitmap=use_bitmap,
-            row_payload_bytes=row_payload_bytes, row_header_bits=ROW_HEADER_BITS,
-            K=K
-        )
-        if not row_vals:
-            break
-        rows_out.append(row_vals)
-    return rows_out, C, len(rows_out)
+    # --- undo delta on-GPU if needed ---
+    if use_delta:
+        out_vals = torch.cumsum(out_vals, dim=1)
+    return out_vals.to(torch.int64), C, num_rows
 
 
 if __name__ == "__main__":
@@ -561,18 +847,19 @@ if __name__ == "__main__":
     ROWS, K = 32, 16
     COLS = 4096
 
-    x = torch.randn((ROWS, COLS), dtype=torch.float32)
+    x = torch.randn((ROWS, COLS), dtype=torch.float32, device="cuda")
     idx = torch.topk(x.abs(), k=K, dim=-1, largest=True, sorted=False).indices
-
-    idx, _ = torch.sort(idx, dim=1)
-    payload, _ = encode_batch_rows_sorted(idx, C=COLS, B_choices=(64, 128, 256))
-    decoded, _, _ = decode_batch_rows(payload)
-    ok = True
-    idx = [row for row in idx]
-    for r in range(ROWS):
-        if not torch.equal(torch.tensor(decoded[r]), idx[r].cpu()):
-            ok = False
-            print("Mismatch row", r)
-            print("orig:", idx[r].tolist())
-            print("dec :", decoded[r])
-    print("Round-trip OK" if ok else "Round-trip MISMATCH")
+    for use_delta in [False, True]:
+        if use_delta:
+            idx, _ = torch.sort(idx, dim=1)
+        payload, _ = encode_batch_rows(idx, C=COLS, use_delta=use_delta, B_choices=(64, 128, 256))
+        decoded, _, _ = decode_batch_rows(payload, use_delta=use_delta)
+        dec = [torch.tensor(r, dtype=torch.int64) for r in decoded]
+        ok = True
+        for r in range(ROWS):
+            if not torch.equal(torch.tensor(decoded[r]), idx[r]):
+                ok = False
+                print("Mismatch row", r)
+                print("orig:", idx[r].tolist())
+                print("dec :", decoded[r])
+        print("Round-trip OK" if ok else "Round-trip MISMATCH")

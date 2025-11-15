@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor as DT
 
 import tplr
 
-from tplr.compression import encode_batch_rows_sorted, decode_batch_rows
+from tplr.compression import encode_batch_rows, decode_batch_rows
 
 # ─────────── type aliases ────────────────────────────────────────────────
 # primitive shapes
@@ -329,7 +329,7 @@ class TopKCompressor(Generic[Q]):
         # sort indices and apply same perm to values
         idx_sorted, perm = torch.sort(idx2d, dim=1)
         val = torch.gather(val2d, dim=1, index=perm)
-        idx_bytes, _meta = encode_batch_rows_sorted(idx_sorted, C=totalk, B_choices=_DEFAULT_B_CHOICES)
+        idx_bytes, _meta = encode_batch_rows(idx_sorted, C=totalk, B_choices=_DEFAULT_B_CHOICES)
 
         # Apply 8-bit quantization if enabled
         if self.use_quantization:
@@ -372,8 +372,7 @@ class TopKCompressor(Generic[Q]):
 
         # Decode indices
         if idx.dtype == torch.uint8:
-            payload_bytes = idx.detach().cpu().numpy().tobytes()
-            rows_list, C, _N = decode_batch_rows(payload_bytes)
+            rows_list, C, _N = decode_batch_rows(idx)
             if C != totalk:
                 raise ValueError(f"Index payload C={C} but expected {totalk}")
             k = val.shape[-1]
