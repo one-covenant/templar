@@ -43,8 +43,8 @@
     "eval_lr_factor": 0.2,
     "openskill_beta": 7,
     "openskill_tau": 0.1,
-    "checkpoint_init_version": "2.1.14",
-    "checkpoint_init_window": 59518,
+    "checkpoint_init_version": "2.1.15",
+    "checkpoint_init_window": 59637,
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
@@ -65,7 +65,7 @@
         "t_max": 140000,
         "eta_min_factor": 0.1,
         "flatten_start_step": 2740,
-        "flatten_duration": 1000
+        "flatten_duration": 450
       }
     },
     "muon": {
@@ -98,7 +98,7 @@
     "enable_cpu_offload": false,
 
     "mixed_precision_param": "bfloat16",
-    "mixed_precision_reduce": "float32",
+    "mixed_precision_reduce": "bfloat16",
 
     "enable_async_tensor_parallel": false,
     "disable_loss_parallel": true,

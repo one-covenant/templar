@@ -1465,21 +1465,35 @@ class Validator(BaseNode, Trainer):
 
             # Only master rank performs the gather operation
             if self.is_master:
-                gather_result = await self.comms.gather_with_reserve(
-                    my_uid=self.uid,
-                    gather_uids=self.comms.peers,
-                    reserve_uids=self.comms.reserve_peers,
-                    window=self.sync_window,
-                    key="gradient",
-                    timeout=90,
-                    device=cast(str, self.device),
-                    local=False,
-                    totalks=self.totalks,
-                    compressor=self.compressor,
-                    time_min=time_min,
-                    time_max=time_max,
-                    expected_compressed_params=self.expected_compressed_params,
-                )
+                try:
+                    tplr.logger.info(
+                        f"Rank {dist_helper.rank} starting gather_with_reserve for window {self.sync_window}"
+                    )
+                    gather_result = await self.comms.gather_with_reserve(
+                        my_uid=self.uid,
+                        gather_uids=self.comms.peers,
+                        reserve_uids=self.comms.reserve_peers,
+                        window=self.sync_window,
+                        key="gradient",
+                        timeout=90,
+                        device=cast(str, self.device),
+                        local=False,
+                        totalks=self.totalks,
+                        compressor=self.compressor,
+                        time_min=time_min,
+                        time_max=time_max,
+                        expected_compressed_params=self.expected_compressed_params,
+                    )
+                    tplr.logger.info(
+                        f"Rank {dist_helper.rank} completed gather_with_reserve for window {self.sync_window}"
+                    )
+                except Exception as e:
+                    tplr.logger.error(
+                        f"Rank {dist_helper.rank} failed during gather_with_reserve: {e}",
+                        exc_info=True,
+                    )
+                    gather_result = None
+                    skip_window = True
 
                 if gather_result is None:
                     tplr.log_with_context(
@@ -1494,8 +1508,20 @@ class Validator(BaseNode, Trainer):
             skip_tensor = torch.tensor(
                 [1 if skip_window else 0], device=self.device, dtype=torch.int32
             )
-            dist_helper.broadcast(skip_tensor, src=0)
-            skip_window = bool(skip_tensor.item())
+            try:
+                tplr.logger.debug(
+                    f"Rank {dist_helper.rank} attempting broadcast of skip_tensor: {skip_tensor.item()}"
+                )
+                dist_helper.broadcast(skip_tensor, src=0)
+                skip_window = bool(skip_tensor.item())
+                tplr.logger.debug(
+                    f"Rank {dist_helper.rank} successfully broadcast skip_tensor: {skip_window}"
+                )
+            except Exception as e:
+                tplr.logger.error(
+                    f"Rank {dist_helper.rank} failed broadcast: {e}", exc_info=True
+                )
+                raise
 
             if skip_window:
                 continue

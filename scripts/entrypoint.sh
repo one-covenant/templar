@@ -61,10 +61,14 @@ if [ "$NODE_TYPE" = "miner" ]; then
         ${DEBUG_FLAG}
 elif [ "$NODE_TYPE" = "validator" ]; then
     echo "Starting validator with torchrun..."
+    # Enable per-rank logging to separate files
     exec torchrun \
         --standalone \
         --nnodes 1 \
         --nproc_per_node 4 \
+        --log_dir /app/logs/torchrun \
+        --redirects 3 \
+        --tee 3 \
         neurons/validator.py \
         --wallet.name ${WALLET_NAME} \
         --wallet.hotkey ${WALLET_HOTKEY} \
