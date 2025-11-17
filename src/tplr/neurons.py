@@ -110,7 +110,7 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                 miner.error_feedback[n] = miner.error_feedback[n].to(
                     param.device, non_blocking=True
                 )
-
+    compression_time = 0
     for _, (n, p) in enumerate(model_iterator, 1):
         owned = n in miner.owned_params
         p_is_dt = is_dtensor(p)
@@ -165,8 +165,7 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         decompressed = miner.compressor.decompress(
             p, idxs, vals, xshape, totalk, quant_params
         )
-        compression_time = tplr.T() - compress_start
-        tplr.logger.info(f"Compression time: {compression_time}")
+        compression_time += tplr.T() - compress_start
 
         # --- 6) Decode & error-feedback update (owner only) ---
         transmit_grad = miner.transformer.decode(decompressed, use_dct=use_dct)
@@ -203,6 +202,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
         # Clear per-param grad
         p.grad = None
+
+    tplr.logger.info(f"Compression time: {compression_time}")
 
     # Batch offload all error feedback tensors to CPU with pinned memory
     for name in miner.error_feedback:
