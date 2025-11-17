@@ -15,7 +15,6 @@ def encode_batch_rows(
         idx: torch.Tensor,
         *,
         C: int,
-        use_delta: bool = True,
         B_choices: Tuple[int, ...] = (64, 128)
 ) -> Tuple[BytesLike, Dict]:
     """
@@ -68,14 +67,11 @@ def encode_batch_rows(
     idx = idx.contiguous()
     dev = idx.device
 
-    if use_delta:
-        # v[0], v[1]-v[0], v[2]-v[1], ...
-        vals = torch.cat(
-            (idx[:, :1], idx[:, 1:] - idx[:, :-1]),
-            dim=1,
-        )
-    else:
-        vals = idx
+    # v[0], v[1]-v[0], v[2]-v[1], ...
+    vals = torch.cat(
+        (idx[:, :1], idx[:, 1:] - idx[:, :-1]),
+        dim=1,
+    )
 
     # Cast to int32 for Triton kernels
     vals = vals.to(torch.int32)
@@ -725,7 +721,6 @@ def decode_rows_kernel(
 
 def decode_batch_rows(
     payload: BytesLike,
-    use_delta: bool = True,
     max_num_B: int = 16,
 ) -> tuple[torch.Tensor, int, int]:
 
@@ -837,8 +832,7 @@ def decode_batch_rows(
     )
 
     # --- undo delta on-GPU if needed ---
-    if use_delta:
-        out_vals = torch.cumsum(out_vals, dim=1)
+    out_vals = torch.cumsum(out_vals, dim=1)
     return out_vals.to(torch.int64), C, num_rows
 
 
@@ -849,17 +843,14 @@ if __name__ == "__main__":
 
     x = torch.randn((ROWS, COLS), dtype=torch.float32, device="cuda")
     idx = torch.topk(x.abs(), k=K, dim=-1, largest=True, sorted=False).indices
-    for use_delta in [False, True]:
-        if use_delta:
-            idx, _ = torch.sort(idx, dim=1)
-        payload, _ = encode_batch_rows(idx, C=COLS, use_delta=use_delta, B_choices=(64, 128, 256))
-        decoded, _, _ = decode_batch_rows(payload, use_delta=use_delta)
-        dec = [torch.tensor(r, dtype=torch.int64) for r in decoded]
-        ok = True
-        for r in range(ROWS):
-            if not torch.equal(torch.tensor(decoded[r]), idx[r]):
-                ok = False
-                print("Mismatch row", r)
-                print("orig:", idx[r].tolist())
-                print("dec :", decoded[r])
-        print("Round-trip OK" if ok else "Round-trip MISMATCH")
+    idx, _ = torch.sort(idx, dim=1)
+    payload, _ = encode_batch_rows(idx, C=COLS, B_choices=(64, 128, 256))
+    decoded, _, _ = decode_batch_rows(payload)
+    ok = True
+    for r in range(ROWS):
+        if not torch.equal(torch.tensor(decoded[r]), idx[r]):
+            ok = False
+            print("Mismatch row", r)
+            print("orig:", idx[r].tolist())
+            print("dec :", decoded[r])
+    print("Round-trip OK" if ok else "Round-trip MISMATCH")
