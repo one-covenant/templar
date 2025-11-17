@@ -154,6 +154,7 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         # --- 4) Encode & compress (owner only) ---
         encoded = miner.transformer.encode(error_feedback, use_dct=use_dct)
 
+        compress_start = tplr.T()
         idxs, vals, xshape, totalk, quant_params = miner.compressor.compress(
             encoded, topk
         )
@@ -164,6 +165,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         decompressed = miner.compressor.decompress(
             p, idxs, vals, xshape, totalk, quant_params
         )
+        compression_time = tplr.T() - compress_start
+        tplr.logger.info(f"Compression time: {compression_time}")
 
         # --- 6) Decode & error-feedback update (owner only) ---
         transmit_grad = miner.transformer.decode(decompressed, use_dct=use_dct)
