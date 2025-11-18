@@ -221,6 +221,30 @@ class ChunkingTransformer:
             # Note: b-c axis output is transposed to chunk DCT in 2D
             return torch.einsum("...ijbd, bk, dl -> ...ijkl", x, b, d)
 
+    def _ensure_shape_in_dict(
+        self, s: int, device: torch.device, dtype: torch.dtype, norm: str = "ortho"
+    ):
+        """
+        Ensure a shape is in the shape_dict, adding it dynamically if needed.
+        This is necessary for TP where local shard shapes may not be in the initial dict.
+
+        Args:
+            s: The shape dimension to ensure
+            device: The device for DCT matrices
+            dtype: The dtype for DCT matrices
+            norm: The normalization for DCT
+        """
+        if s not in self.shape_dict:
+            # Get the closest smallest divisor to the targeted DCT size
+            sc = _get_smaller_split(s, self.target_chunk)
+            self.shape_dict[s] = sc
+
+            # Pregenerate DCT basis matrices if not already present
+            if sc not in self.f_dict:
+                I = torch.eye(sc)  # noqa: E741
+                self.f_dict[sc] = _dct(I, norm=norm).to(dtype).to(device)
+                self.b_dict[sc] = _idct(I, norm=norm).to(dtype).to(device)
+
     @torch.no_grad()
     def encode(self, x: torch.Tensor, *, use_dct: bool = False) -> torch.Tensor:
         """
@@ -234,8 +258,16 @@ class ChunkingTransformer:
             torch.Tensor: The encoded tensor.
         """
         if len(x.shape) > 1:  # 2D weights
-            n1 = self.shape_dict[x.shape[0]]
-            n2 = self.shape_dict[x.shape[1]]
+            # Fast path: assume shapes are in dict (true for FSDP and after first TP step)
+            try:
+                n1 = self.shape_dict[x.shape[0]]
+                n2 = self.shape_dict[x.shape[1]]
+            except KeyError:
+                # Slow path: dynamically add missing shapes (only for TP with new shard sizes)
+                self._ensure_shape_in_dict(x.shape[0], x.device, x.dtype)
+                self._ensure_shape_in_dict(x.shape[1], x.device, x.dtype)
+                n1 = self.shape_dict[x.shape[0]]
+                n2 = self.shape_dict[x.shape[1]]
             n1w = self.f_dict[n1].to(x.device)
             n2w = self.f_dict[n2].to(x.device)
             self.f_dict[n1] = n1w
@@ -246,7 +278,13 @@ class ChunkingTransformer:
                 x = self.einsum_2d(x, n1w, n2w)
 
         else:  # 1D weights
-            n1 = self.shape_dict[x.shape[0]]
+            # Fast path: assume shape is in dict
+            try:
+                n1 = self.shape_dict[x.shape[0]]
+            except KeyError:
+                # Slow path: dynamically add missing shape (only for TP with new shard sizes)
+                self._ensure_shape_in_dict(x.shape[0], x.device, x.dtype)
+                n1 = self.shape_dict[x.shape[0]]
             n1w = self.f_dict[n1].to(x.device)
             self.f_dict[n1] = n1w
 

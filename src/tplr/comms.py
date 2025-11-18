@@ -47,6 +47,14 @@ from tplr.compress import TopKCompressor, unpack_12bit_indices
 from tplr.config import BUCKET_SECRETS, client_config
 from tplr.schemas import Bucket, CommsGetResult
 
+# Add DTensor types to safe globals for torch.load with weights_only=True
+try:
+    from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
+
+    torch.serialization.add_safe_globals([_StridedShard, Replicate, Shard])
+except ImportError:
+    pass  # DTensor not available, skip
+
 # Constants
 CF_REGION_NAME: str = "enam"
 LOCAL_TMP_DIR = "/tmp/local_store"
@@ -96,7 +104,9 @@ class Comms(ChainManager):
         self.wallet = wallet
 
         # Create temp directory for this instance
-        self.temp_dir = os.path.join("/tmp", f"templar_{self.uid}")
+        # Respect TMPDIR environment variable, fallback to /tmp
+        base_tmp = os.getenv("TMPDIR", "/tmp")
+        self.temp_dir = os.path.join(base_tmp, f"templar_{self.uid}")
         os.makedirs(self.temp_dir, exist_ok=True)
         # Get the bucket directly
         self.bucket = self.get_own_bucket("gradients", "write")
@@ -1311,7 +1321,9 @@ class Comms(ChainManager):
         put_start = tplr.T()
 
         # Create per-uid temp directory
-        temp_dir = os.path.join("/tmp", str(self.uid))
+        # Respect TMPDIR environment variable, fallback to /tmp
+        base_tmp = os.getenv("TMPDIR", "/tmp")
+        temp_dir = os.path.join(base_tmp, str(self.uid))
         os.makedirs(temp_dir, exist_ok=True)
         temp_file_path = os.path.join(temp_dir, f"temp_{filename}")
 

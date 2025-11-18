@@ -240,7 +240,9 @@ class TestCreateParallelDims(unittest.TestCase):
         self.assertEqual(pdims.world_size, 1)
 
     def test_miner_role_custom_tp(self):
-        hparams = SimpleNamespace(torchtitan=SimpleNamespace(tp_degree=2))
+        hparams = SimpleNamespace(
+            torchtitan=SimpleNamespace(tp_degree=2, tie_embeddings=False)
+        )
         pdims = create_parallel_dims(world_size=2, hparams=hparams, role="miner")
         self.assertEqual(pdims.tp, 2)
         self.assertEqual(pdims.world_size, 2)
@@ -251,7 +253,7 @@ class TestCreateParallelDims(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ValueError,
-            "Specify either torchtitan.dp_replicate or torchtitan.dp_shard, but not both.",
+            "Cannot use both dp_replicate and dp_shard > 1",
         ):
             create_parallel_dims(world_size=4, hparams=hparams, role="miner")
 
@@ -260,7 +262,7 @@ class TestCreateParallelDims(unittest.TestCase):
             torchtitan=SimpleNamespace(dp_replicate=2, tp_degree=2)
         )
         with self.assertRaisesRegex(
-            ValueError, "dp_replicate can only be used when tp/pp/cp are all 1."
+            ValueError, "dp_replicate .* can only be used when tp/pp/cp are all 1"
         ):
             create_parallel_dims(world_size=4, hparams=hparams, role="miner")
 
@@ -268,15 +270,17 @@ class TestCreateParallelDims(unittest.TestCase):
         hparams = SimpleNamespace(torchtitan=SimpleNamespace(dp_shard=2))
         with self.assertRaisesRegex(
             ValueError,
-            "world_size .* must be divisible by the product of all parallel degrees",
+            "world_size .* must be divisible by",
         ):
             create_parallel_dims(world_size=3, hparams=hparams, role="miner")
 
     def test_miner_role_world_size_not_divisible_by_tp(self):
-        hparams = SimpleNamespace(torchtitan=SimpleNamespace(tp_degree=2))
+        hparams = SimpleNamespace(
+            torchtitan=SimpleNamespace(tp_degree=2, tie_embeddings=False)
+        )
         with self.assertRaisesRegex(
             ValueError,
-            "world_size .* must be divisible by the product of all parallel degrees",
+            "world_size .* must be divisible by",
         ):
             create_parallel_dims(world_size=3, hparams=hparams, role="miner")
 
