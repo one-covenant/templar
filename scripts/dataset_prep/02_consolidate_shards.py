@@ -108,10 +108,37 @@ async def run_preprocessing(
                 )
             )
 
-        tokens_view = np.memmap(tokens_file, dtype=token_dtype, mode="r")
-        tok_u32 = tokens_view.view(np.uint32)  # reinterpret for 4-byte hashing
+        # Load tokens - if .npy file, use np.load to respect embedded dtype
+        if tokens_file.endswith(".npy"):
+            tokens_view = np.load(tokens_file, mmap_mode="r", allow_pickle=False)
+            # Ensure it's uint32 (step 01 saves as uint32)
+            if tokens_view.dtype != np.uint32:
+                tqdm.write(
+                    f"Warning: Shard {i} has dtype {tokens_view.dtype}, expected uint32. "
+                    f"Converting (this may indicate a preprocessing mismatch)."
+                )
+                tok_u32 = tokens_view.astype(np.uint32)
+            else:
+                tok_u32 = tokens_view
+        else:
+            # Raw binary file - use specified dtype then reinterpret as uint32
+            tokens_view = np.memmap(tokens_file, dtype=token_dtype, mode="r")
+            tok_u32 = tokens_view.view(np.uint32)
 
-        raw_idx = np.arange(0, tok_u32.shape[0] + 1, seq_len)
+        # Only create sample IDs for complete sequences (discard partial sequence at end)
+        total_tokens = tok_u32.shape[0]
+        num_complete_samples = total_tokens // seq_len
+
+        # Warn if there's a partial sequence that will be discarded
+        remainder = total_tokens % seq_len
+        if remainder > 0:
+            tqdm.write(
+                f"Warning: Shard {i} has {remainder} tokens remaining after chunking "
+                f"(total: {total_tokens}, seq_len: {seq_len}). "
+                f"Creating {num_complete_samples} complete samples."
+            )
+
+        raw_idx = np.arange(0, num_complete_samples * seq_len + 1, seq_len)
         starts = raw_idx[:-1]
         ends = raw_idx[1:]
 
@@ -208,7 +235,6 @@ async def main() -> None:
     print(f"  • Shards path: {args.r2_prefix}")
     print(f"  • Sequence length: {args.seq_len}")
     print(f"  • Token dtype: {args.token_dtype}")
-    print(f"  • Skip Validation: {args.skip_validation}")
     print()
 
     success = await run_preprocessing(args, args.seq_len, token_dtype)
