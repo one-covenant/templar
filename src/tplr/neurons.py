@@ -111,6 +111,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                     param.device, non_blocking=True
                 )
     compression_time = 0
+    copy_time = 0
+    encode_time = 0
     for _, (n, p) in enumerate(model_iterator, 1):
         owned = n in miner.owned_params
         p_is_dt = is_dtensor(p)
@@ -152,7 +154,9 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             error_feedback.add_(grad_full)
 
         # --- 4) Encode & compress (owner only) ---
+        encode_start = tplr.T()
         encoded = miner.transformer.encode(error_feedback, use_dct=use_dct)
+        encode_time += tplr.T() - encode_start
 
         compress_start = tplr.T()
         idxs, vals, xshape, totalk, quant_params = miner.compressor.compress(
@@ -168,15 +172,18 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         compression_time += tplr.T() - compress_start
 
         # --- 6) Decode & error-feedback update (owner only) ---
+        encode_start = tplr.T()
         transmit_grad = miner.transformer.decode(decompressed, use_dct=use_dct)
         del decompressed
         error_feedback.sub_(transmit_grad)
         # Keep error feedback on GPU for now, batch offload later
         miner.error_feedback[n] = error_feedback
         del transmit_grad, error_feedback
+        encode_time += tplr.T() - encode_start
 
         # --- 7) Pack outputs (move compressed artifacts to CPU asynchronously) ---
         # Using non_blocking=True for async D2H transfers when CUDA is available
+        copy_start = tplr.T()
         if isinstance(idxs, torch.Tensor):
             if torch.cuda.is_available():
                 cpu_idxs = torch.empty_like(idxs, device="cpu", pin_memory=True)
@@ -202,8 +209,9 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
         # Clear per-param grad
         p.grad = None
+        copy_time += tplr.T() - copy_start
 
-    tplr.logger.info(f"Compression time: {compression_time}")
+    tplr.logger.info(f"times: {encode_time}, {compression_time}, {copy_time}")
 
     # Batch offload all error feedback tensors to CPU with pinned memory
     for name in miner.error_feedback:
