@@ -26,7 +26,6 @@ from .pack12 import (
     unpack_12bit_indices
 )
 __all__ = [
-    # High level
     "encode_batch_rows",
     "decode_batch_rows",
     "pack_12bit_indices",

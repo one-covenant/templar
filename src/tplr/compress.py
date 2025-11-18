@@ -31,7 +31,7 @@ from torch.distributed.tensor import DTensor as DT
 
 import tplr
 
-from tplr.compression import encode_batch_rows, decode_batch_rows
+from tplr.compression import encode_batch_rows, decode_batch_rows, unpack_12bit_indices
 
 # ─────────── type aliases ────────────────────────────────────────────────
 # primitive shapes
@@ -489,16 +489,21 @@ class TopKCompressor(Generic[Q]):
         for i, i_data in enumerate(idx_list):
             v_data = val_list[i]
             if i_data.dtype == torch.uint8:
-                rows, C, _N = decode_batch_rows(i_data.detach().cpu().numpy().tobytes())
-                if C != totalk:
-                    raise ValueError(f"Index payload C={C} but expected {totalk}")
-                if any(len(r) != v_data.shape[-1] for r in rows):
-                    raise ValueError(
-                        "Row-wise topk size mismatch in index payload (batch)"
-                    )
-                idx_unpacked = torch.tensor(
-                    rows, dtype=torch.int64, device=p.device
-                ).view(*v_data.shape)
+                try:
+                    rows, C, _N = decode_batch_rows(i_data.detach().cpu().numpy().tobytes())
+                    if C != totalk:
+                        raise ValueError(f"Index payload C={C} but expected {totalk}")
+                    if any(len(r) != v_data.shape[-1] for r in rows):
+                        raise ValueError(
+                            "Row-wise topk size mismatch in index payload (batch)"
+                        )
+                    idx_unpacked = torch.tensor(
+                        rows, dtype=torch.int64, device=p.device
+                    ).view(*v_data.shape)
+                except ValueError as e:
+                    # Fallback: likely old format -> try legacy decoder
+                    idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
+
                 unpacked_indices.append(idx_unpacked)
             elif i_data.dtype in (torch.int64, torch.long):
                 idx_unpacked = i_data.to(p.device)
