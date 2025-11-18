@@ -152,15 +152,20 @@ class SharedShardedDataset(Dataset):
                 f"File: {self.tokens_file}"
             )
 
-        # The authoritative sample count comes from ids file
-        self.total_samples = int(self.sample_ids.shape[0])
+        # Calculate actual sample count from tokens (authoritative source)
+        actual_samples_from_tokens = total_tokens // self.seqlen
+        sample_ids_count = int(self.sample_ids.shape[0])
 
-        # Optional cross-check (warn if mismatch rather than crash)
-        expected_tokens = self.total_samples * self.seqlen
-        if expected_tokens != total_tokens:
+        # Use the smaller of the two to avoid out-of-bounds access
+        self.total_samples = min(actual_samples_from_tokens, sample_ids_count)
+
+        # Warn if there's a mismatch (indicates preprocessing bug)
+        if actual_samples_from_tokens != sample_ids_count:
             tplr.logger.warning(
-                f"[Dataset] tokens != ids*seqlen: tokens={total_tokens}, "
-                f"ids={self.total_samples}, seqlen={self.seqlen} (file: {self.tokens_file})"
+                f"[Dataset] Mismatch between tokens and sample_ids! "
+                f"tokens={total_tokens} ({actual_samples_from_tokens} samples), "
+                f"sample_ids={sample_ids_count} (file: {self.tokens_file}). "
+                f"Using {self.total_samples} samples to avoid out-of-bounds access."
             )
 
         return
