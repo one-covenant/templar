@@ -647,28 +647,11 @@ class Miner(BaseNode, Trainer):
                 await self.wait_until_window(step_window + 1)
 
             if self.is_master:
-                put_start = tplr.T()
-                await self.comms.put(
-                    state_dict=processed_state_dict,
-                    uid=str(self.uid),
-                    window=step_window,
-                    key="gradient",
-                    global_step=self.global_step,
-                    local=False,
-                    stale_retention=100,
-                )
+                # OOM TEST: Skip gradient upload
+                tplr.logger.info("🔥 OOM TEST: Skipping gradient upload")
+                put_time = 0.0
 
-                upload_size = sum(
-                    t.element_size() * t.nelement()
-                    for t in processed_state_dict.values()
-                    if isinstance(t, torch.Tensor)
-                )
-                put_time = tplr.T() - put_start  # ⏱ done
-                tplr.logger.info(
-                    f"Uploaded {upload_size / 1e6:.1f} MB shard-merged gradient"
-                )
-
-                # Free memory immediately after upload
+                # Free memory immediately
                 del processed_state_dict
                 del gradient
                 torch.cuda.empty_cache()

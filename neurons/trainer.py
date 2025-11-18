@@ -777,14 +777,20 @@ class Trainer:
                 # 2. Prepare inputs
                 # ------------------------------------------------------------------ #
                 with tp.record_function("Prepare Inputs") if prof else nullcontext():
-                    if isinstance(batch, torch.Tensor):
-                        input_ids = batch.to(
-                            self.device, dtype=torch.long, non_blocking=True
-                        )
-                    else:
-                        input_ids = torch.tensor(
-                            batch, dtype=torch.long, device=self.device
-                        )
+                    # OOM TEST: Always use random data with 4096 sequence length
+                    tplr.logger.info(
+                        "🔥 OOM TEST: Using random data with 4096 sequence length"
+                    )
+                    local_bs = (
+                        len(batch) if isinstance(batch, torch.Tensor) else len(batch)
+                    )  # type: ignore
+                    input_ids = torch.randint(
+                        0,
+                        self.tokenizer.vocab_size,
+                        (local_bs, 4096),
+                        dtype=torch.long,
+                        device=self.device,
+                    )
 
                     local_bs = len(batch)  # type: ignore
                     accum_batch_size += local_bs
