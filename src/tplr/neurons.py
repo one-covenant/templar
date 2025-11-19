@@ -111,7 +111,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                     param.device, non_blocking=True
                 )
     compression_time = 0
-    copy_time = 0
     encode_time = 0
     for _, (n, p) in enumerate(model_iterator, 1):
         owned = n in miner.owned_params
@@ -183,7 +182,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
         # --- 7) Pack outputs (move compressed artifacts to CPU asynchronously) ---
         # Using non_blocking=True for async D2H transfers when CUDA is available
-        copy_start = tplr.T()
         if isinstance(idxs, torch.Tensor):
             if torch.cuda.is_available():
                 cpu_idxs = torch.empty_like(idxs, device="cpu", pin_memory=True)
@@ -209,9 +207,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
 
         # Clear per-param grad
         p.grad = None
-        copy_time += tplr.T() - copy_start
 
-    tplr.logger.info(f"times: {encode_time}, {compression_time}, {copy_time}")
+    tplr.logger.info(f"times: {encode_time}, {compression_time}")
 
     # Batch offload all error feedback tensors to CPU with pinned memory
     for name in miner.error_feedback:

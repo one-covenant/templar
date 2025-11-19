@@ -491,7 +491,7 @@ class TopKCompressor(Generic[Q]):
             v_data = val_list[i]
             if i_data.dtype == torch.uint8:
                 try:
-                    rows, C, _N = decode_batch_rows(i_data.detach().cpu().numpy().tobytes())
+                    rows, C, _N = decode_batch_rows(i_data)
                     if C != totalk:
                         raise ValueError(f"Index payload C={C} but expected {totalk}")
                     if any(len(r) != v_data.shape[-1] for r in rows):
@@ -501,7 +501,7 @@ class TopKCompressor(Generic[Q]):
                     idx_unpacked = torch.tensor(
                         rows, dtype=torch.int64, device=p.device
                     ).view(*v_data.shape)
-                except ValueError as e:
+                except Exception as e:
                     # Fallback: likely old format -> try legacy decoder
                     idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
 
