@@ -246,5 +246,4 @@ def read_unary_bounded_triton(u8_ptr, bit_off_i32, end_bit_i32):
 
         # Continue only if we are still inside the row and last bit was 1
         cond = (bit_off_i32 < end_bit_i32) & is_one
-
     return q_i32, bit_off_i32, hit_end_i32

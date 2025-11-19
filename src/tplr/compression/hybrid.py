@@ -14,7 +14,7 @@ BytesLike = Union[bytes, bytearray, np.ndarray, torch.Tensor]
 
 @torch.no_grad()
 def encode_batch_rows(
-        idx: torch.Tensor,
+        idx_sorted: torch.Tensor,
         *,
         C: int,
         B_choices: Tuple[int, ...] = (64, 128)
@@ -46,8 +46,8 @@ def encode_batch_rows(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this function.")
 
-    if not isinstance(idx, torch.Tensor) or idx.ndim != 2:
-        raise ValueError(f"idx must be a 2D int64 tensor, got {idx.shape} {idx.dtype}")
+    if not isinstance(idx_sorted, torch.Tensor) or idx_sorted.ndim != 2:
+        raise ValueError(f"idx must be a 2D int64 tensor, got {idx_sorted.shape} {idx_sorted.dtype}")
 
     if not all(isinstance(b, int) and (b & (b - 1) == 0) and b > 0 for b in B_choices):
         raise ValueError(f"All B_choices must be powers of two, got {B_choices}")
@@ -55,7 +55,7 @@ def encode_batch_rows(
     if not all(C % b == 0 for b in B_choices):
         raise ValueError(f"All B_choices must evenly divide C={C}, got {B_choices}")
 
-    num_rows, k_dim = idx.shape
+    num_rows, k_dim = idx_sorted.shape
     if num_rows == 0:
         return b"", {
             "total_bits": 0,
@@ -63,13 +63,13 @@ def encode_batch_rows(
             "B_hist": {b: 0 for b in B_choices}
         }
 
-    if not idx.is_cuda:
-        idx = idx.cuda()
-    idx = idx.contiguous()
-    dev = idx.device
+    if not idx_sorted.is_cuda:
+        idx_sorted = idx_sorted.cuda()
+    idx_sorted = idx_sorted.contiguous()
+    dev = idx_sorted.device
 
     vals = torch.cat(
-        (idx[:, :1], idx[:, 1:] - idx[:, :-1]),
+        (idx_sorted[:, :1], idx_sorted[:, 1:] - idx_sorted[:, :-1]),
         dim=1,
     )
 
