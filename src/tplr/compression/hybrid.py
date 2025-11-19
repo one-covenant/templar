@@ -358,7 +358,6 @@ def parse_header_kernel(
 ):
     """
     Simple GPU kernel to parse the global header.
-    Replaces CPU struct.unpack to avoid CPU<->GPU synchronization.
     """
     pid = tl.program_id(0)
     if pid != 0:
@@ -449,7 +448,6 @@ def decode_rows_kernel(
         k_rice_choices_ptr,
         num_rows_ptr,
         K_ptr,
-        total_payload_bytes: tl.int32,  # kept for signature compatibility (unused)
 ):
     """
     Decodes each row's Rice/bitmap bitstream into *final* prefix-summed values.
@@ -574,12 +572,16 @@ def decode_batch_rows(
 
     if total_bytes == 0:
         return torch.empty((0, 0), dtype=torch.int64, device=dev), 0, 0
+    if total_bytes < 15:
+        raise ValueError("Malformed payload - too few bytes")
+    magic = bytes(payload_gpu[:4].cpu().tolist())
+    if magic != b"CGRP":
+        raise ValueError("Invalid magic header")
 
     # Pad payload on GPU with a few zero bytes to make safe over-reads trivial
     padded = torch.zeros(total_bytes + 8, dtype=torch.uint8, device=dev)
     padded[:total_bytes].copy_(payload_gpu)
     payload_gpu = padded
-    total_bytes_padded = int(payload_gpu.numel())
 
     # --- 1) Parse Header (GPU Kernel) ---
     C_out = torch.empty(1, dtype=torch.int32, device=dev)
@@ -652,8 +654,7 @@ def decode_batch_rows(
         use_bitmap,
         k_rice_choices_tensor,
         R_out,
-        K_out,
-        total_bytes_padded
+        K_out
     )
 
     # No host-side cumsum here: kernel already returns prefix sums

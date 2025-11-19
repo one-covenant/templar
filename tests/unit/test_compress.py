@@ -247,6 +247,38 @@ class TestTopKCompressor:
         )
         assert result_with_norms.shape == xshape
 
+    def test_batch_decompress_with_legacy_packing(
+            self, compress_instance: TopKCompressor[Literal[False]]
+    ):
+        p = torch.zeros(8, 128)  # 1024 elements total, last dim=128
+        xshape = (8, 128)
+        totalk = 128
+
+        # Create test data with Rice/bitmap encoded format
+        idx_orig = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)  # Even count
+        idx_packed = pack_12bit_indices(idx_orig)
+        idx = [idx_packed]
+        val = [torch.tensor([[10.0, 20.0, 30.0, 40.0]], dtype=torch.float32)]
+
+        # Test with normalisation
+        result_norm = compress_instance.batch_decompress(
+            p, idx, val, xshape, totalk, normalise=True
+        )
+        assert result_norm.shape == xshape
+
+        # Test with clip_norm
+        result_clip = compress_instance.batch_decompress(
+            p, idx, val, xshape, totalk, clip_norm=True
+        )
+        assert result_clip.shape == xshape
+
+        # Test with block_norms provided
+        block_norms = torch.tensor([15.0])
+        result_with_norms = compress_instance.batch_decompress(
+            p, idx, val, xshape, totalk, block_norms=block_norms, clip_norm=True
+        )
+        assert result_with_norms.shape == xshape
+
 
 class TestChunkingTransformer:
     """Test ChunkingTransformer using actual implementation"""
