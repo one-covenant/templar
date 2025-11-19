@@ -113,7 +113,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
     compression_time = 0
     copy_time = 0
     encode_time = 0
-    offload_time = 0
     for _, (n, p) in enumerate(model_iterator, 1):
         owned = n in miner.owned_params
         p_is_dt = is_dtensor(p)
@@ -212,7 +211,8 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         p.grad = None
         copy_time += tplr.T() - copy_start
 
-    offload_start = tplr.T()
+    tplr.logger.info(f"times: {encode_time}, {compression_time}, {copy_time}")
+
     # Batch offload all error feedback tensors to CPU with pinned memory
     for name in miner.error_feedback:
         if (
@@ -224,8 +224,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                 miner.error_feedback[name], non_blocking=True
             )
             miner.error_feedback[name] = miner.error_feedback_cpu_buffers[name]
-    offload_time += tplr.T() - offload_start
-    tplr.logger.info(f"times: {encode_time}, {compression_time}, {copy_time}, {offload_time}")
 
     # Single synchronization at the end for all async operations
     if torch.cuda.is_available():
