@@ -390,7 +390,8 @@ class TopKCompressor(Generic[Q]):
         if val.dtype != x.dtype:
             val = val.to(dtype=x.dtype)
 
-        if len(xshape) > 2:
+        # second condition for legacy decompress
+        if len(xshape) > 2 and len(idx_int64) == 2:
             idx_int64 = rearrange(idx_int64, "(y x) h -> y x h", y=xshape[0])
             val = rearrange(val, "(y x) h -> y x h", y=xshape[0])
 
