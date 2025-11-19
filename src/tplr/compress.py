@@ -502,6 +502,7 @@ class TopKCompressor(Generic[Q]):
                         rows, dtype=torch.int64, device=p.device
                     ).view(*v_data.shape)
                 except Exception as e:
+                    tplr.logger.warning(f"Failed to unpack: {e} Falling back to legacy uncompress.")
                     # Fallback: likely old format -> try legacy decoder
                     idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
 
