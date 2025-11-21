@@ -1,5 +1,6 @@
 import torch
 
+
 def pack_12bit_indices(indices: torch.Tensor) -> torch.Tensor:
     """
     Pack int64 indices into 12-bit representation.

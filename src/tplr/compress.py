@@ -29,8 +29,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor as DT
 
 import tplr
-
-from tplr.compression import encode_batch_rows, decode_batch_rows, unpack_12bit_indices
+from tplr.compression import decode_batch_rows, encode_batch_rows, unpack_12bit_indices
 
 # ─────────── type aliases ────────────────────────────────────────────────
 # primitive shapes

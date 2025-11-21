@@ -20,11 +20,8 @@ from .hybrid import (
     decode_batch_rows,  # decoder (CPU)
     encode_batch_rows,  # GPU-accelerated encoder → bytes + perm + meta
 )
+from .pack12 import pack_12bit_indices, unpack_12bit_indices
 
-from .pack12 import (
-    pack_12bit_indices,
-    unpack_12bit_indices
-)
 __all__ = [
     "encode_batch_rows",
     "decode_batch_rows",

@@ -29,12 +29,12 @@ from datetime import datetime, timezone
 from functools import partial
 from types import SimpleNamespace
 from typing import Any, Literal, cast
-import numpy as np
 
 import aiofiles
 import bittensor as bt
 import boto3
 import botocore
+import numpy as np
 import torch
 from aiobotocore.client import AioBaseClient
 from aiobotocore.session import get_session

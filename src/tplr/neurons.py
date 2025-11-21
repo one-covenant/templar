@@ -34,8 +34,8 @@ from torch.optim.lr_scheduler import LRScheduler
 from wandb.sdk.wandb_run import Run
 
 import tplr
-from tplr.distributed import dist_helper
 from tplr.compression import decode_batch_rows
+from tplr.distributed import dist_helper
 
 if TYPE_CHECKING:
     from neurons.miner import Miner

@@ -10,9 +10,8 @@ from tplr.compress import (
     TopKCompressor,
     _dct,
     _get_smaller_split,
-    _idct
+    _idct,
 )
-
 from tplr.compression import encode_batch_rows, pack_12bit_indices, unpack_12bit_indices
 
 
