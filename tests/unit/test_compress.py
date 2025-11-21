@@ -31,7 +31,7 @@ class TestTopKCompressor:
         )
 
     def test_compress_produces_rice_bitmap_indices(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test that compress() produces Rice/bitmap encoded indices"""
         # Create test tensor
@@ -50,7 +50,7 @@ class TestTopKCompressor:
             assert totalk == x.shape[-1]  # For 2D tensor, it's the last dimension
 
     def test_compress_with_quantization(
-            self, compress_instance_quantized: TopKCompressor[Literal[True]]
+        self, compress_instance_quantized: TopKCompressor[Literal[True]]
     ):
         """Test compression with quantization enabled"""
         x = torch.randn(8, 128)  # 1024 elements total, last dim=64
@@ -70,7 +70,7 @@ class TestTopKCompressor:
         assert len(qparams) == 5  # shift, scale, offset, lookup, orig_dtype
 
     def test_decompress_with_rice_bitmap_format(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test that decompress can handle Rice/bitmap encoded format"""
         # Setup
@@ -84,7 +84,9 @@ class TestTopKCompressor:
 
         # Pack using the new encoder format
         idx_bytes, _ = encode_batch_rows(original_indices, C=totalk)
-        val = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=torch.float32)
+        val = torch.tensor(
+            [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8]], dtype=torch.float32
+        )
 
         # Test decompression with packed format
         result = compress_instance.decompress(p, idx_bytes, val, xshape, totalk)
@@ -92,7 +94,7 @@ class TestTopKCompressor:
         assert result.dtype == p.dtype
 
     def test_batch_decompress_multiple_rice_bitmap_formats(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test batch_decompress with multiple Rice/bitmap encoded indices"""
         # Setup
@@ -122,7 +124,7 @@ class TestTopKCompressor:
         assert result.dtype == p.dtype
 
     def test_compress_decompress_round_trip(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test full compress-decompress round trip"""
         x = torch.zeros(8, 128)  # 1024 elements total, last dim=128
@@ -157,7 +159,7 @@ class TestTopKCompressor:
         assert torch.allclose(top_vals, expected_vals, atol=1e-5)
 
     def test_encode_compress_decompress_round_trip(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         class SimpleModel(nn.Module):
             def __init__(self):
@@ -166,7 +168,7 @@ class TestTopKCompressor:
                 self.layer2 = nn.Linear(64, 256)
 
         target_chunk = 16
-        transform = ChunkingTransformer( SimpleModel(), target_chunk)
+        transform = ChunkingTransformer(SimpleModel(), target_chunk)
         x = torch.zeros(256, 64)
         x[0, 0] = 1.0
         x[1, 1] = 2.0
@@ -175,19 +177,14 @@ class TestTopKCompressor:
 
         topk = 4
         encoded = transform.encode(x)
-        idxs, vals, xshape, totalk = compress_instance.compress(
-            encoded, topk
-        )
+        idxs, vals, xshape, totalk = compress_instance.compress(encoded, topk)
 
         p = torch.zeros_like(x)
-        decompressed = compress_instance.decompress(
-            p, idxs, vals, xshape, totalk
-        )
+        decompressed = compress_instance.decompress(p, idxs, vals, xshape, totalk)
         assert torch.allclose(encoded, decompressed, atol=1e-5)
 
-
     def test_rice_bitmap_index_value_range(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test that Rice/bitmap codec can handle large index ranges efficiently"""
         # Create a large tensor that would have indices beyond 8-bit range
@@ -214,7 +211,7 @@ class TestTopKCompressor:
         )
 
     def test_batch_decompress_with_norm_options(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         """Test batch_decompress with normalisation and clip_norm options"""
         p = torch.zeros(8, 128)  # 1024 elements total, last dim=128
@@ -247,7 +244,7 @@ class TestTopKCompressor:
         assert result_with_norms.shape == xshape
 
     def test_batch_decompress_with_legacy_packing(
-            self, compress_instance: TopKCompressor[Literal[False]]
+        self, compress_instance: TopKCompressor[Literal[False]]
     ):
         p = torch.zeros(8, 128)  # 1024 elements total, last dim=128
         xshape = (8, 128)

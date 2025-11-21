@@ -327,9 +327,7 @@ class TopKCompressor(Generic[Q]):
         totalk = x.shape[-1]
         topk = self._clamp_topk(x, topk)
 
-        topk_vals, idx = torch.topk(
-            x.abs(), k=topk, dim=-1, largest=True, sorted=False
-        )
+        topk_vals, idx = torch.topk(x.abs(), k=topk, dim=-1, largest=True, sorted=False)
         del topk_vals
 
         idx = idx.to(torch.int32)
@@ -357,7 +355,6 @@ class TopKCompressor(Generic[Q]):
             val, qparams = self._quantize_values(val)
             return idx_bytes, val, xshape, totalk, qparams
         return idx_bytes, val, xshape, totalk
-
 
     @torch.no_grad()
     def decompress(
@@ -524,9 +521,13 @@ class TopKCompressor(Generic[Q]):
                     idx_unpacked = idx_int64.view_as(v_data)
                 except ValueError as e:
                     # NB: legacy path
-                    tplr.logger.warning(f"Failed to unpack: {e}. Falling back to legacy uncompress.")
+                    tplr.logger.warning(
+                        f"Failed to unpack: {e}. Falling back to legacy uncompress."
+                    )
                     # Fallback: likely old format -> try legacy decoder
-                    idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
+                    idx_unpacked = unpack_12bit_indices(
+                        i_data.to(p.device), v_data.shape
+                    )
 
                 unpacked_indices.append(idx_unpacked)
             elif i_data.dtype in (torch.int64, torch.long):

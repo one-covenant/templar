@@ -2550,7 +2550,9 @@ class Comms(ChainManager):
                 )
         except ValueError as e:
             # NB: legacy path
-            tplr.logger.warning(f"Failed to unpack: {e} Falling back to legacy uncompress.")
+            tplr.logger.warning(
+                f"Failed to unpack: {e} Falling back to legacy uncompress."
+            )
             # Fallback: likely old format -> try legacy decoder
             try:
                 unpacked = unpack_12bit_indices(idxs, vals.shape)
@@ -2561,10 +2563,11 @@ class Comms(ChainManager):
                     )
                 _bounds_check(unpacked)
             except Exception as e:
-                raise ValueError(f"[{param_name}] Failed to unpack legacy 12-bit indices: {e}")
+                raise ValueError(
+                    f"[{param_name}] Failed to unpack legacy 12-bit indices: {e}"
+                )
         except Exception as e:
             raise ValueError(f"[{param_name}] Failed to decode indices payload: {e}")
-
 
     async def s3_get_object_size(self, bucket: Bucket, key: str) -> int | None:
         """

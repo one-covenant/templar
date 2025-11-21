@@ -12,10 +12,7 @@ BytesLike = Union[bytes, bytearray, np.ndarray, torch.Tensor]
 
 @torch.no_grad()
 def encode_batch_rows(
-        idx_sorted: torch.Tensor,
-        *,
-        C: int,
-        B_choices: Tuple[int, ...] = (64, 128)
+    idx_sorted: torch.Tensor, *, C: int, B_choices: Tuple[int, ...] = (64, 128)
 ) -> Tuple[BytesLike, Dict]:
     """
     Compresses a 2D int64 tensor of Top-K indices into a byte string
@@ -45,7 +42,9 @@ def encode_batch_rows(
         raise RuntimeError("CUDA is required for this function.")
 
     if not isinstance(idx_sorted, torch.Tensor) or idx_sorted.ndim != 2:
-        raise ValueError(f"idx must be a 2D int64 tensor, got {idx_sorted.shape} {idx_sorted.dtype}")
+        raise ValueError(
+            f"idx must be a 2D int64 tensor, got {idx_sorted.shape} {idx_sorted.dtype}"
+        )
 
     if not all(isinstance(b, int) and (b & (b - 1) == 0) and b > 0 for b in B_choices):
         raise ValueError(f"All B_choices must be powers of two, got {B_choices}")
@@ -58,7 +57,7 @@ def encode_batch_rows(
         return b"", {
             "total_bits": 0,
             "avg_bits_per_row": 0.0,
-            "B_hist": {b: 0 for b in B_choices}
+            "B_hist": {b: 0 for b in B_choices},
         }
 
     if not idx_sorted.is_cuda:
@@ -99,22 +98,25 @@ def encode_batch_rows(
 
     # Best choice per row
     min_costs, best_B_idx = torch.min(costs, dim=1)
-    is_bitmap_choice = torch.gather(is_bitmap, 1, best_B_idx.unsqueeze(1)).squeeze(1).to(torch.int32)
+    is_bitmap_choice = (
+        torch.gather(is_bitmap, 1, best_B_idx.unsqueeze(1)).squeeze(1).to(torch.int32)
+    )
 
     # Payload sizing
     row_payload_bits = min_costs
     row_payload_bytes = ((row_payload_bits + 7) // 8).to(torch.int32)
 
     if torch.any(row_payload_bytes > 0xFFFF):
-        raise ValueError("Row payload length exceeds 65535 bytes; cannot store in uint16.")
+        raise ValueError(
+            "Row payload length exceeds 65535 bytes; cannot store in uint16."
+        )
 
     # Byte offsets
     if num_rows == 1:
         row_byte_offsets = torch.zeros(1, dtype=torch.int32, device=dev)
     else:
         row_byte_offsets = torch.nn.functional.pad(
-            torch.cumsum(row_payload_bytes, dim=0, dtype=torch.int32)[:-1],
-            (1, 0)
+            torch.cumsum(row_payload_bytes, dim=0, dtype=torch.int32)[:-1], (1, 0)
         )
     total_payload_bytes = int(row_payload_bytes.sum().item())
 
@@ -154,7 +156,9 @@ def encode_batch_rows(
     row_table_flat[:, 1] = ((lengths_i32 >> 8) & 0xFF).to(torch.uint8)
     row_table_flat[:, 2] = (headers_i32 & ((1 << ROW_HEADER_BITS) - 1)).to(torch.uint8)
 
-    payload_buf[global_header_len_bytes: global_header_len_bytes + row_table_bytes] = row_table_flat.view(-1)
+    payload_buf[global_header_len_bytes : global_header_len_bytes + row_table_bytes] = (
+        row_table_flat.view(-1)
+    )
 
     # Calculate absolute byte offsets for pack kernel
     row_abs_byte_offsets = (payload_region_start + row_byte_offsets).to(torch.int32)
@@ -188,13 +192,13 @@ def encode_batch_rows(
 
 @triton.jit
 def cost_kernel(
-        delta_ptr,
-        costs_ptr,
-        is_bitmap_ptr,
-        k_dim: tl.constexpr,
-        num_rows: tl.int32,
-        num_B_choices: tl.int32,
-        k_rice_choices_ptr,
+    delta_ptr,
+    costs_ptr,
+    is_bitmap_ptr,
+    k_dim: tl.constexpr,
+    num_rows: tl.int32,
+    num_B_choices: tl.int32,
+    k_rice_choices_ptr,
 ):
     """
     Calculates bit cost. One row per program instance.
@@ -235,14 +239,14 @@ def cost_kernel(
 
 @triton.jit
 def pack_kernel(
-        delta_ptr,  # (rows, k_dim) IN int32
-        u8_payload_ptr,  # OUT uint8
-        row_abs_byte_offsets_ptr,  # (rows,) IN int32 (byte offset where payload starts)
-        best_B_idx_ptr,  # (rows,) IN
-        is_bitmap_ptr,  # (rows,) IN
-        k_rice_choices_ptr,  # [num_B] IN
-        num_rows: tl.int32,
-        k_dim: tl.int32,  # dynamic
+    delta_ptr,  # (rows, k_dim) IN int32
+    u8_payload_ptr,  # OUT uint8
+    row_abs_byte_offsets_ptr,  # (rows,) IN int32 (byte offset where payload starts)
+    best_B_idx_ptr,  # (rows,) IN
+    is_bitmap_ptr,  # (rows,) IN
+    k_rice_choices_ptr,  # [num_B] IN
+    num_rows: tl.int32,
+    k_dim: tl.int32,  # dynamic
 ):
     """
     Writes payload bits using a 64-bit register accumulator.
@@ -257,7 +261,7 @@ def pack_kernel(
     b_idx_i32 = tl.load(best_B_idx_ptr + row_idx).to(tl.int32)
     use_bitmap_i32 = (tl.load(is_bitmap_ptr + row_idx) & 1).to(tl.int32)
     k_rice_i32 = tl.load(k_rice_choices_ptr + b_idx_i32).to(tl.int32)
-    M_i32 = (tl.full((), 1, dtype=tl.int32) << k_rice_i32)
+    M_i32 = tl.full((), 1, dtype=tl.int32) << k_rice_i32
 
     # Accumulator state
     acc_data = tl.full((), 0, dtype=tl.uint64)
@@ -282,7 +286,7 @@ def pack_kernel(
             # Rice: q '1's, then '0', then k_rice bits of r
             q_count = q.to(tl.int32)
             while q_count > 0:
-                acc_data |= (tl.full((), 1, dtype=tl.uint64) << acc_bits)
+                acc_data |= tl.full((), 1, dtype=tl.uint64) << acc_bits
                 acc_bits += 1
                 q_count -= 1
 
@@ -304,7 +308,7 @@ def pack_kernel(
         else:
             # Bitmap: q is 1 bit
             q_bit = tl.where(q > 0, 1, 0).to(tl.uint64)
-            acc_data |= (q_bit << acc_bits)
+            acc_data |= q_bit << acc_bits
             acc_bits += 1
 
         # Flush Check (after separator/bitmap bit)
@@ -320,7 +324,7 @@ def pack_kernel(
             acc_bits -= 32
 
         # Append Remainder
-        acc_data |= (r << acc_bits)
+        acc_data |= r << acc_bits
         acc_bits += k_rice_i32
 
         # Flush Check
@@ -347,14 +351,14 @@ def pack_kernel(
 
 @triton.jit
 def parse_header_kernel(
-        u8_payload_ptr,  # (total_bytes,) uint8
-        C_out_ptr,  # (1,) int32
-        K_out_ptr,  # (1,) int32
-        R_out_ptr,  # (1,) int32
-        num_B_out_ptr,  # (1,) int32
-        B_choices_out_ptr,  # (MAX_B_CHOICES,) int32
-        header_bytes_out_ptr,  # (1,) int32
-        max_num_B: tl.constexpr,
+    u8_payload_ptr,  # (total_bytes,) uint8
+    C_out_ptr,  # (1,) int32
+    K_out_ptr,  # (1,) int32
+    R_out_ptr,  # (1,) int32
+    num_B_out_ptr,  # (1,) int32
+    B_choices_out_ptr,  # (MAX_B_CHOICES,) int32
+    header_bytes_out_ptr,  # (1,) int32
+    max_num_B: tl.constexpr,
 ):
     """
     Simple GPU kernel to parse the global header.
@@ -406,13 +410,13 @@ def parse_header_kernel(
 
 @triton.jit
 def parse_row_table_kernel(
-        u8_payload_ptr,
-        row_payload_bytes_ptr,
-        best_B_idx_ptr,
-        use_bitmap_ptr,
-        row_table_start_ptr,  # int32* from header kernel
-        num_rows_ptr,  # int32* from header kernel
-        ROW_HEADER_BITS: tl.constexpr,
+    u8_payload_ptr,
+    row_payload_bytes_ptr,
+    best_B_idx_ptr,
+    use_bitmap_ptr,
+    row_table_start_ptr,  # int32* from header kernel
+    num_rows_ptr,  # int32* from header kernel
+    ROW_HEADER_BITS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_rows = tl.load(num_rows_ptr)
@@ -440,14 +444,14 @@ def parse_row_table_kernel(
 
 @triton.jit
 def decode_rows_kernel(
-        u8_payload_ptr,
-        out_vals_ptr,
-        row_byte_offsets_ptr,
-        best_B_idx_ptr,
-        use_bitmap_ptr,
-        k_rice_choices_ptr,
-        num_rows_ptr,
-        K_ptr,
+    u8_payload_ptr,
+    out_vals_ptr,
+    row_byte_offsets_ptr,
+    best_B_idx_ptr,
+    use_bitmap_ptr,
+    k_rice_choices_ptr,
+    num_rows_ptr,
+    K_ptr,
 ):
     """
     Decodes each row's Rice/bitmap bitstream into *final* prefix-summed values.
@@ -470,7 +474,7 @@ def decode_rows_kernel(
     use_bitmap = (tl.load(use_bitmap_ptr + row_idx) & 1).to(tl.int32)
 
     k_rice = tl.load(k_rice_choices_ptr + b_idx).to(tl.int32)
-    M = (tl.full((), 1, dtype=tl.int32) << k_rice)
+    M = tl.full((), 1, dtype=tl.int32) << k_rice
 
     # Streaming bit-buffer state
     byte_offset = start_byte
@@ -495,7 +499,7 @@ def decode_rows_kernel(
                 if bits_in_buf == 0:
                     next_byte = tl.load(u8_payload_ptr + byte_offset).to(tl.uint64)
                     byte_offset += 1
-                    bitbuf |= (next_byte << bits_in_buf)
+                    bitbuf |= next_byte << bits_in_buf
                     bits_in_buf += 8
 
                 bit = (bitbuf & 1).to(tl.int32)
@@ -511,7 +515,7 @@ def decode_rows_kernel(
             if bits_in_buf == 0:
                 next_byte = tl.load(u8_payload_ptr + byte_offset).to(tl.uint64)
                 byte_offset += 1
-                bitbuf |= (next_byte << bits_in_buf)
+                bitbuf |= next_byte << bits_in_buf
                 bits_in_buf += 8
             q = (bitbuf & 1).to(tl.int32)
             bitbuf >>= 1
@@ -524,11 +528,11 @@ def decode_rows_kernel(
             while bits_in_buf < k_rice:
                 next_byte = tl.load(u8_payload_ptr + byte_offset).to(tl.uint64)
                 byte_offset += 1
-                bitbuf |= (next_byte << bits_in_buf)
+                bitbuf |= next_byte << bits_in_buf
                 bits_in_buf += 8
 
             mask = (tl.full((), 1, dtype=tl.uint64) << k_rice) - 1
-            r_u64 = (bitbuf & mask)
+            r_u64 = bitbuf & mask
             bitbuf >>= k_rice
             bits_in_buf -= k_rice
             r = r_u64.to(tl.int32)
@@ -543,8 +547,8 @@ def decode_rows_kernel(
 
 
 def decode_batch_rows(
-        payload: BytesLike,
-        max_num_B: int = 16,
+    payload: BytesLike,
+    max_num_B: int = 16,
 ) -> tuple[torch.Tensor, int, int]:
     """
     Decode a payload produced by encode_batch_rows.
@@ -599,7 +603,7 @@ def decode_batch_rows(
         num_B_out,
         B_choices_out,
         header_bytes_out,
-        max_num_B=max_num_B
+        max_num_B=max_num_B,
     )
 
     # Minimal sync to get scalar values needed for kernel setup
@@ -638,7 +642,9 @@ def decode_batch_rows(
 
     row_payload_bytes_64 = row_payload_bytes.to(torch.int64)
     # Exclusive prefix sum for offsets
-    row_byte_offsets_rel = torch.cumsum(row_payload_bytes_64, dim=0) - row_payload_bytes_64
+    row_byte_offsets_rel = (
+        torch.cumsum(row_payload_bytes_64, dim=0) - row_payload_bytes_64
+    )
     # Absolute byte offsets
     row_byte_offsets = (payload_region_start + row_byte_offsets_rel).to(torch.int32)
 
@@ -654,7 +660,7 @@ def decode_batch_rows(
         use_bitmap,
         k_rice_choices_tensor,
         R_out,
-        K_out
+        K_out,
     )
 
     # No host-side cumsum here: kernel already returns prefix sums

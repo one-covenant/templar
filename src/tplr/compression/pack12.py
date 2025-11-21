@@ -52,7 +52,9 @@ def pack_12bit_indices(indices: torch.Tensor) -> torch.Tensor:
     return packed
 
 
-def unpack_12bit_indices(packed: torch.Tensor, values_shape: tuple[int, ...] ) -> torch.Tensor:
+def unpack_12bit_indices(
+    packed: torch.Tensor, values_shape: tuple[int, ...]
+) -> torch.Tensor:
     """
     Unpack 12-bit packed indices back to int64.
     Assumes even number of indices.
