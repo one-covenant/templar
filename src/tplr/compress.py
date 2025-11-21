@@ -49,8 +49,6 @@ ValT: TypeAlias = torch.Tensor
 # Boolean flag that propagates the chosen quantisation mode
 Q = TypeVar("Q", Literal[True], Literal[False])
 
-_DEFAULT_B_CHOICES: tuple[int, ...] = (32, 64)
-
 
 class ChunkingTransformer:
     """
@@ -211,9 +209,12 @@ class TopKCompressor(Generic[Q]):
     It supports both 1D and 2D tensors.
     """
 
+    DEFAULT_B_CHOICES: tuple[int, ...] = (64, 128)
+
     use_quantization: Q
     n_bins: int
     range_in_sigmas: int
+    b_choices: tuple[int, ...]  # for Rice/bitmap codec
 
     # ------------------------------------------------------------------ #
     # Constructor – two overloads so each instance "remembers" its mode
@@ -225,6 +226,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: Literal[True] = True,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        b_choices: tuple[int, ...] | None = None,
     ) -> None: ...
 
     @overload
@@ -234,6 +236,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: Literal[False] = False,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        b_choices: tuple[int, ...] | None = None,
     ) -> None: ...
 
     @torch.no_grad()
@@ -243,6 +246,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: bool = False,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        b_choices: tuple[int, ...] | None = None,
     ) -> None:
         """
         Initialise the TopKCompressor.
@@ -258,6 +262,14 @@ class TopKCompressor(Generic[Q]):
             self.range_in_sigmas = (
                 quantization_range  # Quantization range in standard deviations
             )
+
+        if b_choices is None:
+            b_choices = self.DEFAULT_B_CHOICES
+        b_choices = tuple(sorted(int(b) for b in b_choices))
+        for b in b_choices:
+            if b <= 0 or (b & (b - 1)) != 0:
+                raise ValueError(f"b_choices must be powers of two > 0, got {b}")
+        self.b_choices = b_choices
 
     def _clamp_topk(self, x, topk) -> int:
         """
@@ -331,7 +343,15 @@ class TopKCompressor(Generic[Q]):
         # sort indices and apply same perm to values
         idx_sorted, perm = torch.sort(idx2d, dim=1)
         val = torch.gather(val2d, dim=1, index=perm)
-        idx_bytes, _meta = encode_batch_rows(idx_sorted, C=totalk, B_choices=_DEFAULT_B_CHOICES)
+
+        # pick only B_choices that divide this layer's C
+        valid_B = tuple(b for b in self.b_choices if totalk % b == 0)
+        if not valid_B:
+            raise ValueError(
+                f"No valid b_choices for C={totalk}; "
+                f"b_choices={self.b_choices} must divide C"
+            )
+        idx_bytes, _meta = encode_batch_rows(idx_sorted, C=totalk, B_choices=valid_B)
 
         # Apply 8-bit quantization if enabled
         if self.use_quantization:
