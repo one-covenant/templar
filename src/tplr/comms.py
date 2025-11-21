@@ -45,7 +45,7 @@ from tqdm import tqdm as std_tqdm
 import tplr
 from tplr.chain import ChainManager
 from tplr.compress import TopKCompressor
-from tplr.compression import decode_batch_rows
+from tplr.compression import decode_batch_rows, unpack_12bit_indices
 from tplr.config import BUCKET_SECRETS, client_config
 from tplr.schemas import Bucket, CommsGetResult
 
