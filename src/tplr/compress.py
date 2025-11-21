@@ -372,15 +372,15 @@ class TopKCompressor(Generic[Q]):
 
         # Decode indices
         if idx.dtype == torch.uint8:
-            rows_list, C, _N = decode_batch_rows(idx)
+            rows, C, _N = decode_batch_rows(idx)
             if C != totalk:
                 raise ValueError(f"Index payload C={C} but expected {totalk}")
-            k = val.shape[-1]
-            if any(len(r) != k for r in rows_list):
-               raise ValueError("Row-wise topk size mismatch in index payload")
-            idx_int64 = torch.tensor(
-                rows_list, dtype=torch.int64, device=p.device
-            ).view(*val.shape)
+            if rows.shape[-1] != val.shape[-1]:
+                raise ValueError(
+                    f"Row-wise topk size mismatch: decoded K={rows.shape[-1]}, val K={val.shape[-1]}"
+                )
+            idx_int64 = rows.to(device=p.device, dtype=torch.int64)
+            idx_int64 = idx_int64.view_as(val)
         elif idx.dtype in (torch.int64, torch.long):
             idx_int64 = idx.to(p.device)
         else:
@@ -494,13 +494,13 @@ class TopKCompressor(Generic[Q]):
                     rows, C, _N = decode_batch_rows(i_data)
                     if C != totalk:
                         raise ValueError(f"Index payload C={C} but expected {totalk}")
-                    if any(len(r) != v_data.shape[-1] for r in rows):
+                    if rows.shape[-1] != v_data.shape[-1]:
                         raise ValueError(
-                            "Row-wise topk size mismatch in index payload (batch)"
+                            f"Row-wise topk size mismatch: decoded K={rows.shape[-1]}, "
+                            f"val K={v_data.shape[-1]}"
                         )
-                    idx_unpacked = torch.tensor(
-                        rows, dtype=torch.int64, device=p.device
-                    ).view(*v_data.shape)
+                    idx_int64 = rows.to(device=p.device, dtype=torch.int64)
+                    idx_unpacked = idx_int64.view_as(v_data)
                 except Exception as e:
                     tplr.logger.warning(f"Failed to unpack: {e} Falling back to legacy uncompress.")
                     # Fallback: likely old format -> try legacy decoder
