@@ -2517,46 +2517,54 @@ class Comms(ChainManager):
         if idxs.numel() == 0:
             raise ValueError(f"[{param_name}] Empty indices payload")
 
-        # Decode (CPU) and perform structural checks
         try:
-            payload_bytes = idxs.detach().cpu().numpy().tobytes()
-            rows_list, C, N = decode_batch_rows(payload_bytes)
+            rows, C, N = decode_batch_rows(idxs)
+            if C != totalk:
+                raise ValueError(
+                    f"[{param_name}] Payload column size C={C} but expected {totalk}"
+                )
+            # compute expected rows from values shape (flatten all but last dim)
+            if vals.ndim == 0:
+                raise ValueError(f"[{param_name}] Values tensor has no top‑k dimension")
+            expected_rows = int(np.prod(vals.shape[:-1])) if vals.ndim > 1 else 1
+            if N != expected_rows:
+                raise ValueError(
+                    f"[{param_name}] Payload rows N={N} but values imply {expected_rows}"
+                )
+
+            k = vals.shape[-1]
+            if k != allowed_topk:
+                raise ValueError(
+                    f"[{param_name}] Payload K={rows.shape[-1]} but values top-k={k}"
+                )
+
+            # Bounds check
+            if rows.numel() > 0:
+                min_idx = int(rows.min().item())
+                max_idx = int(rows.max().item())
+            else:
+                min_idx, max_idx = 0, -1
+            if min_idx < 0 or max_idx >= totalk:
+                raise ValueError(
+                    f"[{param_name}] Index out of bounds (min={min_idx}, max={max_idx}, totalk={totalk})"
+                )
+        except ValueError as e:
+            # NB: legacy path
+            tplr.logger.warning(f"Failed to unpack: {e} Falling back to legacy uncompress.")
+            # Fallback: likely old format -> try legacy decoder
+            try:
+                unpacked = unpack_12bit_indices(idxs, vals.shape)
+                if unpacked.shape[-1] != allowed_topk:
+                    raise ValueError(
+                        f"[{param_name}] Invalid topk dimension: "
+                        f"shape[-1]={unpacked.shape[-1]} but expected {allowed_topk}"
+                    )
+                _bounds_check(unpacked)
+            except Exception as e:
+                raise ValueError(f"[{param_name}] Failed to unpack legacy 12-bit indices: {e}")
         except Exception as e:
             raise ValueError(f"[{param_name}] Failed to decode indices payload: {e}")
 
-        if C != totalk:
-            raise ValueError(
-                f"[{param_name}] Payload column size C={C} but expected {totalk}"
-            )
-
-        # compute expected rows from values shape (flatten all but last dim)
-        if vals.ndim == 0:
-            raise ValueError(f"[{param_name}] Values tensor has no top‑k dimension")
-        expected_rows = int(np.prod(vals.shape[:-1])) if vals.ndim > 1 else 1
-        if N != expected_rows:
-            raise ValueError(
-                f"[{param_name}] Payload rows N={N} but values imply {expected_rows}"
-            )
-
-        k = vals.shape[-1]
-        if k != allowed_topk:
-            raise ValueError(
-                f"[{param_name}] Values top‑k={k} but allowed_topk={allowed_topk}"
-            )
-        if any(len(r) != k for r in rows_list):
-            raise ValueError(
-                f"[{param_name}] At least one row has mismatched top‑k size"
-            )
-
-        # bounds check without materialising full tensor
-        max_idx = max((max(r) if len(r) > 0 else -1) for r in rows_list)
-        min_idx = (
-            min((min(r) if len(r) > 0 else 0) for r in rows_list) if rows_list else 0
-        )
-        if min_idx < 0 or max_idx >= totalk:
-            raise ValueError(
-                f"[{param_name}] Index out of bounds (min={min_idx}, max={max_idx}, totalk={totalk})"
-            )
 
     async def s3_get_object_size(self, bucket: Bucket, key: str) -> int | None:
         """

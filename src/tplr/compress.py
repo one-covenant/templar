@@ -20,7 +20,6 @@
 
 # Global imports
 
-import numpy as np
 import math
 from typing import Generic, Literal, Sequence, TypeAlias, TypeVar, cast, overload
 
@@ -317,14 +316,17 @@ class TopKCompressor(Generic[Q]):
         totalk = x.shape[-1]
         topk = self._clamp_topk(x, topk)
 
-        idx_int64 = torch.topk(
+        topk_vals, idx = torch.topk(
             x.abs(), k=topk, dim=-1, largest=True, sorted=False
-        ).indices
-        val = torch.gather(x, dim=-1, index=idx_int64)
+        )
+        del topk_vals
+
+        idx = idx.to(torch.int32)
+        val = torch.gather(x, dim=-1, index=idx)
 
         # Flatten to [rows, k] for the codec
-        idx2d = idx_int64.reshape(-1, topk).to(torch.int32)
-        val2d = val.reshape(-1, topk)
+        idx2d = idx.view(-1, topk)
+        val2d = val.view(-1, topk)
 
         # sort indices and apply same perm to values
         idx_sorted, perm = torch.sort(idx2d, dim=1)
@@ -501,8 +503,9 @@ class TopKCompressor(Generic[Q]):
                         )
                     idx_int64 = rows.to(device=p.device, dtype=torch.int64)
                     idx_unpacked = idx_int64.view_as(v_data)
-                except Exception as e:
-                    tplr.logger.warning(f"Failed to unpack: {e} Falling back to legacy uncompress.")
+                except ValueError as e:
+                    # NB: legacy path
+                    tplr.logger.warning(f"Failed to unpack: {e}. Falling back to legacy uncompress.")
                     # Fallback: likely old format -> try legacy decoder
                     idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
 
