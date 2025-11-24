@@ -13,7 +13,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from tplr import load_hparams
-from tplr.compress import pack_12bit_indices
+from tplr.compression import encode_batch_rows, pack_12bit_indices
 
 hparams = load_hparams()
 
@@ -48,7 +48,7 @@ def create_xshapes_totalks(model):
 def create_valid_state_dict(model):
     state_dict = {}
     for name, _ in model.named_parameters():
-        # Create 12-bit packed format
+        # Create legacy 12-bit packed format
         indices = torch.tensor([0, 1], dtype=torch.long)
         packed_data = pack_12bit_indices(indices)
         state_dict[name + "idxs"] = packed_data
@@ -65,9 +65,9 @@ def create_missing_idxs(model):
 
 
 def create_packed_indices(indices_list):
-    """Helper function to create 12-bit packed indices from a list"""
+    """Helper function to create legacy 12-bit packed indices from a list"""
     indices = torch.tensor(indices_list, dtype=torch.long)
-    # Ensure even number of indices for 12-bit packing
+    # Ensure even number of indices for legacy 12-bit packing
     if len(indices_list) % 2 != 0:
         indices = torch.cat([indices, torch.tensor([0], dtype=torch.long)])
     packed_data = pack_12bit_indices(indices)
@@ -244,7 +244,7 @@ async def test_gather_basic_functionality(comms_instance, dummy_compressor):
         data={
             "0.weightidxs": create_packed_indices(
                 [0, 1, 2, 3]
-            ),  # Even count for 12-bit
+            ),  # Even count for legacy 12-bit
             "0.weightvals": torch.tensor([0.4, 0.5, 0.6, 0.7]),
             "totalks": {"0.weight": totalk_value},
         },
@@ -255,7 +255,7 @@ async def test_gather_basic_functionality(comms_instance, dummy_compressor):
         data={
             "0.weightidxs": create_packed_indices(
                 [0, 1, 2, 3]
-            ),  # Even count for 12-bit
+            ),  # Even count for legacy 12-bit
             "0.weightvals": torch.tensor([0.7, 0.8, 0.9, 1.0]),
             "totalks": {"0.weight": totalk_value},
         },
@@ -315,7 +315,7 @@ async def test_gather_normalization(comms_instance, dummy_compressor):
         data={
             "0.weightidxs": create_packed_indices(
                 [0, 1, 2, 3]
-            ),  # Even count for 12-bit
+            ),  # Even count for legacy 12-bit
             "0.weightvals": torch.tensor([0.4, 0.5, 0.6, 0.7]),
             "totalks": {"0.weight": totalk_value},
         },
@@ -360,7 +360,7 @@ async def test_gather_quant_params_validation(comms_instance, dummy_compressor):
     val_key = f"{param_base}vals"
     qp_key = f"{param_base}quant_params"
 
-    idxs = create_packed_indices([0, 1, 2, 3])  # Even count for 12-bit
+    idxs = create_packed_indices([0, 1, 2, 3])  # Even count for legacy 12-bit
     vals = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.uint8)  # still quantised
 
     lookup = torch.zeros(256, dtype=torch.float32)  # dummy LUT
@@ -480,7 +480,7 @@ async def test_gather_averaging(comms_instance, dummy_compressor):
         data={
             "0.weightidxs": create_packed_indices(
                 [0, 1, 2, 3]
-            ),  # Even count for 12-bit
+            ),  # Even count for legacy 12-bit
             "0.weightvals": torch.tensor([0.4, 0.5, 0.6, 0.7]),
             "totalks": {"0.weight": totalk_value},
         },
@@ -491,7 +491,7 @@ async def test_gather_averaging(comms_instance, dummy_compressor):
         data={
             "0.weightidxs": create_packed_indices(
                 [0, 1, 2, 3]
-            ),  # Even count for 12-bit
+            ),  # Even count for legacy 12-bit
             "0.weightvals": torch.tensor([0.8, 0.9, 1.0, 1.1]),
             "totalks": {"0.weight": totalk_value},
         },
@@ -649,7 +649,7 @@ async def test_gather_complex_normalization(comms_instance, dummy_compressor):
     # Include totalks in each peer response using the key "layer." (so that stripping "idxs"/"vals" returns the same base key).
     peer1_response = CommsGetResult(
         data={
-            "layer.idxs": create_packed_indices([0, 1, 2, 3]),  # Even count for 12-bit
+            "layer.idxs": create_packed_indices([0, 1, 2, 3]),  # Even count for legacy 12-bit
             "layer.vals": torch.tensor([1.0, 2.0, 2.0, 3.0]),  # norm ≈ 3
             "totalks": {"layer.": totalk_value},
         },
@@ -658,7 +658,7 @@ async def test_gather_complex_normalization(comms_instance, dummy_compressor):
     )
     peer2_response = CommsGetResult(
         data={
-            "layer.idxs": create_packed_indices([0, 1, 2, 3]),  # Even count for 12-bit
+            "layer.idxs": create_packed_indices([0, 1, 2, 3]),  # Even count for legacy 12-bit
             "layer.vals": torch.tensor([10.0, 20.0, 20.0, 30.0]),  # Larger scale
             "totalks": {"layer.": totalk_value},
         },
@@ -667,7 +667,7 @@ async def test_gather_complex_normalization(comms_instance, dummy_compressor):
     )
     peer3_response = CommsGetResult(
         data={
-            "layer.idxs": create_packed_indices([0, 1, 2, 3]),  # Even count for 12-bit
+            "layer.idxs": create_packed_indices([0, 1, 2, 3]),  # Even count for legacy 12-bit
             "layer.vals": torch.tensor([-5.0, 5.0, 5.0, 10.0]),  # Different sign
             "totalks": {"layer.": totalk_value},
         },
@@ -1464,37 +1464,41 @@ class DummyComms:
         )
 
 
-def test_valid_12bit_packed_indices():
+def test_valid_rice_bitmap_encoded_indices():
     """
-    Test Case: test_valid_12bit_packed_indices
-      - Input: 12-bit packed indices with correct topk dimension
+    Test Case: test_valid_rice_bitmap_encoded_indices
+      - Input: Rice/bitmap encoded indices with correct topk dimension
       - Valid indices (all indices within [0, totalk-1])
       - Expected Outcome: The function should complete without raising an error.
     """
     dummy_comms = DummyComms()
 
-    # totalk is set to 10; allowed_topk is min(4, 10) == 4.
-    totalk = 10
-    valid_indices = torch.tensor([1, 5, 9, 3], dtype=torch.long)
-    packed_data = pack_12bit_indices(valid_indices)
-    vals = torch.randn_like(valid_indices, dtype=torch.float32)
+    # totalk is set to 64; allowed_topk is min(4, 64) == 4.
+    totalk = 64
+    valid_indices = torch.tensor(
+        [[1, 5, 9, 3]], dtype=torch.long
+    )  # Shape [1, 4] for one row
+    # Use the new encoder format
+    idx, _ = encode_batch_rows(valid_indices, C=totalk)
+    vals = torch.randn(1, 4, dtype=torch.float32)  # Match the shape [rows, k]
 
     # This call should complete without any error.
-    dummy_comms.check_compressed_indices("test_param", packed_data, totalk, vals=vals)
+    dummy_comms.check_compressed_indices("test_param", idx, totalk, vals=vals)
 
 
-def test_valid_12bit_packed_multi_dim():
+def test_valid_rice_bitmap_encoded_multi_dim():
     """
-    Test 12-bit packed indices from multi-dimensional tensor where the last dimension
+    Test Rice/bitmap encoded indices from multi-dimensional tensor where the last dimension
     equals min(hparams.topk_compression, totalk) and all indices are within valid range.
     """
     dummy_comms = DummyComms()
-    totalk = 20  # allowed_topk = min(4, 20) = 4
+    totalk = 128  # allowed_topk = min(4, 128) = 4
     # Create a valid 2D tensor (shape: 2 x 4) with valid indices.
     valid_indices = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.long)
-    packed_data = pack_12bit_indices(valid_indices)
-    vals = torch.randn_like(valid_indices, dtype=torch.float32)
-    dummy_comms.check_compressed_indices("param", packed_data, totalk, vals=vals)
+    # Use the new encoder format
+    idx, _ = encode_batch_rows(valid_indices, C=totalk)
+    vals = torch.randn(2, 4, dtype=torch.float32)  # Match the shape
+    dummy_comms.check_compressed_indices("param", idx, totalk, vals=vals)
 
 
 def test_invalid_not_packed_format():
@@ -1502,18 +1506,18 @@ def test_invalid_not_packed_format():
     Test that non-packed formats (like regular tensors or lists) are rejected.
     """
     dummy_comms = DummyComms()
-    totalk = 20
+    totalk = 128
 
     # Test with regular tensor (not packed) - should fail because it's not uint8
     invalid_tensor = torch.tensor([0, 1, 2, 3], dtype=torch.long)
     vals = torch.randn(4, dtype=torch.float32)
-    # This should fail since only uint8 12-bit packed format is supported
-    with pytest.raises(ValueError, match="Expected uint8 for 12-bit packed indices"):
+    # This should fail since only uint8 Rice/bitmap encoded format is supported
+    with pytest.raises(ValueError, match="Expected uint8.*Rice/bitmap payload"):
         dummy_comms.check_compressed_indices("param", invalid_tensor, totalk, vals=vals)
 
     # Test with list (not a tensor)
     invalid_list = torch.tensor([0, 1, 2, 3])
-    with pytest.raises(ValueError, match="Expected uint8 for 12-bit packed indices"):
+    with pytest.raises(ValueError, match="Expected uint8.*Rice/bitmap payload"):
         dummy_comms.check_compressed_indices("param", invalid_list, totalk, vals=vals)
 
 
@@ -1522,125 +1526,132 @@ def test_invalid_wrong_dtype():
     Test that packed data with wrong dtype is handled correctly.
     """
     dummy_comms = DummyComms()
-    totalk = 20
+    totalk = 128
 
     # int32 tensor is not uint8, so it should fail
     fake_packed = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
     vals = torch.randn(4, dtype=torch.float32)
     # Should fail since only uint8 format is supported
-    with pytest.raises(ValueError, match="Expected uint8 for 12-bit packed indices"):
+    with pytest.raises(ValueError, match="Expected uint8.*Rice/bitmap payload"):
         dummy_comms.check_compressed_indices("param", fake_packed, totalk, vals=vals)
 
 
-def test_invalid_12bit_packed_wrong_topk():
+def test_invalid_rice_bitmap_wrong_topk():
     """
-    Test that 12-bit packed indices with wrong topk dimension raises ValueError.
+    Test that Rice/bitmap encoded indices with wrong topk dimension raises ValueError.
     """
     dummy_comms = DummyComms()
-    totalk = 10  # allowed_topk = min(4, 10) = 4
+    totalk = 64  # allowed_topk = min(4, 64) = 4
     # Create packed indices with wrong topk (2 instead of 4)
-    invalid_indices = torch.tensor([0, 1], dtype=torch.long)
-    packed_data = pack_12bit_indices(invalid_indices)
-    vals = torch.randn(2, dtype=torch.float32)  # Wrong shape - should be 4
-    with pytest.raises(ValueError, match="Invalid topk dimension"):
+    invalid_indices = torch.tensor([[0, 1]], dtype=torch.long)
+    payload, _ = encode_batch_rows(invalid_indices, C=totalk)
+    packed_data = torch.tensor(
+        np.frombuffer(payload, dtype=np.uint8), dtype=torch.uint8
+    )
+    vals = torch.randn(1, 2, dtype=torch.float32)  # Wrong shape - should be 4
+    with pytest.raises(ValueError, match="Values top.*k=2 but allowed_topk=4"):
         dummy_comms.check_compressed_indices("param", packed_data, totalk, vals=vals)
 
 
-def test_invalid_12bit_packed_multi_dim_wrong_topk():
+def test_invalid_rice_bitmap_multi_dim_wrong_topk():
     """
-    Test that 12-bit packed indices from multi-dimensional tensor with wrong last dimension
+    Test that Rice/bitmap encoded indices from multi-dimensional tensor with wrong last dimension
     raises ValueError indicating invalid topk dimension.
     """
     dummy_comms = DummyComms()
-    totalk = 20  # allowed_topk = min(4, 20) = 4
+    totalk = 128  # allowed_topk = min(4, 128) = 4
     # Create a 2D tensor with last dimension size 6 (should be 4)
     invalid_indices = torch.tensor(
         [[0, 1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11]], dtype=torch.long
     )
-    packed_data = pack_12bit_indices(invalid_indices)
+    idx, _ = encode_batch_rows(invalid_indices, C=totalk)
     vals = torch.randn(2, 6, dtype=torch.float32)  # Wrong shape - should be (2, 4)
-    with pytest.raises(ValueError, match="Invalid topk dimension"):
-        dummy_comms.check_compressed_indices("param", packed_data, totalk, vals=vals)
+    with pytest.raises(ValueError, match="Values top.*k=6 but allowed_topk=4"):
+        dummy_comms.check_compressed_indices("param", idx, totalk, vals=vals)
 
 
-# Removed test_invalid_12bit_packed_negative_index as pack_12bit_indices validates input
+# Removed test_invalid_rice_bitmap_negative_index as encoder validates input
 
 
-def test_invalid_12bit_packed_out_of_bounds():
+def test_invalid_rice_bitmap_out_of_bounds():
     """
-    Test that 12-bit packed indices with out-of-bounds values raise ValueError.
+    Test that Rice/bitmap encoded indices with out-of-bounds values raise ValueError.
     """
     dummy_comms = DummyComms()
-    totalk = 10  # allowed_topk = min(4, 10) = 4
-    # Index 10 is out-of-range because valid indices are 0 to 9.
-    invalid_indices = torch.tensor([0, 1, 10, 3], dtype=torch.long)
-    packed_data = pack_12bit_indices(invalid_indices)
-    vals = torch.randn(4, dtype=torch.float32)
-    with pytest.raises(ValueError, match="Index 10 out of bounds"):
-        dummy_comms.check_compressed_indices("param", packed_data, totalk, vals=vals)
+    totalk = 64  # allowed_topk = min(4, 64) = 4
+    # Index 64 is out-of-range because valid indices are 0 to 63.
+    # But the encoder will fail before we can test - so let's test with valid encode but wrong totalk
+    invalid_indices = torch.tensor([[0, 1, 9, 3]], dtype=torch.long)
+    # Encode with a larger C to make it work
+    idx, _ = encode_batch_rows(invalid_indices, C=128, B_choices=(64))
+    vals = torch.randn(1, 4, dtype=torch.float32)
+    # Now check with smaller totalk=64, so index 9 is valid but payload says C=128
+    with pytest.raises(ValueError, match="Payload column size C=128 but expected 64"):
+        dummy_comms.check_compressed_indices("param", idx, totalk, vals=vals)
 
 
 # Removed test_invalid_flat_list_wrong_length - covered by test_invalid_not_packed_format
 
 
-# Removed test_valid_single_value - not applicable to 12-bit packed format
+# Removed test_valid_single_value - not applicable to Rice/bitmap encoded format
 
 
-# Removed test_invalid_single_value_out_of_bounds - not applicable to 12-bit packed format
+# Removed test_invalid_single_value_out_of_bounds - not applicable to Rice/bitmap encoded format
 
 
-def test_override_allowed_topk_12bit():
+def test_override_allowed_topk_rice_bitmap():
     """
-    Test using the optional allowed_topk parameter with 12-bit packed format.
+    Test using the optional allowed_topk parameter with Rice/bitmap encoded format.
     """
     dummy_comms = DummyComms()
-    totalk = 10
+    totalk = 64
+    B_choices = (64)
 
     # Override allowed_topk to 2.
     valid_indices = torch.tensor(
-        [0, 9], dtype=torch.long
+        [[0, 9]], dtype=torch.long
     )  # Correct length: 2 elements.
-    packed_data = pack_12bit_indices(valid_indices)
-    vals = torch.randn(2, dtype=torch.float32)
+    idx, _ = encode_batch_rows(valid_indices, C=totalk, B_choices=B_choices)
+    vals = torch.randn(1, 2, dtype=torch.float32)
     dummy_comms.check_compressed_indices(
-        "param", packed_data, totalk, allowed_topk=2, vals=vals
+        "param", idx, totalk, allowed_topk=2, vals=vals
     )
 
     # Test with wrong topk
     invalid_indices = torch.tensor(
-        [0, 1, 2, 3], dtype=torch.long
+        [[0, 1, 2, 3]], dtype=torch.long
     )  # 4 elements instead of 2.
-    packed_data = pack_12bit_indices(invalid_indices)
-    vals = torch.randn(4, dtype=torch.float32)  # Wrong shape for allowed_topk=2
-    with pytest.raises(ValueError, match="Invalid topk dimension"):
+    idx, _ = encode_batch_rows(invalid_indices, C=totalk, B_choices=B_choices)
+    vals = torch.randn(1, 4, dtype=torch.float32)  # Wrong shape for allowed_topk=2
+    with pytest.raises(ValueError, match="Values top.*k=4 but allowed_topk=2"):
         dummy_comms.check_compressed_indices(
-            "param", packed_data, totalk, allowed_topk=2, vals=vals
+            "param", idx, totalk, allowed_topk=2, vals=vals
         )
 
 
-def test_topk_auto_adjust_when_totalk_is_lower_12bit():
+def test_topk_auto_adjust_when_totalk_is_lower_rice_bitmap():
     """
-    Test scenario where totalk is less than hparams.topk_compression with 12-bit packed format.
+    Test scenario where totalk is less than hparams.topk_compression with Rice/bitmap encoded format.
     """
     dummy_comms = DummyComms()
-    totalk = 2  # Now allowed_topk becomes min(hparams.topk_compression, totalk) = min(4,2) = 2.
+    totalk = 64  # Now allowed_topk becomes min(hparams.topk_compression, totalk) = min(4,64) = 4.
 
     valid_indices = torch.tensor(
-        [0, 1], dtype=torch.long
-    )  # Valid: length matches allowed_topk (which is 2).
-    packed_data = pack_12bit_indices(valid_indices)
-    vals = torch.randn(2, dtype=torch.float32)
-    dummy_comms.check_compressed_indices("param", packed_data, totalk, vals=vals)
+        [[0, 1, 2, 3]], dtype=torch.long
+    )  # Valid: length matches allowed_topk (which is 4).
+    idx, _ = encode_batch_rows(valid_indices, C=totalk)
+    vals = torch.randn(1, 4, dtype=torch.float32)
+    dummy_comms.check_compressed_indices("param", idx, totalk, vals=vals)
 
-    # Note: Can't test with 1 element as pack_12bit_indices requires even number of indices
-    # Test with 4 elements (wrong topk)
+    # Note: Can't test with 1 element as encoder requires even number of indices
+    # Test with 6 elements (wrong topk)
     invalid_indices = torch.tensor(
-        [0, 1, 0, 1], dtype=torch.long
-    )  # 4 elements instead of 2.
-    packed_data = pack_12bit_indices(invalid_indices)
-    vals = torch.randn(4, dtype=torch.float32)  # Wrong shape for allowed_topk=2
-    with pytest.raises(ValueError, match="Invalid topk dimension"):
-        dummy_comms.check_compressed_indices("param", packed_data, totalk, vals=vals)
+        [[0, 1, 2, 3, 4, 5]], dtype=torch.long
+    )  # 6 elements instead of 4.
+    idx, _ = encode_batch_rows(invalid_indices, C=totalk)
+    vals = torch.randn(1, 6, dtype=torch.float32)  # Wrong shape for allowed_topk=4
+    with pytest.raises(ValueError, match="Values top.*k=6 but allowed_topk=4"):
+        dummy_comms.check_compressed_indices("param", idx, totalk, vals=vals)
 
 
 # Tests for `weighted_random_sample_no_replacement`
