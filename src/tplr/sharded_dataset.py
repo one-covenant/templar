@@ -132,6 +132,15 @@ class SharedShardedDataset(Dataset):
             # Ensure dtype is uint32 (no copy if already correct)
             if arr.dtype != np.uint32:
                 arr = arr.astype(np.uint32, copy=False)
+
+            # Flatten if array is not 1D (defensive check for preprocessing bugs)
+            if arr.ndim != 1:
+                tplr.logger.warning(
+                    f"[Dataset] Token file has wrong shape {arr.shape}, expected 1D. "
+                    f"Flattening to 1D (file: {self.tokens_file})"
+                )
+                arr = arr.reshape(-1)
+
             tokens_mem = arr
         else:
             # Raw binary: assume little-endian uint32 from preprocessing
