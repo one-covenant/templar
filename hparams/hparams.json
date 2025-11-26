@@ -11,6 +11,7 @@
     "blocks_per_window": 115,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
+    "shard_reset_outer_step": 4040,
     "momentum_decay": 0.95,
     "topk_compression": 64,
     "target_chunk": 64,

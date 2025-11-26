@@ -29,6 +29,32 @@ from torch.utils.data import Dataset
 import tplr
 
 
+def compute_shard_state(
+    global_step: int,
+    outer_steps_per_shard: int,
+    reset_outer_step: int | None = None,
+) -> tuple[int, int]:
+    """
+    Compute shard epoch and index with optional reset point.
+
+    Returns:
+        (epoch, shard_index)
+        epoch increments when reset_outer_step is reached; shard_index resets to 0.
+    """
+    if outer_steps_per_shard <= 0:
+        return 0, 0
+
+    if (
+        reset_outer_step is None
+        or reset_outer_step < 0
+        or global_step < reset_outer_step
+    ):
+        return 0, global_step // outer_steps_per_shard
+
+    adjusted_step = max(global_step - reset_outer_step, 0)
+    return 1, adjusted_step // outer_steps_per_shard
+
+
 class SharedShardedDataset(Dataset):
     """
     Memory-maps the *pre-processed* dataset produced by `run_preprocessing()`.
