@@ -62,6 +62,8 @@
       "scheduler": {
         "warmup_steps": 1500,
         "warmup_inner_steps": 30,
+        "initial_warmup_inner_steps": 200,
+        "replay_rewind_inner_steps": 20000,
         "t_max": 140000,
         "eta_min_factor": 0.1,
         "flatten_start_step": 2740,
@@ -78,6 +80,8 @@
       "scheduler": {
         "warmup_steps": 1500,
         "warmup_inner_steps": 30,
+        "initial_warmup_inner_steps": 200,
+        "replay_rewind_inner_steps": 20000,
         "t_max": 140000,
         "eta_min_factor": 0.1,
         "flatten_start_step": null,
