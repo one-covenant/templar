@@ -122,7 +122,7 @@ class SharedShardedDataset(Dataset):
             )
 
         tokens_file = os.path.join(shards_path, f"{file_prefix}_{shard_index:06d}.npy")
-        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.bin")
+        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.npy")
 
         return tokens_file, ids_file
 
@@ -172,8 +172,14 @@ class SharedShardedDataset(Dataset):
             # Raw binary: assume little-endian uint32 from preprocessing
             tokens_mem = np.memmap(tokens_path, dtype=np.dtype("<u4"), mode="r")
 
-        # IDs sidecar: always raw binary uint64 little-endian
-        ids_mem = np.memmap(ids_path, dtype=np.dtype("<u8"), mode="r")
+        # IDs sidecar: support .npy (preferred) or raw .bin
+        if ids_path.suffix == ".npy":
+            ids_arr = np.load(ids_path, mmap_mode="r", allow_pickle=False)
+            if ids_arr.dtype != np.uint64:
+                ids_arr = ids_arr.astype(np.uint64, copy=False)
+            ids_mem = ids_arr
+        else:
+            ids_mem = np.memmap(ids_path, dtype=np.dtype("<u8"), mode="r")
 
         # Wrap as torch tensors (zero-copy views)
         self.tokens = torch.from_numpy(tokens_mem)  # dtype: torch.uint32
