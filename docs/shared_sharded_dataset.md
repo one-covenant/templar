@@ -19,7 +19,7 @@ The Shared Sharded dataset is based on the [mlfoundations/dclm-baseline-1.0-parq
 For the fastest training, our optimized version includes:
 
 - Pretokenized numpy arrays in .npy files
-- Array slicing provided via .bin files
+- Sample ID arrays provided via .npy files
 
 ## System Requirements
 
@@ -43,9 +43,9 @@ Append the following env keys:
 
 ```bash
 R2_DATASET_ACCOUNT_ID=8af7f92a8a0661cf7f1ac0420c932980
-R2_DATASET_BUCKET_NAME=gemma-migration
-R2_DATASET_READ_ACCESS_KEY_ID=a733fac6c32a549e0d48f9f7cf67d758
-R2_DATASET_READ_SECRET_ACCESS_KEY=f50cab456587f015ad21c48c3e23c7ff0e6f1ad5a22c814c3a50d1a4b7c76bb9
+R2_DATASET_BUCKET_NAME=mixed-dataset-migration
+R2_DATASET_READ_ACCESS_KEY_ID=e70cd26850f697479bbb5fd9413713f4
+R2_DATASET_READ_SECRET_ACCESS_KEY=11e3364d6ef70e44d671863fb6de32d474aa6220fa2c9c3df45c5e012ebfbda3
 DATASET_BINS_PATH="tokenized/"
 ```
 
@@ -92,16 +92,16 @@ Use the CloudFlare migration tool for the easiest setup. Here are the key-value 
 
 - Bucket Information
   `Source bucket provider`: `S3-Compatible Storage`
-  `Bucket name`: `gemma-migration`
-  `S3-compatible endpoint URL`: `https://8af7f92a8a0661cf7f1ac0420c932980.r2.cloudflarestorage.com/gemma-migration`
+  `Bucket name`: `mixed-dataset-migration`
+  `S3-compatible endpoint URL`: `https://8af7f92a8a0661cf7f1ac0420c932980.r2.cloudflarestorage.com/mixed-dataset-migration`
 - Required Credentials
-  `Access Key ID`: `a733fac6c32a549e0d48f9f7cf67d758`
-  `Secret Access Key`: `f50cab456587f015ad21c48c3e23c7ff0e6f1ad5a22c814c3a50d1a4b7c76bb9`
+  `Access Key ID`: `e70cd26850f697479bbb5fd9413713f4`
+  `Secret Access Key`: `11e3364d6ef70e44d671863fb6de32d474aa6220fa2c9c3df45c5e012ebfbda3`
 
 #### Page 2
 
 - Select destination R2 bucket
-  `Bucket name`: `gemma-migration`
+  `Bucket name`: `mixed-dataset-migration`
   `Access Key ID`: your_write_id
   `Access Key`: your_secret_write_id
   `Overwrite files?`: `Yes, overwrite (recommended)`
@@ -122,8 +122,8 @@ curl https://rclone.org/install.sh | sudo bash
 # Configure source (read-only)
 rclone config create r2-source s3 \
   provider=Cloudflare \
-  access_key_id=a733fac6c32a549e0d48f9f7cf67d758 \
-  secret_access_key=f50cab456587f015ad21c48c3e23c7ff0e6f1ad5a22c814c3a50d1a4b7c76bb9 \
+  access_key_id=e70cd26850f697479bbb5fd9413713f4 \
+  secret_access_key=11e3364d6ef70e44d671863fb6de32d474aa6220fa2c9c3df45c5e012ebfbda3 \
   endpoint=https://8af7f92a8a0661cf7f1ac0420c932980.r2.cloudflarestorage.com \
   acl=private
 
@@ -139,7 +139,7 @@ rclone config create r2-dest s3 \
 ##### Copy all shards (Full Migration)
 ```bash
 # Copy entire tokenized directory (all shards and sample IDs)
-rclone copy r2-source:gemma-migration/tokenized/ r2-dest:<your-bucket-name>/tokenized/ \
+rclone copy r2-source:mixed-dataset-migration/tokenized/ r2-dest:<your-bucket-name>/tokenized/ \
   --transfers 32 \
   --checkers 16 \
   --progress
@@ -149,10 +149,10 @@ rclone copy r2-source:gemma-migration/tokenized/ r2-dest:<your-bucket-name>/toke
 If you want to test with just the first two shards:
 ```bash
 # Copy first two training shards and their sample IDs
-rclone copy r2-source:gemma-migration/tokenized/train_000000.npy r2-dest:<your-bucket-name>/tokenized/ --progress
-rclone copy r2-source:gemma-migration/tokenized/train_000001.npy r2-dest:<your-bucket-name>/tokenized/ --progress
-rclone copy r2-source:gemma-migration/tokenized/sample_ids_000000.bin r2-dest:<your-bucket-name>/tokenized/ --progress
-rclone copy r2-source:gemma-migration/tokenized/sample_ids_000001.bin r2-dest:<your-bucket-name>/tokenized/ --progress
+rclone copy r2-source:mixed-dataset-migration/tokenized/train_000000.npy r2-dest:<your-bucket-name>/tokenized/ --progress
+rclone copy r2-source:mixed-dataset-migration/tokenized/train_000001.npy r2-dest:<your-bucket-name>/tokenized/ --progress
+rclone copy r2-source:mixed-dataset-migration/tokenized/sample_ids_000000.npy r2-dest:<your-bucket-name>/tokenized/ --progress
+rclone copy r2-source:mixed-dataset-migration/tokenized/sample_ids_000001.npy r2-dest:<your-bucket-name>/tokenized/ --progress
 ```
 
 After migration, update your environment variables to point to your bucket:
