@@ -521,6 +521,9 @@ class Validator(BaseNode, Trainer):
         self.param_change_alpha = 0.2
 
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
+        self.shard_reset_outer_step = getattr(
+            self.hparams, "shard_reset_outer_step", None
+        )
         self.dataset_manager = tplr.sharded_dataset.ShardedDatasetManager(
             sequence_length=self.hparams.sequence_length,
             rank=self.local_rank,  # Use local_rank for proper file operations
@@ -1245,7 +1248,11 @@ class Validator(BaseNode, Trainer):
             aggregator_device="cpu",
         )
 
-        current_shard = self.global_step // self.outer_steps_per_shard
+        shard_epoch, current_shard = tplr.sharded_dataset.compute_shard_state(
+            self.global_step,
+            self.outer_steps_per_shard,
+            self.shard_reset_outer_step,
+        )
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
         _ = await self.dataset_manager.initialize_datasets(current_shard)
@@ -1256,6 +1263,7 @@ class Validator(BaseNode, Trainer):
         self.set_dataloader(validator=True)
 
         # Track the current shard to avoid double-swapping at initialization
+        last_shard_epoch = shard_epoch
         last_shard = current_shard
 
         if self.is_master:
@@ -1287,8 +1295,24 @@ class Validator(BaseNode, Trainer):
             window_start = tplr.T()
 
             # Check if we need to swap dataset based on shard index change
-            current_shard_check = self.global_step // self.outer_steps_per_shard
-            if current_shard_check > last_shard:
+            shard_epoch_check, current_shard_check = (
+                tplr.sharded_dataset.compute_shard_state(
+                    self.global_step,
+                    self.outer_steps_per_shard,
+                    self.shard_reset_outer_step,
+                )
+            )
+            if shard_epoch_check != last_shard_epoch:
+                tplr.logger.info(
+                    f"Resetting shard schedule at outer_step {self.global_step} "
+                    f"to shard {current_shard_check}"
+                )
+                await self.dataset_manager.initialize_datasets(current_shard_check)
+                self.set_dataloader(validator=True)
+                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                last_shard_epoch = shard_epoch_check
+                last_shard = current_shard_check
+            elif current_shard_check > last_shard:
                 tplr.logger.info(
                     f"Swapping dataset after {self.global_step} outer steps at window {self.current_window}"
                 )

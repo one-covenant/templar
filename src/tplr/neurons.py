@@ -689,6 +689,38 @@ async def handle_checkpoint_catchup(
         from_bootstrap: Whether checkpoint was from bootstrap version
         aggregator_device: which device to load aggregation results to
     """
+    # Determine scheduler config and warmup settings
+    optimizer_cfg = getattr(instance.hparams, "optimizer", {})
+    opt_type = optimizer_cfg.get("type", "adamw").lower()
+    opt_cfg = optimizer_cfg.get(opt_type, {})
+    scheduler_cfg = opt_cfg.get("scheduler", {})
+
+    default_warmup_inner = scheduler_cfg.get(
+        "warmup_inner_steps", getattr(instance, "warmup_inner_steps", 0)
+    )
+    startup_warmup_inner = scheduler_cfg.get(
+        "initial_warmup_inner_steps", default_warmup_inner
+    )
+
+    # Set warmup length:
+    # - If resuming from bootstrap, use the longer startup warmup.
+    # - If resuming from a regular checkpoint, use the default.
+    # - If global_step is 0, leave as-is; the scheduler's own warmup covers this.
+    if ckpt_global_step == 0:
+        tplr.logger.info("Global step is 0; leaving warmup settings unchanged.")
+    elif from_bootstrap:
+        instance.warmup_inner_steps = startup_warmup_inner
+        tplr.logger.info(
+            f"Applying startup warmup_inner_steps={startup_warmup_inner} (bootstrap resume)"
+        )
+        instance.warmup_steps_taken = 0
+    else:
+        instance.warmup_inner_steps = default_warmup_inner
+        tplr.logger.info(
+            f"Applying resumed warmup_inner_steps={default_warmup_inner} (checkpoint resume)"
+        )
+        instance.warmup_steps_taken = 0
+
     # Decide catch-up windows and run catch-up on ALL ranks
     # When loading from bootstrap, we always need to catch up from start_window
     # to ensure we're using current version's gradients
@@ -726,7 +758,17 @@ async def handle_checkpoint_catchup(
     # Replay scheduler steps based on windows completed from checkpoint
     # ckpt_global_step tracks windows, scheduler needs inner_steps per window
     total_inner_steps = ckpt_global_step * instance.hparams.inner_steps
-    if total_inner_steps > 0:
+
+    # Apply configurable rewind before replaying scheduler to give slack on restarts
+    rewind_inner_steps = scheduler_cfg.get("replay_rewind_inner_steps", 0)
+    if rewind_inner_steps > 0:
+        total_inner_steps = max(total_inner_steps - rewind_inner_steps, 0)
+        tplr.logger.info(
+            f"Rewinding scheduler replay by {rewind_inner_steps} inner steps; "
+            f"{total_inner_steps} steps remain to replay"
+        )
+
+    if total_inner_steps > 0 and getattr(instance, "inner_scheduler", None) is not None:
         for _ in range(total_inner_steps):
             # Respect flatten window during replay
             if not instance.should_skip_scheduler_step():

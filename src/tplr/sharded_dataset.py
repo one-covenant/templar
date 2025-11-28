@@ -29,6 +29,32 @@ from torch.utils.data import Dataset
 import tplr
 
 
+def compute_shard_state(
+    global_step: int,
+    outer_steps_per_shard: int,
+    reset_outer_step: int | None = None,
+) -> tuple[int, int]:
+    """
+    Compute shard epoch and index with optional reset point.
+
+    Returns:
+        (epoch, shard_index)
+        epoch increments when reset_outer_step is reached; shard_index resets to 0.
+    """
+    if outer_steps_per_shard <= 0:
+        return 0, 0
+
+    if (
+        reset_outer_step is None
+        or reset_outer_step < 0
+        or global_step < reset_outer_step
+    ):
+        return 0, global_step // outer_steps_per_shard
+
+    adjusted_step = max(global_step - reset_outer_step, 0)
+    return 1, adjusted_step // outer_steps_per_shard
+
+
 class SharedShardedDataset(Dataset):
     """
     Memory-maps the *pre-processed* dataset produced by `run_preprocessing()`.
@@ -96,7 +122,7 @@ class SharedShardedDataset(Dataset):
             )
 
         tokens_file = os.path.join(shards_path, f"{file_prefix}_{shard_index:06d}.npy")
-        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.bin")
+        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.npy")
 
         return tokens_file, ids_file
 
@@ -132,13 +158,28 @@ class SharedShardedDataset(Dataset):
             # Ensure dtype is uint32 (no copy if already correct)
             if arr.dtype != np.uint32:
                 arr = arr.astype(np.uint32, copy=False)
+
+            # Flatten if array is not 1D (defensive check for preprocessing bugs)
+            if arr.ndim != 1:
+                tplr.logger.warning(
+                    f"[Dataset] Token file has wrong shape {arr.shape}, expected 1D. "
+                    f"Flattening to 1D (file: {self.tokens_file})"
+                )
+                arr = arr.reshape(-1)
+
             tokens_mem = arr
         else:
             # Raw binary: assume little-endian uint32 from preprocessing
             tokens_mem = np.memmap(tokens_path, dtype=np.dtype("<u4"), mode="r")
 
-        # IDs sidecar: always raw binary uint64 little-endian
-        ids_mem = np.memmap(ids_path, dtype=np.dtype("<u8"), mode="r")
+        # IDs sidecar: support .npy (preferred) or raw .bin
+        if ids_path.suffix == ".npy":
+            ids_arr = np.load(ids_path, mmap_mode="r", allow_pickle=False)
+            if ids_arr.dtype != np.uint64:
+                ids_arr = ids_arr.astype(np.uint64, copy=False)
+            ids_mem = ids_arr
+        else:
+            ids_mem = np.memmap(ids_path, dtype=np.dtype("<u8"), mode="r")
 
         # Wrap as torch tensors (zero-copy views)
         self.tokens = torch.from_numpy(tokens_mem)  # dtype: torch.uint32
