@@ -884,7 +884,9 @@ class Trainer:
 
                             # Unscale, clip, then step via GradScaler if using fp16
                             self.scaler.unscale_(self.inner_optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                            total_grad_norm = torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(), 1.0
+                            ).item()
                             self.scaler.step(self.inner_optimizer)
                             self.scaler.update()
 
@@ -906,6 +908,7 @@ class Trainer:
                         else:
                             # Spin-up: don't step optimizer/scheduler, just clear gradients
                             self.scaler.update()
+                            total_grad_norm = 0.0
 
                         self.inner_optimizer.zero_grad(set_to_none=True)
 
@@ -922,6 +925,7 @@ class Trainer:
                             tplr.logger.info(
                                 f"Inner Step {inner_step_count}, "
                                 f"Batch {batch_count}, loss: {log_loss:.4f}, "
+                                f"grad_norm: {total_grad_norm:.4f}, "
                                 f"accum: {accum_batch_size}/{self.hparams.batch_size}"
                             )
                         if window_entry_loss == 0.0:

@@ -58,6 +58,9 @@ class BaseNode(abc.ABC):
         self._prof = None
         # self.config, self.world_size …  come from the concrete node
 
+        # Continue MRO chain to initialize parent classes (e.g., Trainer)
+        super().__init__()
+
     async def main(self):
         loop = asyncio.get_running_loop()
         self._setup_signal_handlers(loop)
