@@ -49,7 +49,7 @@ from tplr.schemas import Bucket, CommsGetResult
 
 # Constants
 CF_REGION_NAME: str = "enam"
-LOCAL_TMP_DIR = "/tmp/local_store"
+LOCAL_TMP_DIR = "./tmp/local_store"
 PEERS_FILE_PREFIX = "peers_"
 CPU_COUNT = os.cpu_count() or 4
 CPU_MAX_CONNECTIONS = min(100, max(30, CPU_COUNT * 4))
@@ -72,7 +72,7 @@ class Comms(ChainManager):
     def __init__(
         self,
         wallet: bt.wallet | None,
-        save_location: str = "/tmp",
+        save_location: str = "./tmp",
         key_prefix: str = "model",
         config=None,
         hparams=None,
@@ -85,7 +85,7 @@ class Comms(ChainManager):
 
         Args:
             wallet (bt.wallet | None): The bittensor wallet instance.
-            save_location (str, optional): The base directory for saving local files. Defaults to "/tmp".
+            save_location (str, optional): The base directory for saving local files. Defaults to "./tmp".
             key_prefix (str, optional): A prefix for keys used in storage. Defaults to "model".
             config (object, optional): Configuration object. Defaults to None.
             hparams (object, optional): Hyperparameters object. Defaults to None.
@@ -96,7 +96,7 @@ class Comms(ChainManager):
         self.wallet = wallet
 
         # Create temp directory for this instance
-        self.temp_dir = os.path.join("/tmp", f"templar_{self.uid}")
+        self.temp_dir = os.path.join("./tmp", f"templar_{self.uid}")
         os.makedirs(self.temp_dir, exist_ok=True)
         # Get the bucket directly
         self.bucket = self.get_own_bucket("gradients", "write")
@@ -111,15 +111,15 @@ class Comms(ChainManager):
         # Use the hotkey directly in the save_location
         if self.wallet is not None:
             hotkey = self.wallet.hotkey.ss58_address
-            self.save_location = os.path.join("/tmp", f"hotkey_{hotkey}")
+            self.save_location = os.path.join("./tmp", f"hotkey_{hotkey}")
             os.makedirs(self.save_location, exist_ok=True)
         self.key_prefix = key_prefix
 
         ## a single aiobotocore session and a dictionary of clients
         self.session = get_session()
-        self._s3_clients: dict[
-            tuple[str, str, str], AioBaseClient
-        ] = {}  # (acc_key, sec_key, account_id) -> s3_client
+        self._s3_clients: dict[tuple[str, str, str], AioBaseClient] = (
+            {}
+        )  # (acc_key, sec_key, account_id) -> s3_client
 
         self.lock = asyncio.Lock()
         self.active_peers = set()  # Set to store active peers
@@ -1311,7 +1311,7 @@ class Comms(ChainManager):
         put_start = tplr.T()
 
         # Create per-uid temp directory
-        temp_dir = os.path.join("/tmp", str(self.uid))
+        temp_dir = os.path.join("./tmp", str(self.uid))
         os.makedirs(temp_dir, exist_ok=True)
         temp_file_path = os.path.join(temp_dir, f"temp_{filename}")
 
