@@ -891,7 +891,7 @@ class DCPCheckpointer:
         _barrier(process_group)
         
         sidecar_path = local_dir / "extra_metadata.json"
-        # NEW: retry on FileNotFoundError / transient IO errors
+        # retry on FileNotFoundError / transient IO errors
         async def _read_sidecar():
             return await asyncio.to_thread(sidecar_path.read_text)
         
@@ -902,11 +902,24 @@ class DCPCheckpointer:
                 attempts=5,
                 delay_s=0.5,
             )
+            read_ok = True
         except Exception as e:
             tplr.logger.error(
                 f"[DCP][download-and-load] failed to read sidecar at "
                 f"{_safe(sidecar_path)}: {_safe(e)}"
             )
+            read_ok = False
+            sidecar_text = ""
+        
+        # --- Synchronize success/failure across ranks ---
+        if dist.is_available() and dist.is_initialized():
+            ok_tensor = torch.tensor([1 if read_ok else 0], dtype=torch.int32)
+            # always keep on CPU for safety
+            dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+            read_ok = bool(ok_tensor.item())
+
+        if not read_ok:
+            # All ranks return consistently
             return None
         
         try:
