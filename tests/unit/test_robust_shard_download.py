@@ -64,7 +64,9 @@ class TestShardValidation:
 
         assert dataset_manager._validate_shard_files(tokens_file, ids_file) is True
 
-    def test_validate_shard_files_missing_tokens(self, dataset_manager, temp_dataset_path):
+    def test_validate_shard_files_missing_tokens(
+        self, dataset_manager, temp_dataset_path
+    ):
         """Test validation when tokens file is missing."""
         tokens_file = temp_dataset_path / "train_000000.npy"
         ids_file = temp_dataset_path / "sample_ids_000000.npy"
@@ -164,7 +166,9 @@ class TestPrepareShardWithRetry:
     """Tests for shard preparation with retry logic."""
 
     @pytest.mark.asyncio
-    async def test_prepare_shard_already_exists(self, dataset_manager, temp_dataset_path):
+    async def test_prepare_shard_already_exists(
+        self, dataset_manager, temp_dataset_path
+    ):
         """Test preparation when shard already exists."""
         tokens_file = temp_dataset_path / "train_000000.npy"
         ids_file = temp_dataset_path / "sample_ids_000000.npy"
@@ -223,7 +227,9 @@ class TestPrepareShardWithRetry:
 
         call_count = 0
 
-        async def mock_download_with_retry(key, bucket, load_data=False, show_progress=True):
+        async def mock_download_with_retry(
+            key, bucket, load_data=False, show_progress=True
+        ):
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
@@ -236,7 +242,9 @@ class TestPrepareShardWithRetry:
                 np.save(key, np.array([100, 200, 300], dtype=np.uint64))
             return str(key)
 
-        dataset_manager.comms.s3_get_object = AsyncMock(side_effect=mock_download_with_retry)
+        dataset_manager.comms.s3_get_object = AsyncMock(
+            side_effect=mock_download_with_retry
+        )
 
         success = await dataset_manager._prepare_shard_with_retry(
             shard_index=0,
@@ -361,7 +369,9 @@ class TestCreateDatasetAwaitBased:
     """Tests for await-based dataset creation."""
 
     @pytest.mark.asyncio
-    async def test_create_dataset_success(self, dataset_manager, temp_dataset_path, monkeypatch):
+    async def test_create_dataset_success(
+        self, dataset_manager, temp_dataset_path, monkeypatch
+    ):
         """Test successful dataset creation with await-based download."""
         # Create valid shard files
         tokens_file = temp_dataset_path / "train_000000.npy"
@@ -396,6 +406,7 @@ class TestCreateDatasetAwaitBased:
         self, dataset_manager, temp_dataset_path
     ):
         """Test dataset creation when validation fails after download."""
+
         # Mock download that succeeds but creates invalid files
         async def mock_download(key, bucket, load_data=False, show_progress=True):
             # Create empty files

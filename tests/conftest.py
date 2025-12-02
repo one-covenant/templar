@@ -31,6 +31,11 @@ os.environ.setdefault("R2_DATASET_READ_ACCESS_KEY_ID", "mock-dataset-read-key-id
 os.environ.setdefault(
     "R2_DATASET_READ_SECRET_ACCESS_KEY", "mock-dataset-read-secret-key"
 )
+os.environ.setdefault("R2_DATASET_WRITE_ACCESS_KEY_ID", "mock-dataset-write-key-id")
+os.environ.setdefault(
+    "R2_DATASET_WRITE_SECRET_ACCESS_KEY", "mock-dataset-write-secret-key"
+)
+os.environ.setdefault("DATASET_BINS_PATH", "/tmp/test-dataset")
 
 import pytest
 from unittest.mock import Mock, patch

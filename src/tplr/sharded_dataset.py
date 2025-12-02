@@ -390,7 +390,7 @@ class ShardedDatasetManager:
 
             # Exponential backoff before retry (except on last attempt)
             if attempt < self.max_download_retries - 1:
-                backoff_time = 2 ** attempt  # 1s, 2s, 4s, etc.
+                backoff_time = 2**attempt  # 1s, 2s, 4s, etc.
                 tplr.logger.info(f"Retrying in {backoff_time}s...")
                 await asyncio.sleep(backoff_time)
 
