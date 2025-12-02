@@ -234,4 +234,4 @@ Potential enhancements for future iterations:
 ## References
 
 - [Issue #600](https://github.com/one-covenant/templar/issues/600): Original issue
-- [PR #XXX](https://github.com/one-covenant/templar/pull/XXX): Implementation PR
+- [PR #663](https://github.com/one-covenant/templar/pull/663): Implementation PR
