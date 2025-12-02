@@ -1670,10 +1670,10 @@ class Comms(ChainManager):
             current_window=window,
         )
 
-        aggregated_state_dict = {}
-        valid_uids = []
-        skipped_uids = []  # Retain UIDs that are skipped.
-        global_steps = []
+        aggregated_state_dict: dict[str, list[torch.Tensor]] = {}
+        valid_uids: list[int] = []
+        skipped_uids: list[int] = []
+        global_steps: list[int] = []
 
         # Ensure deterministic order across processes/ranks
         uids = sorted(uids)
@@ -1703,203 +1703,219 @@ class Comms(ChainManager):
                     f"{tplr.P(window, tplr.T() - download_start)} Downloaded peer gradients <--"
                 )
                 process_start = tplr.T()
-                for uid, response in zip(uids, batch_responses):
-                    received_compressed_params = set()
 
-                    if isinstance(response, Exception):
-                        tplr.log_with_context(
-                            level="debug",
-                            message=f"Error from UID {uid}: {str(response)}",
-                            current_window=window,
-                        )
-                        skipped_uids.append(uid)
-                        continue
-                    if response is None:
-                        tplr.logger.info(f"Skipped UID {uid} - gradient not found.")
-                        skipped_uids.append(uid)
-                        continue
+                # We don't need gradients for any of this
+                with torch.no_grad():
+                    for uid, response in zip(uids, batch_responses):
+                        received_compressed_params: set[str] = set()
 
-                    try:
-                        # This is where get response uses the step
-                        response = cast(CommsGetResult, response)
-                        state_dict_resp, global_step_resp = (
-                            response.data,
-                            response.global_step,
-                        )
-                        tplr.logger.debug(
-                            f"Received state dict and global step {global_step_resp} from UID {uid}"
-                        )
-                    except (TypeError, ValueError) as e:
-                        tplr.log_with_context(
-                            level="debug",
-                            message=f"Invalid response from UID {uid}: {e}",
-                            current_window=window,
-                        )
-                        skipped_uids.append(uid)
-                        continue
-
-                    if state_dict_resp is None:
-                        tplr.logger.debug(f"Empty state dict from UID {uid}")
-                        skipped_uids.append(uid)
-                        continue
-
-                    # ---------- Begin Compressed Indices and Values Check ----------
-                    valid_response = True
-                    for param_name, tensor in state_dict_resp.items():
-                        received_compressed_params.add(param_name)
-
-                        # ----------------------------------------------------------
-                        # (1)  Validate quantisation parameters themselves
-                        # ----------------------------------------------------------
-                        if param_name.endswith("quant_params"):
-                            shift, scale, offset, lookup, dtype = tensor
-                            if (
-                                (not torch.isfinite(shift))
-                                or isinstance(scale, float)
-                                and (
-                                    not math.isfinite(scale)
-                                    or abs(scale) < 1e-12
-                                    or abs(scale) > 1e4
-                                )
-                            ):
-                                tplr.logger.warning(
-                                    f"Bad quant‑params in {param_name} from UID {uid}; "
-                                    f"shift={shift}, scale={scale}"
-                                )
-                                valid_response = False
-                                break
-                            if torch.is_tensor(lookup) and (
-                                not torch.isfinite(lookup).all()
-                            ):
-                                tplr.logger.warning(
-                                    f"Lookup table contains non‑finite values in {param_name} "
-                                    f"from UID {uid}"
-                                )
-                                valid_response = False
-                                break
-
-                        if param_name.endswith("idxs"):
-                            base_name = param_name[:-4]
-                            totalk_value = totalks.get(base_name)
-                            if totalk_value is None:
-                                tplr.logger.warning(
-                                    f"Missing totalk for parameter {base_name} from UID {uid}, skipping UID."
-                                )
-                                valid_response = False
-                                break
-                            # totalks stores integers, not tensors
-                            totalk = (
-                                totalk_value
-                                if isinstance(totalk_value, int)
-                                else totalk_value.numel()
+                        # ----------------- error / None handling -----------------
+                        if isinstance(response, Exception):
+                            tplr.log_with_context(
+                                level="debug",
+                                message=f"Error from UID {uid}: {str(response)}",
+                                current_window=window,
                             )
-                            # Get corresponding vals tensor for 12-bit unpacking
-                            vals_tensor = state_dict_resp.get(base_name + "vals", None)
-                            try:
-                                self.check_compressed_indices(
-                                    param_name,
-                                    tensor,
-                                    totalk,
-                                    allowed_topk=self.hparams.topk_compression,
-                                    vals=vals_tensor,
-                                )
-                            except Exception as e:
-                                tplr.logger.warning(
-                                    f"Compressed indices check failed for parameter {param_name} from UID {uid}: {e}"
-                                )
-                                valid_response = False
-                                break
-                        # Check if values are valid (not NaN, not Inf) - validate without dequantizing
-                        elif param_name.endswith("vals"):
-                            # Only move to device for validation if needed
-                            if tensor.dtype == torch.uint8:
-                                # For quantized values, do a quick check on the raw bytes
-                                if tensor.nelement() == 0:
-                                    tplr.logger.warning(
-                                        f"Empty tensor in {param_name} from UID {uid}, skipping"
-                                    )
-                                    valid_response = False
-                                    break
-                            else:
-                                # For non-quantized tensors, check for NaN/Inf
-                                tensor_to_check = tensor.to(device)
+                            skipped_uids.append(uid)
+                            continue
+
+                        if response is None:
+                            tplr.logger.info(f"Skipped UID {uid} - gradient not found.")
+                            skipped_uids.append(uid)
+                            continue
+
+                        try:
+                            response = cast(CommsGetResult, response)
+                            state_dict_resp, global_step_resp = (
+                                response.data,
+                                response.global_step,
+                            )
+                            tplr.logger.debug(
+                                f"Received state dict and global step {global_step_resp} from UID {uid}"
+                            )
+                        except (TypeError, ValueError) as e:
+                            tplr.log_with_context(
+                                level="debug",
+                                message=f"Invalid response from UID {uid}: {e}",
+                                current_window=window,
+                            )
+                            skipped_uids.append(uid)
+                            continue
+
+                        if state_dict_resp is None:
+                            tplr.logger.debug(f"Empty state dict from UID {uid}")
+                            skipped_uids.append(uid)
+                            continue
+
+                        # ---------- Begin Compressed Indices and Values Check ----------
+                        valid_response = True
+
+                        for param_name, tensor in state_dict_resp.items():
+                            received_compressed_params.add(param_name)
+
+                            # (1) Validate quantisation parameters themselves
+                            if param_name.endswith("quant_params"):
+                                shift, scale, offset, lookup, dtype = tensor
                                 if (
-                                    torch.isnan(tensor_to_check).any()
-                                    or torch.isinf(tensor_to_check).any()
+                                    (not torch.isfinite(shift))
+                                    or isinstance(scale, float)
+                                    and (
+                                        not math.isfinite(scale)
+                                        or abs(scale) < 1e-12
+                                        or abs(scale) > 1e4
+                                    )
                                 ):
                                     tplr.logger.warning(
-                                        f"NaN/Inf in {param_name} from UID {uid}, skipping"
+                                        f"Bad quant-params in {param_name} from UID {uid}; "
+                                        f"shift={shift}, scale={scale}"
                                     )
                                     valid_response = False
                                     break
-                                # Clean up temporary tensor
-                                del tensor_to_check
+                                if torch.is_tensor(lookup) and (
+                                    not torch.isfinite(lookup).all()
+                                ):
+                                    tplr.logger.warning(
+                                        f"Lookup table contains non-finite values in {param_name} "
+                                        f"from UID {uid}"
+                                    )
+                                    valid_response = False
+                                    break
 
-                            # ------------------------------------------------------
-                            # (2)  Only validate quantization params exist, don't dequantize
-                            # ------------------------------------------------------
-                            qparams = state_dict_resp.get(
-                                param_name[:-4] + "quant_params", None
-                            )
-                            if qparams is None and tensor.dtype == torch.uint8:
-                                tplr.logger.warning(
-                                    f"Missing quant_params for quantized {param_name} from UID {uid}"
+                            if param_name.endswith("idxs"):
+                                base_name = param_name[:-4]
+                                totalk_value = totalks.get(base_name)
+                                if totalk_value is None:
+                                    tplr.logger.warning(
+                                        f"Missing totalk for parameter {base_name} from UID {uid}, skipping UID."
+                                    )
+                                    valid_response = False
+                                    break
+
+                                # totalks stores integers, not tensors
+                                totalk = (
+                                    totalk_value
+                                    if isinstance(totalk_value, int)
+                                    else totalk_value.numel()
                                 )
-                                valid_response = False
-                                break
 
-                    missing_params = (
-                        expected_compressed_params - received_compressed_params
-                    )
-                    if missing_params:
-                        tplr.logger.warning(
-                            f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
+                                vals_tensor = state_dict_resp.get(base_name + "vals", None)
+                                try:
+                                    self.check_compressed_indices(
+                                        param_name,
+                                        tensor,
+                                        totalk,
+                                        allowed_topk=self.hparams.topk_compression,
+                                        vals=vals_tensor,
+                                    )
+                                except Exception as e:
+                                    tplr.logger.warning(
+                                        f"Compressed indices check failed for parameter {param_name} from UID {uid}: {e}"
+                                    )
+                                    valid_response = False
+                                    break
+
+                            # Check if values are valid (not NaN, not Inf) - validate without dequantizing
+                            elif param_name.endswith("vals"):
+                                if tensor.dtype == torch.uint8:
+                                    # For quantized values, do a quick check on the raw bytes
+                                    if tensor.nelement() == 0:
+                                        tplr.logger.warning(
+                                            f"Empty tensor in {param_name} from UID {uid}, skipping"
+                                        )
+                                        valid_response = False
+                                        break
+                                else:
+                                    # For non-quantized tensors, check for NaN/Inf
+                                    # Avoid unnecessary copies: only move if needed
+                                    if tensor.device.type == device:
+                                        tensor_to_check = tensor
+                                        needs_delete = False
+                                    else:
+                                        tensor_to_check = tensor.to(device, non_blocking=True)
+                                        needs_delete = True
+
+                                    if (
+                                        torch.isnan(tensor_to_check).any()
+                                        or torch.isinf(tensor_to_check).any()
+                                    ):
+                                        tplr.logger.warning(
+                                            f"NaN/Inf in {param_name} from UID {uid}, skipping"
+                                        )
+                                        valid_response = False
+
+                                    if needs_delete:
+                                        del tensor_to_check
+
+                                    if not valid_response:
+                                        break
+
+                                # (2) Only validate quantization params exist, don't dequantize
+                                qparams = state_dict_resp.get(
+                                    param_name[:-4] + "quant_params", None
+                                )
+                                if qparams is None and tensor.dtype == torch.uint8:
+                                    tplr.logger.warning(
+                                        f"Missing quant_params for quantized {param_name} from UID {uid}"
+                                    )
+                                    valid_response = False
+                                    break
+
+                        missing_params = (
+                            expected_compressed_params - received_compressed_params
                         )
-                        valid_response = False
-
-                    # If any check failed, skip this UID entirely
-                    if not valid_response:
-                        tplr.logger.info(
-                            f"Skipping UID {uid} due to validation failures"
-                        )
-                        skipped_uids.append(uid)
-                        continue
-                    # ---------- End Compressed Indices and Values Check ----------
-
-                    # Process tensors - keep everything quantized to save memory
-                    for param_name, tensor in state_dict_resp.items():
-                        # 1️⃣  Indices are kept as‑is -----------------------------------------
-                        if param_name.endswith("idxs"):
-                            aggregated_state_dict.setdefault(param_name, []).append(
-                                tensor
+                        if missing_params:
+                            tplr.logger.warning(
+                                f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
                             )
-                            # Handle 12-bit packed format (uint8 tensor)
-                            metrics["download_bytes"] += (
-                                tensor.element_size() * tensor.nelement()
-                            )
+                            valid_response = False
 
-                        # 2️⃣  Values → keep quantized, store with quant_params ---------------
-                        elif param_name.endswith("vals"):
-                            # Keep values quantized - just store the raw tensor
-                            aggregated_state_dict.setdefault(param_name, []).append(
-                                tensor  # Keep original dtype (uint8 if quantized)
+                        if not valid_response:
+                            tplr.logger.info(
+                                f"Skipping UID {uid} due to validation failures"
                             )
-                            metrics["download_bytes"] += (
-                                tensor.element_size() * tensor.nelement()
-                            )
+                            skipped_uids.append(uid)
+                            # Drop references early for this UID
+                            del state_dict_resp
+                            del response
+                            continue
+                        # ---------- End Compressed Indices and Values Check ----------
 
-                        # 3️⃣  Store quantization parameters for later use --------------------
-                        elif param_name.endswith("quant_params"):
-                            aggregated_state_dict.setdefault(param_name, []).append(
-                                tensor
-                            )
+                        # ----------------- Aggregation (still under no_grad) -----------------
+                        for param_name, tensor in state_dict_resp.items():
+                            if param_name.endswith("idxs"):
+                                aggregated_state_dict.setdefault(param_name, []).append(
+                                    tensor
+                                )
+                                metrics["download_bytes"] += (
+                                    tensor.element_size() * tensor.nelement()
+                                )
 
-                    valid_uids.append(uid)
-                    global_steps.append(global_step_resp)
+                            elif param_name.endswith("vals"):
+                                aggregated_state_dict.setdefault(param_name, []).append(
+                                    tensor
+                                )
+                                metrics["download_bytes"] += (
+                                    tensor.element_size() * tensor.nelement()
+                                )
+
+                            elif param_name.endswith("quant_params"):
+                                aggregated_state_dict.setdefault(param_name, []).append(
+                                    tensor
+                                )
+
+                        valid_uids.append(uid)
+                        global_steps.append(global_step_resp)
+
+                        # Explicitly drop UID-local references now that we've copied
+                        del state_dict_resp
+                        del response
 
                 tplr.logger.info(
                     f"{tplr.P(window, tplr.T() - process_start)} Processed peer gradients <--"
                 )
+
+                # Drop the entire batch_responses list to free references
+                del batch_responses
 
             except Exception as e:
                 tplr.logger.error(f"Error processing uid batch: {str(e)}")
