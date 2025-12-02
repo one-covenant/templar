@@ -97,7 +97,7 @@ manager = ShardedDatasetManager(
 
 All failure modes are logged with clear, actionable messages:
 
-```
+```plaintext
 ERROR: Timeout downloading shard 5 after 600s (attempt 2/3)
 INFO: Retrying in 2s...
 ERROR: Failed to download shard 5 after 3 attempts. Files: /path/to/train_000005.npy, /path/to/sample_ids_000005.npy
