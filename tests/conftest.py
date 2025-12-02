@@ -8,34 +8,34 @@ def pytest_configure(config):
 # Set up mock environment variables before imports
 import os
 
+
+# Helper function to set env var only if not set or empty
+def set_mock_env(key: str, value: str) -> None:
+    """Set environment variable only if it's not set or is empty."""
+    if not os.environ.get(key):
+        os.environ[key] = value
+
+
 # Mock R2 bucket access for testing
-os.environ.setdefault("R2_AGGREGATOR_ACCOUNT_ID", "mock-account-id")
-os.environ.setdefault("R2_AGGREGATOR_BUCKET_NAME", "mock-bucket-name")
-os.environ.setdefault("R2_AGGREGATOR_READ_ACCESS_KEY_ID", "mock-read-key-id")
-os.environ.setdefault("R2_AGGREGATOR_READ_SECRET_ACCESS_KEY", "mock-read-secret-key")
+set_mock_env("R2_AGGREGATOR_ACCOUNT_ID", "mock-account-id")
+set_mock_env("R2_AGGREGATOR_BUCKET_NAME", "mock-bucket-name")
+set_mock_env("R2_AGGREGATOR_READ_ACCESS_KEY_ID", "mock-read-key-id")
+set_mock_env("R2_AGGREGATOR_READ_SECRET_ACCESS_KEY", "mock-read-secret-key")
 
 # Also set other required variables from config.py
-os.environ.setdefault("R2_GRADIENTS_ACCOUNT_ID", "mock-gradients-account-id")
-os.environ.setdefault("R2_GRADIENTS_BUCKET_NAME", "mock-gradients-bucket-name")
-os.environ.setdefault("R2_GRADIENTS_READ_ACCESS_KEY_ID", "mock-gradients-read-key-id")
-os.environ.setdefault(
-    "R2_GRADIENTS_READ_SECRET_ACCESS_KEY", "mock-gradients-read-secret-key"
-)
-os.environ.setdefault("R2_GRADIENTS_WRITE_ACCESS_KEY_ID", "mock-gradients-write-key-id")
-os.environ.setdefault(
-    "R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY", "mock-gradients-write-secret-key"
-)
-os.environ.setdefault("R2_DATASET_ACCOUNT_ID", "mock-dataset-account-id")
-os.environ.setdefault("R2_DATASET_BUCKET_NAME", "mock-dataset-bucket-name")
-os.environ.setdefault("R2_DATASET_READ_ACCESS_KEY_ID", "mock-dataset-read-key-id")
-os.environ.setdefault(
-    "R2_DATASET_READ_SECRET_ACCESS_KEY", "mock-dataset-read-secret-key"
-)
-os.environ.setdefault("R2_DATASET_WRITE_ACCESS_KEY_ID", "mock-dataset-write-key-id")
-os.environ.setdefault(
-    "R2_DATASET_WRITE_SECRET_ACCESS_KEY", "mock-dataset-write-secret-key"
-)
-os.environ.setdefault("DATASET_BINS_PATH", "/tmp/test-dataset")
+set_mock_env("R2_GRADIENTS_ACCOUNT_ID", "mock-gradients-account-id")
+set_mock_env("R2_GRADIENTS_BUCKET_NAME", "mock-gradients-bucket-name")
+set_mock_env("R2_GRADIENTS_READ_ACCESS_KEY_ID", "mock-gradients-read-key-id")
+set_mock_env("R2_GRADIENTS_READ_SECRET_ACCESS_KEY", "mock-gradients-read-secret-key")
+set_mock_env("R2_GRADIENTS_WRITE_ACCESS_KEY_ID", "mock-gradients-write-key-id")
+set_mock_env("R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY", "mock-gradients-write-secret-key")
+set_mock_env("R2_DATASET_ACCOUNT_ID", "mock-dataset-account-id")
+set_mock_env("R2_DATASET_BUCKET_NAME", "mock-dataset-bucket-name")
+set_mock_env("R2_DATASET_READ_ACCESS_KEY_ID", "mock-dataset-read-key-id")
+set_mock_env("R2_DATASET_READ_SECRET_ACCESS_KEY", "mock-dataset-read-secret-key")
+set_mock_env("R2_DATASET_WRITE_ACCESS_KEY_ID", "mock-dataset-write-key-id")
+set_mock_env("R2_DATASET_WRITE_SECRET_ACCESS_KEY", "mock-dataset-write-secret-key")
+set_mock_env("DATASET_BINS_PATH", "/tmp/test-dataset")
 
 import pytest
 from unittest.mock import Mock, patch
