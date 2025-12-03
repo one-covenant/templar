@@ -11,11 +11,19 @@ _mock_tokenizer.vocab_size = 50000
 _mock_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
 _mock_tokenizer.decode = MagicMock(return_value="test")
 
-# Apply the tokenizer patch globally before test collection
+# Mock AutoConfig to prevent HuggingFace API calls
+_mock_config = MagicMock()
+_mock_config.vocab_size = 50000
+
+# Apply patches globally before test collection
 _tokenizer_patcher = patch(
     "transformers.AutoTokenizer.from_pretrained", return_value=_mock_tokenizer
 )
+_config_patcher = patch(
+    "transformers.AutoConfig.from_pretrained", return_value=_mock_config
+)
 _tokenizer_patcher.start()
+_config_patcher.start()
 
 
 # Register the asyncio marker
@@ -67,11 +75,15 @@ import asyncio
 import logging
 from typing import Generator
 
-# Fix bittensor compatibility issue (bt.wallet -> bt.Wallet)
+# Fix bittensor compatibility issues
 import bittensor as bt
 
 if not hasattr(bt, "wallet"):
     bt.wallet = bt.Wallet
+
+if not hasattr(bt, "config"):
+    # Create a mock config class for compatibility
+    bt.config = MagicMock
 
 # Get the project root directory (one level up from tests/)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
