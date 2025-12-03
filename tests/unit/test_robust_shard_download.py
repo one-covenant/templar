@@ -225,15 +225,18 @@ class TestPrepareShardWithRetry:
         tokens_file = temp_dataset_path / "train_000000.npy"
         ids_file = temp_dataset_path / "sample_ids_000000.npy"
 
-        call_count = 0
+        attempt_count = 0
 
         async def mock_download_with_retry(
             key, bucket, load_data=False, show_progress=True
         ):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                # Fail first two attempts
+            nonlocal attempt_count
+            # Track attempts by counting pairs of calls (tokens file triggers increment)
+            if "train_" in str(key):
+                attempt_count += 1
+
+            if attempt_count <= 2:
+                # Fail first two download attempts (both files)
                 return None
             # Succeed on third attempt
             if "train_" in str(key):
@@ -254,8 +257,8 @@ class TestPrepareShardWithRetry:
         )
 
         assert success is True
-        # Should have retried (2 failed attempts for each file + 1 success = 3 attempts)
-        assert call_count >= 4  # At least 2 calls per file
+        # Should have made 3 attempts (2 failed, 1 succeeded)
+        assert attempt_count == 3
 
     @pytest.mark.asyncio
     async def test_prepare_shard_all_retries_exhausted(

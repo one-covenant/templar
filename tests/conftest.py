@@ -36,30 +36,50 @@ set_mock_env("R2_DATASET_READ_SECRET_ACCESS_KEY", "mock-dataset-read-secret-key"
 set_mock_env("R2_DATASET_WRITE_ACCESS_KEY_ID", "mock-dataset-write-key-id")
 set_mock_env("R2_DATASET_WRITE_SECRET_ACCESS_KEY", "mock-dataset-write-secret-key")
 set_mock_env("DATASET_BINS_PATH", "/tmp/test-dataset")
+# Set HF_TOKEN to prevent gated model access errors during testing
+set_mock_env("HF_TOKEN", "mock-hf-token-for-testing")
 
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, MagicMock
 import torch
-import tplr.comms as comms_module
-import tplr.compress as compress
 from types import SimpleNamespace
-import tplr
 import sys
 import numpy as np
 import asyncio
 import logging
 from typing import Generator
 
-# Get the project root directory (one level up from tests/)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Mock the tokenizer BEFORE importing tplr to avoid gated model access
+mock_tokenizer = MagicMock()
+mock_tokenizer.pad_token_id = 0
+mock_tokenizer.eos_token_id = 1
+mock_tokenizer.bos_token_id = 2
+mock_tokenizer.vocab_size = 50000
+mock_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
+mock_tokenizer.decode = MagicMock(return_value="test")
 
-# Add project root to Python path so we can import from neurons/
-sys.path.insert(0, project_root)
+# Fix bittensor compatibility issue (bt.wallet -> bt.Wallet)
+import bittensor as bt
 
-from neurons.validator import Validator
+if not hasattr(bt, "wallet"):
+    bt.wallet = bt.Wallet
 
+# Patch AutoTokenizer before any imports that use it
+with patch("transformers.AutoTokenizer.from_pretrained", return_value=mock_tokenizer):
+    import tplr.comms as comms_module
+    import tplr.compress as compress
+    import tplr
 
-hparams = tplr.load_hparams()
+    # Get the project root directory (one level up from tests/)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    # Add project root to Python path so we can import from neurons/
+    sys.path.insert(0, project_root)
+
+    from neurons.validator import Validator
+
+    # Load hparams with mocked tokenizer
+    hparams = tplr.load_hparams()
 
 
 # Dummy wallet and other objects (adjust based on your actual code structure)

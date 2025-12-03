@@ -544,19 +544,27 @@ class ShardedDatasetManager:
         remapped_shard = self.remap_shard_index(shard_index)
 
         # Only rank 0 downloads the shard, others wait
+        download_success = True
+        download_error = None
         if self.rank == 0:
             download_task = self.prepare_shard(shard_index)
             success = await download_task
 
             if not success:
-                raise RuntimeError(
+                download_success = False
+                download_error = (
                     f"Failed to download shard {shard_index} after {self.max_download_retries} attempts. "
                     "Cannot proceed without valid shard data."
                 )
+
         # Non-master ranks will just check if files exist (downloaded by rank 0)
         # Add a barrier to ensure rank 0 has completed download
         if self.world_size > 1:
             dist.barrier(device_ids=[self.rank])
+
+        # Raise after barrier so all ranks exit together
+        if not download_success:
+            raise RuntimeError(download_error)
 
         # Validate files exist before creating dataset
         tokens_file, ids_file = SharedShardedDataset.locate_shards(
@@ -624,7 +632,8 @@ class ShardedDatasetManager:
         if self.upcoming_dataset:
             try:
                 success = await self.upcoming_dataset
-                if not success:
+                # Only rank 0 has a real download task; non-rank-0 have dummy tasks returning None
+                if success is False:  # Explicitly check for False, not None
                     tplr.logger.warning(
                         f"Background preparation of shard {self.shard_index} failed. "
                         "Attempting synchronous download..."
