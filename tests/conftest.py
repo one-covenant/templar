@@ -9,28 +9,28 @@ def pytest_configure(config):
 import os
 
 # Mock R2 bucket access for testing
-os.environ.setdefault("R2_AGGREGATOR_ACCOUNT_ID", "mock-account-id")
-os.environ.setdefault("R2_AGGREGATOR_BUCKET_NAME", "mock-bucket-name")
-os.environ.setdefault("R2_AGGREGATOR_READ_ACCESS_KEY_ID", "mock-read-key-id")
-os.environ.setdefault("R2_AGGREGATOR_READ_SECRET_ACCESS_KEY", "mock-read-secret-key")
+# Use direct assignment to override empty strings from CI
+os.environ["R2_AGGREGATOR_ACCOUNT_ID"] = "mock-account-id"
+os.environ["R2_AGGREGATOR_BUCKET_NAME"] = "mock-bucket-name"
+os.environ["R2_AGGREGATOR_READ_ACCESS_KEY_ID"] = "mock-read-key-id"
+os.environ["R2_AGGREGATOR_READ_SECRET_ACCESS_KEY"] = "mock-read-secret-key"
+os.environ["R2_AGGREGATOR_WRITE_ACCESS_KEY_ID"] = "mock-write-key-id"
+os.environ["R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY"] = "mock-write-secret-key"
 
 # Also set other required variables from config.py
-os.environ.setdefault("R2_GRADIENTS_ACCOUNT_ID", "mock-gradients-account-id")
-os.environ.setdefault("R2_GRADIENTS_BUCKET_NAME", "mock-gradients-bucket-name")
-os.environ.setdefault("R2_GRADIENTS_READ_ACCESS_KEY_ID", "mock-gradients-read-key-id")
-os.environ.setdefault(
-    "R2_GRADIENTS_READ_SECRET_ACCESS_KEY", "mock-gradients-read-secret-key"
-)
-os.environ.setdefault("R2_GRADIENTS_WRITE_ACCESS_KEY_ID", "mock-gradients-write-key-id")
-os.environ.setdefault(
-    "R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY", "mock-gradients-write-secret-key"
-)
-os.environ.setdefault("R2_DATASET_ACCOUNT_ID", "mock-dataset-account-id")
-os.environ.setdefault("R2_DATASET_BUCKET_NAME", "mock-dataset-bucket-name")
-os.environ.setdefault("R2_DATASET_READ_ACCESS_KEY_ID", "mock-dataset-read-key-id")
-os.environ.setdefault(
-    "R2_DATASET_READ_SECRET_ACCESS_KEY", "mock-dataset-read-secret-key"
-)
+os.environ["R2_GRADIENTS_ACCOUNT_ID"] = "mock-gradients-account-id"
+os.environ["R2_GRADIENTS_BUCKET_NAME"] = "mock-gradients-bucket-name"
+os.environ["R2_GRADIENTS_READ_ACCESS_KEY_ID"] = "mock-gradients-read-key-id"
+os.environ["R2_GRADIENTS_READ_SECRET_ACCESS_KEY"] = "mock-gradients-read-secret-key"
+os.environ["R2_GRADIENTS_WRITE_ACCESS_KEY_ID"] = "mock-gradients-write-key-id"
+os.environ["R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY"] = "mock-gradients-write-secret-key"
+os.environ["R2_DATASET_ACCOUNT_ID"] = "mock-dataset-account-id"
+os.environ["R2_DATASET_BUCKET_NAME"] = "mock-dataset-bucket-name"
+os.environ["R2_DATASET_READ_ACCESS_KEY_ID"] = "mock-dataset-read-key-id"
+os.environ["R2_DATASET_READ_SECRET_ACCESS_KEY"] = "mock-dataset-read-secret-key"
+os.environ["R2_DATASET_WRITE_ACCESS_KEY_ID"] = "mock-dataset-write-key-id"
+os.environ["R2_DATASET_WRITE_SECRET_ACCESS_KEY"] = "mock-dataset-write-secret-key"
+os.environ["DATASET_BINS_PATH"] = "/mock/dataset/bins/path"
 
 import pytest
 from unittest.mock import Mock, patch

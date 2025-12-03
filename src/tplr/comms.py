@@ -1832,7 +1832,7 @@ class Comms(ChainManager):
                                     # For non-quantized tensors, check for NaN/Inf
                                     # Avoid unnecessary copies: only move if needed
                                     target_device = torch.device(device)
-                                    
+
                                     if tensor.device.type == target_device:
                                         tensor_to_check = tensor
                                         needs_delete = False

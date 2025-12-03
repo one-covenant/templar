@@ -753,10 +753,10 @@ class DCPCheckpointer:
         local_dir = self._local_dir(layout)
 
         world, r = _world(), _rank()
-        
+
         # ensure all ranks agreed on window and created local_dir
         _barrier(process_group)
-        
+
         # Try highest-staked bucket first, then own
         bucket = await self._choose_read_bucket(
             prefer_highest_staked=prefer_highest_staked
@@ -886,15 +886,15 @@ class DCPCheckpointer:
         )
         if local_dir is None:
             return None
-        
+
         # make sure *all* ranks have finished downloading / mop-up
         _barrier(process_group)
-        
+
         sidecar_path = local_dir / "extra_metadata.json"
         # retry on FileNotFoundError / transient IO errors
         async def _read_sidecar():
             return await asyncio.to_thread(sidecar_path.read_text)
-        
+
         try:
             sidecar_text = await _retry_n(
                 _read_sidecar,
@@ -910,7 +910,7 @@ class DCPCheckpointer:
             )
             read_ok = False
             sidecar_text = ""
-        
+
         # --- Synchronize success/failure across ranks ---
         if dist.is_available() and dist.is_initialized():
             ok_tensor = torch.tensor([1 if read_ok else 0], dtype=torch.int32)
@@ -921,7 +921,7 @@ class DCPCheckpointer:
         if not read_ok:
             # All ranks return consistently
             return None
-        
+
         try:
             sidecar = json.loads(sidecar_text)
         except Exception as e:
@@ -932,12 +932,12 @@ class DCPCheckpointer:
             return None
         w = int(sidecar["window"])
         global_step = int(sidecar.get("global_step", -1))
-        
+
         # Barrier before DCP load (safety belt)
         _barrier(process_group)
-        
+
         self.load_local(model=model, window=w, process_group=process_group)
-        
+
         # Barrier after load to ensure all ranks finish loading
         _barrier(process_group)
         return w, global_step
