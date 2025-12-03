@@ -891,6 +891,7 @@ class DCPCheckpointer:
         _barrier(process_group)
 
         sidecar_path = local_dir / "extra_metadata.json"
+
         # retry on FileNotFoundError / transient IO errors
         async def _read_sidecar():
             return await asyncio.to_thread(sidecar_path.read_text)

@@ -1758,16 +1758,22 @@ class Comms(ChainManager):
                                 shift, scale, offset, lookup, dtype = tensor
                                 if (
                                     (not torch.isfinite(shift))
-                                    or (isinstance(scale, float) and (
-                                        not math.isfinite(scale)
-                                        or abs(scale) < 1e-12
-                                        or abs(scale) > 1e4
-                                    ))
-                                    or (torch.is_tensor(scale) and (
-                                        not torch.isfinite(scale).all()
-                                        or scale.abs().max() < 1e-12
-                                        or scale.abs().max() > 1e4
-                                    ))
+                                    or (
+                                        isinstance(scale, float)
+                                        and (
+                                            not math.isfinite(scale)
+                                            or abs(scale) < 1e-12
+                                            or abs(scale) > 1e4
+                                        )
+                                    )
+                                    or (
+                                        torch.is_tensor(scale)
+                                        and (
+                                            not torch.isfinite(scale).all()
+                                            or scale.abs().max() < 1e-12
+                                            or scale.abs().max() > 1e4
+                                        )
+                                    )
                                 ):
                                     tplr.logger.warning(
                                         f"Bad quant-params in {param_name} from UID {uid}; "
@@ -1802,7 +1808,9 @@ class Comms(ChainManager):
                                     else totalk_value.numel()
                                 )
 
-                                vals_tensor = state_dict_resp.get(base_name + "vals", None)
+                                vals_tensor = state_dict_resp.get(
+                                    base_name + "vals", None
+                                )
                                 try:
                                     self.check_compressed_indices(
                                         param_name,
@@ -1837,7 +1845,9 @@ class Comms(ChainManager):
                                         tensor_to_check = tensor
                                         needs_delete = False
                                     else:
-                                        tensor_to_check = tensor.to(target_device, non_blocking=True)
+                                        tensor_to_check = tensor.to(
+                                            target_device, non_blocking=True
+                                        )
                                         needs_delete = True
 
                                     if (
