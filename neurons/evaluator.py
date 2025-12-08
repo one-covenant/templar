@@ -214,6 +214,7 @@ class Evaluator:
 
     # Track active subprocess for cleanup on termination
     _active_subprocess: subprocess.Popen | None = None
+    _is_cleaned_up: bool = False
 
     def __init__(self, config: bt.config):
         self.config = config
@@ -1230,6 +1231,10 @@ class Evaluator:
 
     def cleanup(self):
         """Cleanup resources including active subprocesses."""
+        if self._is_cleaned_up:
+            return
+        self._is_cleaned_up = True
+
         # Terminate any active subprocess first
         if self._active_subprocess is not None:
             tplr.logger.info("Terminating active subprocess...")
