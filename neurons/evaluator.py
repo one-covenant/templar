@@ -33,7 +33,9 @@ import json
 import math
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import cast
@@ -209,6 +211,9 @@ class ModelCache:
 
 class Evaluator:
     """Evaluator using existing Templar infrastructure."""
+
+    # Track active subprocess for cleanup on termination
+    _active_subprocess: subprocess.Popen | None = None
 
     def __init__(self, config: bt.config):
         self.config = config
@@ -521,7 +526,7 @@ class Evaluator:
         tplr.logger.info(f"[Master] Running lm-eval: {' '.join(cmd)}")
         start = time.perf_counter()
 
-        process = subprocess.Popen(
+        self._active_subprocess = subprocess.Popen(
             cmd,
             stdout=None,  # inherit parent stdout (no per-line piping)
             stderr=None,  # inherit parent stderr
@@ -530,9 +535,11 @@ class Evaluator:
             universal_newlines=True,
             env=clean_env,  # ← IMPORTANT
         )
+        process = self._active_subprocess
 
         tplr.logger.info("[Master] Waiting for lm-eval subprocess to complete...")
         return_code = process.wait()
+        self._active_subprocess = None  # Clear reference after completion
 
         runtime = time.perf_counter() - start
 
@@ -1222,7 +1229,24 @@ class Evaluator:
                     )
 
     def cleanup(self):
-        """Cleanup resources."""
+        """Cleanup resources including active subprocesses."""
+        # Terminate any active subprocess first
+        if self._active_subprocess is not None:
+            tplr.logger.info("Terminating active subprocess...")
+            try:
+                self._active_subprocess.terminate()
+                try:
+                    self._active_subprocess.wait(timeout=5)
+                    tplr.logger.info("Subprocess terminated gracefully")
+                except subprocess.TimeoutExpired:
+                    tplr.logger.warning("Subprocess did not terminate, killing...")
+                    self._active_subprocess.kill()
+                    self._active_subprocess.wait()
+                    tplr.logger.info("Subprocess killed")
+            except Exception as e:
+                tplr.logger.warning(f"Failed to terminate subprocess: {e}")
+            self._active_subprocess = None
+
         if hasattr(self, "model"):
             self.model = self.model.to("cpu")
             torch.cuda.empty_cache()
@@ -1298,8 +1322,23 @@ def get_config() -> bt.config:
     return config
 
 
+# Global reference for signal handler
+_evaluator: Evaluator | None = None
+
+
+def _signal_handler(signum, frame):
+    """Handle termination signals by cleaning up evaluator."""
+    global _evaluator
+    sig_name = signal.Signals(signum).name
+    tplr.logger.info(f"Received {sig_name}, cleaning up...")
+    if _evaluator is not None:
+        _evaluator.cleanup()
+    sys.exit(0)
+
+
 async def main():
     """Entry point."""
+    global _evaluator
     config = get_config()
 
     # Setup logging
@@ -1308,7 +1347,12 @@ async def main():
     if config.trace:
         tplr.trace()
 
-    evaluator = Evaluator(config)
+    _evaluator = Evaluator(config)
+    evaluator = _evaluator
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
 
     try:
         await evaluator.run()
@@ -1322,3 +1366,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
