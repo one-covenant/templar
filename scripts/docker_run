@@ -2,12 +2,13 @@
 set -e
 
 # Function to prompt for input with default value
+# Function to prompt for input with default value
 prompt_with_default() {
     local prompt="$1"
     local default="$2"
     local response
 
-    echo -n "$prompt [$default]: "
+    echo -n "$prompt [$default]: " >&2
     read response
     echo "${response:-$default}"
 }
@@ -18,10 +19,10 @@ prompt_required() {
     local response=""
     
     while [ -z "$response" ]; do
-        echo -n "$prompt: "
+        echo -n "$prompt: " >&2
         read response
         if [ -z "$response" ]; then
-            echo "This field is required"
+            echo "This field is required" >&2
         fi
     done
     echo "$response"
@@ -31,7 +32,7 @@ prompt_required() {
 echo "🤖 Templar Mining Docker Configuration"
 echo "-------------------------------------"
 
-NODE_TYPE=$(prompt_with_default "Enter node type (miner/validator)" "miner")
+NODE_TYPE=$(prompt_with_default "Enter node type (miner/validator/evaluator)" "miner")
 WALLET_NAME=$(prompt_required "Enter wallet name")
 WALLET_HOTKEY=$(prompt_required "Enter wallet hotkey")
 WANDB_API_KEY=$(prompt_required "Enter Weights & Biases API key")
@@ -43,11 +44,17 @@ DEBUG=$(prompt_with_default "Enable debug mode? (true/false)" "false")
 export WALLET_NAME WALLET_HOTKEY WANDB_API_KEY NETWORK CUDA_DEVICE DEBUG
 
 # Choose compose file based on node type
-COMPOSE_FILE="docker/compose.${NODE_TYPE}.yml"
+COMPOSE_FILE="docker/compose.yml"
+
+# Determine service to run
+SERVICE="node"  # default for miner and validator
+if [ "$NODE_TYPE" = "evaluator" ]; then
+    SERVICE="evaluator"
+fi
 
 # Start the containers
-echo -e "\n📦 Starting containers..."
-docker compose -f "$COMPOSE_FILE" up -d
+echo -e "\n📦 Starting containers (Service: $SERVICE + Watchtower)..."
+docker compose -f "$COMPOSE_FILE" up -d "$SERVICE" watchtower
 
 echo -e "\n✅ Containers started successfully!"
 echo "📝 Logs are available in the ./logs directory"
