@@ -470,7 +470,7 @@ class Evaluator:
             "--model",
             "vllm",
             "--model_args",
-            f"pretrained={model_path},tensor_parallel_size={tp},gpu_memory_utilization=0.85",
+            f"pretrained={model_path},tensor_parallel_size={tp},gpu_memory_utilization=0.85,max_model_len={self.hparams.sequence_length}",
             "--tasks",
             ",".join(tasks),
             "--batch_size",
