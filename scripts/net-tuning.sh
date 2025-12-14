@@ -31,4 +31,23 @@ net.core.netdev_budget_usecs = 8000
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_congestion_control = bbr
-net.core.default
+net.core.default_qdisc = fq
+
+# === CONNECTION LIFETIME / REUSE ===
+net.ipv4.ip_local_port_range = 32768 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fastopen = 3
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_tw_buckets = 262144
+
+# === KEEPALIVE SETTINGS ===
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+EOF
+
+echo "[+] Applying sysctl settings immediately"
+sudo sysctl --system >/dev/null
+
+echo "[✓] Network tuning applied and will persist across reboot"
