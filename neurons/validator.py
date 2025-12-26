@@ -410,7 +410,7 @@ class Validator(BaseNode, Trainer):
 
         self.bootstrap_version = getattr(self.hparams, "checkpoint_init_version", None)
         tplr.logger.info(
-            f"[Miner] code_version={tplr.__version__} "
+            f"[Validator] code_version={tplr.__version__} "
             f"checkpoint_init_flag={self.bootstrap_version or '<none>'}"
         )
 
