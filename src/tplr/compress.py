@@ -29,6 +29,7 @@ from einops import rearrange
 from torch.distributed.tensor import DTensor as DT
 
 import tplr
+from tplr.compression import decode_batch_rows, encode_batch_rows, unpack_12bit_indices
 
 # ─────────── type aliases ────────────────────────────────────────────────
 # primitive shapes
@@ -46,100 +47,6 @@ ValT: TypeAlias = torch.Tensor
 
 # Boolean flag that propagates the chosen quantisation mode
 Q = TypeVar("Q", Literal[True], Literal[False])
-
-
-def pack_12bit_indices(indices: torch.Tensor) -> torch.Tensor:
-    """
-    Pack int64 indices into 12-bit representation.
-    Every 2 indices (24 bits) are packed into 3 uint8 values.
-    Assumes even number of indices (topk is always even).
-
-    Args:
-        indices: Tensor with values < 4096 (12-bit max), must have even number of elements
-
-    Returns:
-        packed_tensor as uint8
-    """
-    # Ensure indices fit in 12 bits
-    max_idx = indices.max().item() if indices.numel() > 0 else 0
-    if max_idx >= 4096:
-        raise ValueError(f"Index {max_idx} exceeds 12-bit limit (4095)")
-
-    # Flatten the tensor
-    indices_flat = indices.flatten()
-    n_indices = indices_flat.numel()
-
-    # Ensure we have even number of indices
-    if n_indices % 2 != 0:
-        raise ValueError(f"Number of indices must be even, got {n_indices}")
-
-    # Convert to int32 for bit manipulation
-    indices_flat = indices_flat.to(torch.int32)
-
-    # Process all as pairs
-    indices_pairs = indices_flat
-    n_pairs = n_indices // 2
-
-    # Calculate packed size
-    packed_size = n_pairs * 3
-    packed = torch.zeros(packed_size, dtype=torch.uint8, device=indices.device)
-
-    # Vectorized packing for pairs
-    if n_pairs > 0:
-        idx_pairs = indices_pairs.reshape(-1, 2)
-        idx1 = idx_pairs[:, 0]
-        idx2 = idx_pairs[:, 1]
-
-        # Pack pairs: idx1 uses byte0 + lower 4 bits of byte1
-        #            idx2 uses upper 4 bits of byte1 + byte2
-        packed[0::3] = (idx1 & 0xFF).to(torch.uint8)  # Lower 8 bits of idx1
-        packed[1::3] = (((idx1 >> 8) & 0x0F) | ((idx2 & 0x0F) << 4)).to(torch.uint8)
-        packed[2::3] = ((idx2 >> 4) & 0xFF).to(torch.uint8)  # Upper 8 bits of idx2
-
-    return packed
-
-
-def unpack_12bit_indices(packed: torch.Tensor, values_shape: ShapeT) -> torch.Tensor:
-    """
-    Unpack 12-bit packed indices back to int64.
-    Assumes even number of indices.
-
-    Args:
-        packed: Packed uint8 tensor
-        values_shape: Shape of the values tensor (same as original indices shape)
-
-    Returns:
-        Unpacked indices as int64 tensor with original shape
-    """
-    n_indices = int(torch.prod(torch.tensor(values_shape)).item())
-
-    if n_indices == 0:
-        return torch.zeros(values_shape, dtype=torch.int64, device=packed.device)
-
-    # Ensure even number of indices
-    if n_indices % 2 != 0:
-        raise ValueError(f"Number of indices must be even, got {n_indices}")
-
-    # Prepare output
-    indices = torch.zeros(n_indices, dtype=torch.int64, device=packed.device)
-
-    # All indices are paired
-    n_pairs = n_indices // 2
-
-    if n_pairs > 0:
-        # Vectorized unpacking
-        byte0 = packed[0::3].to(torch.int64)
-        byte1 = packed[1::3].to(torch.int64)
-        byte2 = packed[2::3].to(torch.int64)
-
-        # Reconstruct indices
-        indices[0::2] = byte0 | ((byte1 & 0x0F) << 8)  # idx1
-        indices[1::2] = ((byte1 >> 4) & 0x0F) | (byte2 << 4)  # idx2
-
-    # Reshape to match values shape
-    indices = indices.reshape(values_shape)
-
-    return indices
 
 
 class ChunkingTransformer:
@@ -301,9 +208,12 @@ class TopKCompressor(Generic[Q]):
     It supports both 1D and 2D tensors.
     """
 
+    DEFAULT_B_CHOICES: tuple[int, ...] = (64, 128)
+
     use_quantization: Q
     n_bins: int
     range_in_sigmas: int
+    b_choices: tuple[int, ...]  # for Rice/bitmap codec
 
     # ------------------------------------------------------------------ #
     # Constructor – two overloads so each instance "remembers" its mode
@@ -315,6 +225,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: Literal[True] = True,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        b_choices: tuple[int, ...] | None = None,
     ) -> None: ...
 
     @overload
@@ -324,6 +235,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: Literal[False] = False,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        b_choices: tuple[int, ...] | None = None,
     ) -> None: ...
 
     @torch.no_grad()
@@ -333,6 +245,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: bool = False,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        b_choices: tuple[int, ...] | None = None,
     ) -> None:
         """
         Initialise the TopKCompressor.
@@ -348,6 +261,14 @@ class TopKCompressor(Generic[Q]):
             self.range_in_sigmas = (
                 quantization_range  # Quantization range in standard deviations
             )
+
+        if b_choices is None:
+            b_choices = self.DEFAULT_B_CHOICES
+        b_choices = tuple(sorted(int(b) for b in b_choices))
+        for b in b_choices:
+            if b <= 0 or (b & (b - 1)) != 0:
+                raise ValueError(f"b_choices must be powers of two > 0, got {b}")
+        self.b_choices = b_choices
 
     def _clamp_topk(self, x, topk) -> int:
         """
@@ -406,21 +327,34 @@ class TopKCompressor(Generic[Q]):
         totalk = x.shape[-1]
         topk = self._clamp_topk(x, topk)
 
-        idx_int64 = torch.topk(
-            x.abs(), k=topk, dim=-1, largest=True, sorted=False
-        ).indices
-        val = torch.gather(x, dim=-1, index=idx_int64)
+        topk_vals, idx = torch.topk(x.abs(), k=topk, dim=-1, largest=True, sorted=False)
+        del topk_vals
 
-        # Pack indices into 12-bit representation for efficient storage
-        # This reduces storage by 25% compared to int16
-        idx = pack_12bit_indices(idx_int64)
+        idx = idx.to(torch.int32)
+        val = torch.gather(x, dim=-1, index=idx)
+
+        # Flatten to [rows, k] for the codec
+        idx2d = idx.view(-1, topk)
+        val2d = val.view(-1, topk)
+
+        # sort indices and apply same perm to values
+        idx_sorted, perm = torch.sort(idx2d, dim=1)
+        val = torch.gather(val2d, dim=1, index=perm)
+
+        # pick only B_choices that divide this layer's C
+        valid_B = tuple(b for b in self.b_choices if totalk % b == 0)
+        if not valid_B:
+            raise ValueError(
+                f"No valid b_choices for C={totalk}; "
+                f"b_choices={self.b_choices} must divide C"
+            )
+        idx_bytes, _meta = encode_batch_rows(idx_sorted, C=totalk, B_choices=valid_B)
 
         # Apply 8-bit quantization if enabled
         if self.use_quantization:
-            val, quant_params = self._quantize_values(val)
-            return idx, val, xshape, totalk, quant_params
-
-        return idx, val, xshape, totalk
+            val, qparams = self._quantize_values(val)
+            return idx_bytes, val, xshape, totalk, qparams
+        return idx_bytes, val, xshape, totalk
 
     @torch.no_grad()
     def decompress(
@@ -454,20 +388,30 @@ class TopKCompressor(Generic[Q]):
         if len(xshape) > 2:  # 2D weights
             x = rearrange(x, "y x h w -> y x (h w)")
 
-        # Unpack 12-bit indices using val shape (if needed)
+        # Decode indices
         if idx.dtype == torch.uint8:
-            # 12-bit packed format - unpack it
-            idx_int64 = unpack_12bit_indices(idx, val.shape)
+            rows, C, _N = decode_batch_rows(idx)
+            if C != totalk:
+                raise ValueError(f"Index payload C={C} but expected {totalk}")
+            if rows.shape[-1] != val.shape[-1]:
+                raise ValueError(
+                    f"Row-wise topk size mismatch: decoded K={rows.shape[-1]}, val K={val.shape[-1]}"
+                )
+            idx_int64 = rows.to(device=p.device, dtype=torch.int64)
+            idx_int64 = idx_int64.view_as(val)
         elif idx.dtype in (torch.int64, torch.long):
-            # Already unpacked (from batch_decompress)
-            idx_int64 = idx
+            idx_int64 = idx.to(p.device)
         else:
-            raise ValueError(
-                f"Expected uint8 (packed) or int64 (unpacked) indices, got {idx.dtype}"
-            )
+            raise ValueError(f"Unsupported index tensor dtype: {idx.dtype}")
+
         # Ensure val has the same dtype as x for scatter operation
         if val.dtype != x.dtype:
             val = val.to(dtype=x.dtype)
+
+        # second condition for legacy decompress
+        if len(xshape) > 2 and len(x) != len(idx_int64):
+            idx_int64 = rearrange(idx_int64, "(y x) h -> y x h", y=xshape[0])
+            val = rearrange(val, "(y x) h -> y x h", y=xshape[0])
 
         x.scatter_reduce_(
             dim=-1, index=idx_int64, src=val, reduce="mean", include_self=False
@@ -562,14 +506,35 @@ class TopKCompressor(Generic[Q]):
         idx_list = idx if isinstance(idx, Sequence) else [idx]
 
         for i, i_data in enumerate(idx_list):
-            if i_data.dtype != torch.uint8:
-                raise ValueError(
-                    f"Expected uint8 for 12-bit packed indices, got {i_data.dtype}"
-                )
-            # Unpack 12-bit format using corresponding values shape
             v_data = val_list[i]
-            idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
-            unpacked_indices.append(idx_unpacked)
+            if i_data.dtype == torch.uint8:
+                try:
+                    rows, C, _N = decode_batch_rows(i_data)
+                    if C != totalk:
+                        raise ValueError(f"Index payload C={C} but expected {totalk}")
+                    if rows.shape[-1] != v_data.shape[-1]:
+                        raise ValueError(
+                            f"Row-wise topk size mismatch: decoded K={rows.shape[-1]}, "
+                            f"val K={v_data.shape[-1]}"
+                        )
+                    idx_int64 = rows.to(device=p.device, dtype=torch.int64)
+                    idx_unpacked = idx_int64.view_as(v_data)
+                except ValueError as e:
+                    # NB: legacy path
+                    tplr.logger.warning(
+                        f"Failed to unpack: {e}. Falling back to legacy uncompress."
+                    )
+                    # Fallback: likely old format -> try legacy decoder
+                    idx_unpacked = unpack_12bit_indices(
+                        i_data.to(p.device), v_data.shape
+                    )
+
+                unpacked_indices.append(idx_unpacked)
+            elif i_data.dtype in (torch.int64, torch.long):
+                idx_unpacked = i_data.to(p.device)
+                unpacked_indices.append(idx_unpacked)
+            else:
+                raise ValueError(f"Unsupported index dtype in batch: {i_data.dtype}")
 
         idx_concat = torch.cat(unpacked_indices, dim=-1)
         val_concat = torch.cat(processed_vals, dim=-1).to(p.dtype)

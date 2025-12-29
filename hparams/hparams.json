@@ -47,6 +47,7 @@
     "checkpoint_init_version": "2.1.17",
     "checkpoint_init_window": 60711,
     "num_evaluation_bins": 5,
+    "compression_b_choices": [32, 64, 128],
     "quantization_bins": 4,
     "quantization_range": 6,
     "burn_rate": 0.5,
