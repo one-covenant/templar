@@ -1,5 +1,14 @@
 {
     "spec_version": 5,
+    "anneal_mode": {
+      "enabled": true,
+      "start_global_step": 6100,
+      "warmup_inner_steps": 100,
+      "decay_outer_steps": 550,
+      "peak_lr_factor": 0.5,
+      "eta_min_factor": 0.0,
+      "file_prefix": "anneal"
+    },
     "project": "dough",
     "tokenizer_name": "google/gemma-3-270m",
     "sequence_length": 2048,
