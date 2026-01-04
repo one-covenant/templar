@@ -399,12 +399,21 @@ class Miner(BaseNode, Trainer):
         self.next_reserve_peers: list[int] | None = None
         self.peers_update_window = -1
 
+        # Get anneal mode config for dataset manager
+        anneal_config = getattr(self.hparams, "anneal_mode", {})
+        anneal_enabled = anneal_config.get("enabled", False)
+        anneal_prefix = (
+            anneal_config.get("file_prefix", "anneal") if anneal_enabled else "train"
+        )
+
         self.dataset_manager = tplr.sharded_dataset.ShardedDatasetManager(
             sequence_length=self.hparams.sequence_length,
             rank=self.local_rank,
             world_size=self.world_size,
             comms=self.comms,
             token_dtype=np.uint32,  # Match preprocessing script dtype
+            file_prefix=anneal_prefix,
+            anneal_mode=anneal_enabled,
         )
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
         self.shard_reset_outer_step = getattr(
@@ -485,6 +494,10 @@ class Miner(BaseNode, Trainer):
             self.outer_steps_per_shard,
             self.shard_reset_outer_step,
         )
+        # In anneal mode, always use shard 0
+        if self.dataset_manager.anneal_mode:
+            current_shard = 0
+            current_shard_epoch = 0
         tplr.logger.info(
             f"Starting with global_step={self.global_step} (actual outer steps)"
         )
@@ -542,31 +555,36 @@ class Miner(BaseNode, Trainer):
             self.sampler.set_window_uid(self.uid, step_window)
 
             # Check if we need to swap dataset based on shard index change
-            shard_epoch_check, current_shard_check = (
-                tplr.sharded_dataset.compute_shard_state(
-                    self.global_step,
-                    self.outer_steps_per_shard,
-                    self.shard_reset_outer_step,
+            # Skip shard switching in anneal mode - we stay on single shard
+            anneal_config = getattr(self.hparams, "anneal_mode", {})
+            anneal_enabled = anneal_config.get("enabled", False)
+
+            if not anneal_enabled:
+                shard_epoch_check, current_shard_check = (
+                    tplr.sharded_dataset.compute_shard_state(
+                        self.global_step,
+                        self.outer_steps_per_shard,
+                        self.shard_reset_outer_step,
+                    )
                 )
-            )
-            if shard_epoch_check != last_shard_epoch:
-                tplr.logger.info(
-                    f"Resetting shard schedule at outer_step {self.global_step} "
-                    f"to shard {current_shard_check}"
-                )
-                await self.dataset_manager.initialize_datasets(current_shard_check)
-                self.set_dataloader()
-                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
-                last_shard_epoch = shard_epoch_check
-                last_shard = current_shard_check
-            elif current_shard_check > last_shard:
-                tplr.logger.info(
-                    f"Swapping dataset after {self.global_step} outer steps at window {step_window}"
-                )
-                await self.dataset_manager.swap_datasets()
-                self.set_dataloader()
-                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
-                last_shard = current_shard_check
+                if shard_epoch_check != last_shard_epoch:
+                    tplr.logger.info(
+                        f"Resetting shard schedule at outer_step {self.global_step} "
+                        f"to shard {current_shard_check}"
+                    )
+                    await self.dataset_manager.initialize_datasets(current_shard_check)
+                    self.set_dataloader()
+                    dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                    last_shard_epoch = shard_epoch_check
+                    last_shard = current_shard_check
+                elif current_shard_check > last_shard:
+                    tplr.logger.info(
+                        f"Swapping dataset after {self.global_step} outer steps at window {step_window}"
+                    )
+                    await self.dataset_manager.swap_datasets()
+                    self.set_dataloader()
+                    dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                    last_shard = current_shard_check
 
             data_loading_time = tplr.T() - data_start
             tplr.logger.info(
