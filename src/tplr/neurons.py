@@ -843,6 +843,62 @@ async def handle_checkpoint_catchup(
         from_bootstrap: Whether checkpoint was from bootstrap version
         aggregator_device: which device to load aggregation results to
     """
+    # Check for anneal mode - handles scheduler replay differently
+    anneal_config = getattr(instance.hparams, "anneal_mode", {})
+    anneal_enabled = anneal_config.get("enabled", False)
+
+    if anneal_enabled:
+        # Anneal mode: Calculate progress from start_global_step, not from 0
+        anneal_start_global_step = anneal_config.get("start_global_step", 0)
+        warmup_inner_steps = anneal_config.get("warmup_inner_steps", 100)
+
+        # Calculate how far into anneal based on actual outer steps taken
+        anneal_outer_steps = max(0, ckpt_global_step - anneal_start_global_step)
+        anneal_inner_steps = anneal_outer_steps * instance.hparams.inner_steps
+
+        # Set warmup tracking for anneal mode
+        instance.warmup_inner_steps = warmup_inner_steps
+        instance.warmup_steps_taken = min(anneal_inner_steps, warmup_inner_steps)
+
+        # Replay anneal scheduler steps (NOT the old pre-anneal steps)
+        instance.inner_scheduler_step_count = 0
+        if (
+            anneal_inner_steps > 0
+            and getattr(instance, "inner_scheduler", None) is not None
+        ):
+            for _ in range(anneal_inner_steps):
+                instance.inner_scheduler.step()
+                instance.inner_scheduler_step_count += 1
+
+        tplr.logger.info(
+            f"Anneal mode: start_global_step={anneal_start_global_step}, "
+            f"ckpt_global_step={ckpt_global_step}, "
+            f"replayed {anneal_inner_steps} anneal scheduler steps"
+        )
+
+        # Still need to do catchup for gradients
+        if not ckpt_ok:
+            tplr.logger.info("No checkpoint found, will catch up from start_window")
+            await catchup_with_aggregation_server(
+                instance, instance.start_window, aggregator_device=aggregator_device
+            )
+        elif ckpt_sync_win < instance.current_window:
+            catch_up_start = max(ckpt_sync_win, instance.start_window)
+            tplr.logger.info(
+                f"Checkpoint at window {ckpt_sync_win} is behind current {instance.current_window}, "
+                f"catching up from {catch_up_start}"
+            )
+            await catchup_with_aggregation_server(
+                instance, catch_up_start, aggregator_device=aggregator_device
+            )
+        else:
+            tplr.logger.info(
+                f"Checkpoint at window {ckpt_sync_win} is up to date with current window "
+                f"{instance.current_window}"
+            )
+        return
+
+    # Normal (non-anneal) mode below
     # Determine scheduler config and warmup settings
     optimizer_cfg = getattr(instance.hparams, "optimizer", {})
     opt_type = optimizer_cfg.get("type", "adamw").lower()
