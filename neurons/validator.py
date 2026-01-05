@@ -2574,21 +2574,26 @@ class Validator(BaseNode, Trainer):
                 )
 
             with torch.no_grad():
-                for n, p in self.model.named_parameters():
-                    # Sample from local shard to avoid collectives (matches debug dict generation)
-                    if isinstance(p, DT):
-                        flat = p.to_local().detach().cpu().flatten()
-                    else:
-                        flat = p.detach().cpu().flatten()
+                slice_idx = slice(10, 12)  # indices published in miner debug dict
 
-                    # Sample last 2 elements (or 1 if that's all there is) to match debug dict generation
-                    if flat.numel() == 0:
+                for n, p in self.model.named_parameters():
+                    if p.numel() < 12:
                         continue
-                    curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
+
+                    # Handle DTensor case - get local tensor first
+                    if isinstance(p, DT):
+                        # For DTensor, use the local tensor
+                        local_p = p.to_local()
+                        curr_cpu = local_p.detach().cpu()
+                    else:
+                        # move current weights to CPU once
+                        curr_cpu = p.detach().cpu()
 
                     # compute delta only if we have a previous slice
                     if n in self.prev_param_state:
                         prev_slice = self.prev_param_state[n]
+                        curr_slice = curr_cpu.flatten()[slice_idx]
+
                         delta_slice = torch.abs(curr_slice - prev_slice)
 
                         # lazy-init & EMA update
@@ -2600,24 +2605,26 @@ class Validator(BaseNode, Trainer):
                             ).add_(delta_slice * self.param_change_alpha)
 
                     # stash the new slice for next iteration
-                    self.prev_param_state[n] = curr_slice.clone()
+                    self.prev_param_state[n] = curr_cpu.flatten()[slice_idx].clone()
 
             # Add debug data including successfully gathered peers
             debug_dict = {}
 
-            # Add model parameters debug info (sample from local shard to avoid collectives)
+            # Add model parameters debug info
             for name, param in self.model.named_parameters():
-                if param is not None and self.is_master:
-                    # Use to_local() for DTensor to avoid full_tensor() collective deadlock
+                if (
+                    param is not None and param.numel() >= 2
+                ):  # Check if tensor has at least 2 elements
+                    # Handle DTensor case - get local tensor first
                     if isinstance(param, DT):
-                        flat = param.to_local().data.flatten()
+                        local_param = param.to_local()
+                        debug_dict[name + "_debug"] = (
+                            local_param.flatten()[:2].detach().cpu().tolist()
+                        )
                     else:
-                        flat = param.data.flatten()
-
-                    if flat.numel() > 0:
-                        # Sample last 2 elements to be consistent with comparison
-                        sample = flat[-2:] if flat.numel() >= 2 else flat[-1:]
-                        debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
+                        debug_dict[name + "_debug"] = (
+                            param.flatten()[:2].detach().cpu().tolist()
+                        )
 
             # Add successful peers information
             if len(skipped_uids) > 0:
@@ -3203,6 +3210,7 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
+            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 

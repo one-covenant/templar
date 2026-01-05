@@ -1367,6 +1367,7 @@ async def compare_model_with_debug_dict(
     param_avg_change: dict[str, torch.Tensor] | None = None,
     *,
     min_step_size: float = 1e-9,
+    index_range: tuple[int, int] = (0, 2),
 ) -> dict[str, bool | float | int]:
     """
     Compare weights with published debug snippets and return sync metrics.
@@ -1395,15 +1396,10 @@ async def compare_model_with_debug_dict(
             continue
 
         # --- grab the slice we care about --------------------------------
-        # Sample from the end of the local shard (matches debug dict generation)
-        # This avoids needing full_tensor() collective for DTensor
         if isinstance(p, DT):
-            flat = p.to_local().data.flatten()
+            curr_slice = p.to_local().data.flatten()[index_range[0] : index_range[1]]
         else:
-            flat = p.data.flatten()
-
-        # Always sample last 2 elements to match debug dict generation at [-2:]
-        curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
+            curr_slice = p.data.flatten()[index_range[0] : index_range[1]]
 
         debug_slice = torch.tensor(
             debug_dict[key], dtype=p.dtype, device=curr_slice.device

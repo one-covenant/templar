@@ -968,10 +968,10 @@ class Miner(BaseNode, Trainer):
                     else:
                         flat = param.data.flatten()
 
-                    if flat.numel() > 0:
-                        # Sample last 2 elements to be consistent with comparison
-                        sample = flat[-2:] if flat.numel() >= 2 else flat[-1:]
-                        debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
+                    if flat.numel() >= 12:
+                        debug_dict[name + "_debug"] = (
+                            flat[10:12].detach().cpu().tolist()
+                        )
 
             # Only master uploads the debug dictionary
             if self.is_master:

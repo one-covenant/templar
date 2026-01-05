@@ -55,8 +55,8 @@ class TestCompareModelWithDebugDict(unittest.TestCase):
         self.model.named_parameters.return_value = [("param1", self.param1)]
 
     def test_compare_model_with_debug_dict_perfect_match(self):
-        # Debug dict should contain last 2 elements to match to_local() behavior
-        debug_dict = {"param1_debug": [2.0, 3.0]}
+        # Debug dict should contain first 2 elements (index_range default is (0, 2))
+        debug_dict = {"param1_debug": [1.0, 2.0]}
         result = asyncio.run(
             compare_model_with_debug_dict(self.model, debug_dict, 0.01)
         )
@@ -68,8 +68,8 @@ class TestCompareModelWithDebugDict(unittest.TestCase):
         reason="TODO: Fix NaN issue in avg_steps_behind calculation with mocked parameters"
     )
     def test_compare_model_with_debug_dict_mismatch(self):
-        # Debug dict should contain last 2 elements (but with different values)
-        debug_dict = {"param1_debug": [2.2, 3.3]}
+        # Debug dict should contain first 2 elements (but with different values)
+        debug_dict = {"param1_debug": [1.2, 2.3]}
         result = asyncio.run(
             compare_model_with_debug_dict(self.model, debug_dict, 0.01)
         )
