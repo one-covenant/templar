@@ -151,7 +151,6 @@ and gradient gathering operations.
 """
 
 
-@pytest.mark.skip(reason="Cross-device link issue in CI: /dev/shm to /tmp")
 async def test_put_local(comms_instance):
     """Test 1: Local Storage Functionality
 

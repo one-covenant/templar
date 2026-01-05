@@ -72,25 +72,20 @@ async def cleanup_bucket():
         try:
             async for page in paginator.paginate(Bucket=account_id):
                 if "Contents" in page:
-                    # Filter objects that start with checkpoint, gradient, start_window, aggregator, debug, or peers
+                    # Filter objects that start with checkpoint, gradient, or start_window
                     filtered_objects = [
                         {"Key": obj["Key"]}
                         for obj in page["Contents"]
                         if obj["Key"].startswith(
-                            (
-                                "checkpoint",
-                                "gradient",
-                                "start_window",
-                                "aggregator",
-                                "debug",
-                                "peers",
-                            )
+                            ("checkpoint", "gradient", "start_window")
                         )
                     ]
                     objects_to_delete.extend(filtered_objects)
 
             if not objects_to_delete:
-                logger.info("No training files found to delete")
+                logger.info(
+                    "No checkpoint, gradient, or start_window files found to delete"
+                )
                 return
 
             # Delete objects in batches of 1000 (S3 limit)
@@ -111,7 +106,7 @@ async def cleanup_bucket():
                         )
 
             logger.success(
-                f"Successfully deleted {len(objects_to_delete)} training files from bucket"
+                f"Successfully deleted {len(objects_to_delete)} checkpoint, gradient, and start_window files from bucket"
             )
 
         except Exception as e:
@@ -120,5 +115,5 @@ async def cleanup_bucket():
 
 
 if __name__ == "__main__":
-    logger.info("Starting cleanup of all training files...")
+    logger.info("Starting cleanup of checkpoint, gradient, and start_window files...")
     asyncio.run(cleanup_bucket())

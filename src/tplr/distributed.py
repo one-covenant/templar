@@ -348,63 +348,6 @@ class DistributedHelper:
 
         return result
 
-    def batched_all_reduce(
-        self,
-        values: dict[str, float | int],
-        device: torch.device,
-        ops: dict[str, dist.ReduceOp.RedOpType] | None = None,
-    ) -> dict[str, float]:
-        """
-        Perform batched all-reduce on multiple scalar values in a single operation.
-        This is much more efficient than multiple individual all-reduce calls.
-
-        Args:
-            values: Dictionary of {name: value} to reduce
-            device: Device to perform reduction on
-            ops: Optional dictionary of {name: ReduceOp} for per-value operations.
-                 Defaults to SUM for all values.
-
-        Returns:
-            Dictionary of {name: reduced_value}
-        """
-        if not self.is_distributed():
-            return {k: float(v) for k, v in values.items()}
-
-        if not values:
-            return {}
-
-        # Default to SUM for all operations
-        if ops is None:
-            ops = {}
-
-        # Group values by operation type to minimize all-reduce calls
-        op_groups: dict[dist.ReduceOp.RedOpType, dict[str, float]] = {}
-        for name, value in values.items():
-            op = ops.get(name, dist.ReduceOp.SUM)
-            if op not in op_groups:
-                op_groups[op] = {}
-            op_groups[op][name] = float(value)
-
-        # Perform one all-reduce per operation type
-        results = {}
-        for op, group_values in op_groups.items():
-            # Pack all values for this operation into a single tensor
-            names = list(group_values.keys())
-            tensor = torch.tensor(
-                [group_values[name] for name in names],
-                dtype=torch.float32,
-                device=device,
-            )
-
-            # Single all-reduce for all values with this operation
-            dist.all_reduce(tensor, op=op)
-
-            # Unpack results
-            for i, name in enumerate(names):
-                results[name] = float(tensor[i].item())
-
-        return results
-
     def _model_device(self, model: torch.nn.Module) -> torch.device:
         return next(model.parameters()).device
 

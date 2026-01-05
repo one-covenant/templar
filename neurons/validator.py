@@ -28,12 +28,6 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from io import StringIO
-
-# Set PyTorch CUDA memory allocator to use expandable segments for better FSDP performance
-# This reduces memory fragmentation and improves allocation efficiency for large models
-# Must be set before importing torch
-if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Deque, cast
@@ -333,21 +327,6 @@ class Validator(BaseNode, Trainer):
         self.hparams = tplr.load_hparams(
             use_local_run_hparams=cast(bool, self.config.local)
         )
-
-        # Store parallelization parameters
-        tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
-        # Check environment variable first for runtime override, then hparams
-        raw_tp = os.environ.get("TP_DEGREE")
-        if raw_tp is not None:
-            try:
-                self.tp_degree = max(1, int(raw_tp))
-            except (ValueError, TypeError):
-                tplr.logger.warning(
-                    f"Invalid TP_DEGREE='{raw_tp}', falling back to hparams"
-                )
-                self.tp_degree = int(getattr(tt, "tp_degree", 1))
-        else:
-            self.tp_degree = int(getattr(tt, "tp_degree", 1))
 
         # Init bittensor objects
         self.wallet = bt.wallet(config=self.config)
@@ -1695,10 +1674,6 @@ class Validator(BaseNode, Trainer):
                         positive_ratio_pct=gather_peers_positive_ratio * 100,
                     )
 
-            # [TP] Sync all ranks before master does async slashing to avoid deadlock
-            if self.world_size > 1 and dist.is_initialized():
-                dist_helper.safe_barrier("validator_pre_slashing", self.local_rank)
-
             # Only master evaluates miner sync and applies slashing
             if self.is_master:
                 await self.slash_for_poor_sync()
@@ -1902,9 +1877,17 @@ class Validator(BaseNode, Trainer):
             # Process each UID with sliding window loading
             for eval_uid in evaluation_uids:
                 uid_eval_start = time.time()
-
                 # Check if window has changed before starting evaluation
                 if self.current_window != eval_window:
+                    if self.is_master:
+                        tplr.log_with_context(
+                            level="info",
+                            message=f"Window changed during evaluation (was {eval_window},"
+                            f" now {self.current_window}), exiting evaluation loop early."
+                            f" Evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs.",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
                     break
 
                 # Mark this UID as attempted (for counter management)
@@ -2045,7 +2028,6 @@ class Validator(BaseNode, Trainer):
 
                 # 9. Apply gradient and compute loss after
                 apply_ok_local = True
-                exception_msg = ""
                 try:
                     gradient_apply_start = tplr.T()
                     self.update_model_with_gradient(
@@ -2065,25 +2047,13 @@ class Validator(BaseNode, Trainer):
                         )
                 except Exception as e:
                     apply_ok_local = False
-                    exception_msg = str(e)
+                    if self.is_master:
+                        self.slash_for_invalid_gradient(eval_uid, e)
 
-                # Reach group consensus before any barrier - ALL ranks must participate
+                # Reach group consensus before any barrier
                 apply_ok_global = dist_helper.all_ok(
                     apply_ok_local, self.device, tag=f"apply_grad_uid_{eval_uid}"
                 )
-
-                # Only call slash AFTER all_ok completes, so all ranks are synchronized
-                if not apply_ok_global and self.is_master:
-                    # Slash regardless of which rank failed
-                    exc = (
-                        Exception(exception_msg)
-                        if exception_msg
-                        else Exception(
-                            "Gradient application failed on at least one rank"
-                        )
-                    )
-                    self.slash_for_invalid_gradient(eval_uid, exc)
-
                 if not apply_ok_global:
                     # Restore and skip in lockstep
                     self._restore_model_state(saved_state)
@@ -2574,21 +2544,26 @@ class Validator(BaseNode, Trainer):
                 )
 
             with torch.no_grad():
-                for n, p in self.model.named_parameters():
-                    # Sample from local shard to avoid collectives (matches debug dict generation)
-                    if isinstance(p, DT):
-                        flat = p.to_local().detach().cpu().flatten()
-                    else:
-                        flat = p.detach().cpu().flatten()
+                slice_idx = slice(10, 12)  # indices published in miner debug dict
 
-                    # Sample last 2 elements (or 1 if that's all there is) to match debug dict generation
-                    if flat.numel() == 0:
+                for n, p in self.model.named_parameters():
+                    if p.numel() < 12:
                         continue
-                    curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
+
+                    # Handle DTensor case - get local tensor first
+                    if isinstance(p, DT):
+                        # For DTensor, use the local tensor
+                        local_p = p.to_local()
+                        curr_cpu = local_p.detach().cpu()
+                    else:
+                        # move current weights to CPU once
+                        curr_cpu = p.detach().cpu()
 
                     # compute delta only if we have a previous slice
                     if n in self.prev_param_state:
                         prev_slice = self.prev_param_state[n]
+                        curr_slice = curr_cpu.flatten()[slice_idx]
+
                         delta_slice = torch.abs(curr_slice - prev_slice)
 
                         # lazy-init & EMA update
@@ -2600,24 +2575,26 @@ class Validator(BaseNode, Trainer):
                             ).add_(delta_slice * self.param_change_alpha)
 
                     # stash the new slice for next iteration
-                    self.prev_param_state[n] = curr_slice.clone()
+                    self.prev_param_state[n] = curr_cpu.flatten()[slice_idx].clone()
 
             # Add debug data including successfully gathered peers
             debug_dict = {}
 
-            # Add model parameters debug info (sample from local shard to avoid collectives)
+            # Add model parameters debug info
             for name, param in self.model.named_parameters():
-                if param is not None and self.is_master:
-                    # Use to_local() for DTensor to avoid full_tensor() collective deadlock
+                if (
+                    param is not None and param.numel() >= 2
+                ):  # Check if tensor has at least 2 elements
+                    # Handle DTensor case - get local tensor first
                     if isinstance(param, DT):
-                        flat = param.to_local().data.flatten()
+                        local_param = param.to_local()
+                        debug_dict[name + "_debug"] = (
+                            local_param.flatten()[:2].detach().cpu().tolist()
+                        )
                     else:
-                        flat = param.data.flatten()
-
-                    if flat.numel() > 0:
-                        # Sample last 2 elements to be consistent with comparison
-                        sample = flat[-2:] if flat.numel() >= 2 else flat[-1:]
-                        debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
+                        debug_dict[name + "_debug"] = (
+                            param.flatten()[:2].detach().cpu().tolist()
+                        )
 
             # Add successful peers information
             if len(skipped_uids) > 0:
@@ -3203,6 +3180,7 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
+            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 
@@ -3593,10 +3571,6 @@ class Validator(BaseNode, Trainer):
         clip_norm = True  # Always true in the repo 8/13/2025
         # If all validations pass, apply the gradients
 
-        # NOTE: For evaluation, we MUST use validator's own xshapes, not miner's xshapes
-        # The miner's xshapes are only used in outer_step for gradient aggregation
-        # Here we need to decompress to match the validator's model shape
-
         for n, p in model.named_parameters():
             src_rank = 0
             on_src = self.is_master or not dist_helper.is_distributed()
@@ -3647,21 +3621,16 @@ class Validator(BaseNode, Trainer):
                         if clip_norm:
                             quant_params = None  # Fast route for decompress
 
-                        # For evaluation, always use validator's own xshapes to match model shape
-                        param_xshape = self.xshapes[n]
-                        param_totalk = self.totalks[n]
-
+                        # Check if we're in distributed mode
                         # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                        ref = torch.empty(
-                            param_xshape, device=self.device, dtype=p.dtype
-                        )
+                        ref = torch.empty_like(p, device=self.device, dtype=p.dtype)
 
                         decompressed = self.compressor.decompress(
                             ref,
                             idxs,
                             vals,
-                            param_xshape,
-                            param_totalk,
+                            self.xshapes[n],
+                            self.totalks[n],
                             cast("QuantParamsT | None", quant_params),
                         )
 
@@ -4071,18 +4040,6 @@ class Validator(BaseNode, Trainer):
         Re-create the *exact* index pool a miner used for (uid, window) and
         return a 128-bit hex digest **plus the expected sample count**.
         """
-        # Safe-parse TP_DEGREE
-        raw_tp = os.environ.get("TP_DEGREE")
-        if raw_tp is not None:
-            try:
-                tp_degree = max(1, int(raw_tp))
-            except (ValueError, TypeError):
-                tp_degree = int(getattr(self.hparams, "tp_degree", 1))
-        else:
-            tp_degree = int(getattr(self.hparams, "tp_degree", 1))
-
-        # Use rank=0 to get the first DP rank's indices (representative for all TP ranks)
-        # tp_degree doesn't affect _global_indices(), but pass it for consistency
         miner_sampler = tplr.MinerSampler(
             dataset=self.dataset,
             uid=uid,
@@ -4092,8 +4049,7 @@ class Validator(BaseNode, Trainer):
             batch_size=self.hparams.batch_size,
             target_batch_size=self.hparams.target_batch_size,
             rank=0,
-            world_size=self.world_size,
-            tp_degree=tp_degree,
+            world_size=1,
         )
         idxs = miner_sampler._global_indices()
         ids = miner_sampler.ids_for_indices(idxs.tolist())
