@@ -1617,6 +1617,7 @@ class Comms(ChainManager):
         stale_retention: int = 10,
         time_min: datetime | None = None,
         time_max: datetime | None = None,
+        xshapes: dict[str, tuple] | None = None,
     ) -> SimpleNamespace | None:
         """
         Gathers and processes gradients from a list of peer UIDs.
@@ -1646,6 +1647,9 @@ class Comms(ChainManager):
                 gradients. Defaults to None.
             time_max (datetime | None, optional): The maximum modification time for
                 gradients. Defaults to None.
+            xshapes (dict[str, tuple] | None, optional): Expected shapes for gradient
+                tensors, used to validate that received gradients have the correct
+                dimensions. Defaults to None.
 
         Returns:
             SimpleNamespace | None: A namespace containing the aggregated state dict,
@@ -1847,6 +1851,28 @@ class Comms(ChainManager):
                                 )
                                 valid_response = False
                                 break
+
+                            # ------------------------------------------------------
+                            # (3)  Validate vals shape matches expected model shape
+                            # ------------------------------------------------------
+                            if xshapes is not None:
+                                base_name = param_name[:-4]  # Remove "vals" suffix
+                                expected_shape = xshapes.get(base_name)
+                                if expected_shape is not None:
+                                    # vals.shape should be xshape[:-1] + [topk]
+                                    # So vals.shape[:-1] should match xshape[:-1]
+                                    expected_vals_prefix = expected_shape[:-1]
+                                    actual_vals_prefix = tensor.shape[:-1]
+                                    if tuple(actual_vals_prefix) != tuple(
+                                        expected_vals_prefix
+                                    ):
+                                        tplr.logger.warning(
+                                            f"Shape mismatch for {param_name} from UID {uid}: "
+                                            f"expected shape prefix {expected_vals_prefix}, "
+                                            f"got {actual_vals_prefix} (likely sharded gradient)"
+                                        )
+                                        valid_response = False
+                                        break
 
                     missing_params = (
                         expected_compressed_params - received_compressed_params

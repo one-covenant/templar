@@ -758,6 +758,7 @@ class Miner(BaseNode, Trainer):
                     local=False,
                     stale_retention=100,
                     totalks=self.totalks,
+                    xshapes=self.xshapes,
                     compressor=self.compressor,
                     time_min=time_min,
                     time_max=time_max,
