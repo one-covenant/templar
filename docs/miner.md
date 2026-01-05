@@ -176,7 +176,7 @@ This guide will help you set up and run a miner for **τemplar**. We'll cover bo
    export R2_DATASET_BUCKET_NAME="mixed-dataset-migration"
    export R2_DATASET_READ_ACCESS_KEY_ID="e70cd26850f697479bbb5fd9413713f4"
    export R2_DATASET_READ_SECRET_ACCESS_KEY="11e3364d6ef70e44d671863fb6de32d474aa6220fa2c9c3df45c5e012ebfbda3"
-   export DATASET_BINS_PATH="tokenized/"
+   export DATASET_BINS_PATH="anneal/"
 
 
    # Aggregator R2 credentials

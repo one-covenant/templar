@@ -39,7 +39,7 @@ async def download_files(shard_indices, output_path):
 
     Args:
         shard_indices: List of shard indices to download
-        output_path: Base directory path where files will be saved (e.g., "remote/tokenized/")
+        output_path: Base directory path where files will be saved (e.g., "anneal/")
     """
 
     # Get credentials from environment variables (using the same env vars as comms)
@@ -104,11 +104,14 @@ async def download_files(shard_indices, output_path):
     files_to_download = []
     skipped_files = []
 
+    # Detect anneal mode from output path
+    file_prefix = "anneal" if "anneal" in str(output_path) else "train"
+
     for idx in shard_indices:
         # Use SharedShardedDataset.locate_shards to get the correct filenames
         # This returns the full paths as they should be in both S3 and locally
         tokens_file, ids_file = SharedShardedDataset.locate_shards(
-            shard_index=idx, custom_path=output_path
+            shard_index=idx, custom_path=output_path, file_prefix=file_prefix
         )
 
         # The S3 keys and local paths should match exactly
@@ -238,7 +241,7 @@ Environment variables:
         "-p",
         type=str,
         default=None,
-        help="Output directory path (default: from DATASET_BINS_PATH or 'remote/tokenized/')",
+        help="Output directory path (default: from DATASET_BINS_PATH or 'anneal/')",
     )
 
     args = parser.parse_args()
@@ -263,8 +266,8 @@ Environment variables:
 
     # Determine output path - this should match DATASET_BINS_PATH
     if args.path is None:
-        # Try environment variable first, default to "remote/tokenized/"
-        args.path = os.getenv("DATASET_BINS_PATH", "remote/tokenized/")
+        # Try environment variable first, default to "anneal/"
+        args.path = os.getenv("DATASET_BINS_PATH", "anneal/")
 
     # Remove any trailing slashes for consistency
     args.path = args.path.rstrip("/")

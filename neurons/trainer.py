@@ -170,32 +170,74 @@ class Trainer:
         default_lr = 2e-4 if optimizer_type == "adamw" else 0.02
         effective_lr = opt_specific_config.get("learning_rate", default_lr)
 
-        # Get scheduler parameters with optimizer-specific overrides
-        warmup_steps = scheduler_config.get("warmup_steps", 750)
-        t_max = scheduler_config.get("t_max", 20000)
-        eta_min_factor = scheduler_config.get("eta_min_factor", 0.1)
+        # Check for anneal mode
+        anneal_config = getattr(self.hparams, "anneal_mode", {})
+        anneal_enabled = anneal_config.get("enabled", False)
 
-        warmup_scheduler = lr_scheduler.LinearLR(
-            self.inner_optimizer,
-            start_factor=1e-6,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        cosine_scheduler = lr_scheduler.CosineAnnealingLR(
-            self.inner_optimizer,
-            T_max=t_max,
-            eta_min=effective_lr * eta_min_factor,
-        )
-        inner_scheduler = lr_scheduler.SequentialLR(
-            self.inner_optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_steps],
-        )
+        if anneal_enabled:
+            # Anneal mode: Linear warmup to peak_lr_factor, then linear decay to eta_min
+            warmup_inner_steps = anneal_config.get("warmup_inner_steps", 100)
+            decay_outer_steps = anneal_config.get("decay_outer_steps", 550)
+            peak_lr_factor = anneal_config.get("peak_lr_factor", 0.5)
+            eta_min_factor = anneal_config.get("eta_min_factor", 0.0)
 
-        tplr.logger.info(
-            f"[Init] Constructed {optimizer_type} scheduler with lr={effective_lr}, "
-            f"warmup_steps={warmup_steps}, t_max={t_max}, eta_min_factor={eta_min_factor}"
-        )
+            total_decay_steps = decay_outer_steps * self.hparams.inner_steps
+
+            warmup_scheduler = lr_scheduler.LinearLR(
+                self.inner_optimizer,
+                start_factor=1e-6,
+                end_factor=peak_lr_factor,
+                total_iters=warmup_inner_steps,
+            )
+            # Decay from peak_lr_factor down to eta_min_factor
+            # end_factor is relative to current LR, so we compute the ratio
+            decay_end_factor = (
+                eta_min_factor / peak_lr_factor if peak_lr_factor > 0 else 0.0
+            )
+            decay_scheduler = lr_scheduler.LinearLR(
+                self.inner_optimizer,
+                start_factor=1.0,
+                end_factor=decay_end_factor,
+                total_iters=total_decay_steps,
+            )
+            inner_scheduler = lr_scheduler.SequentialLR(
+                self.inner_optimizer,
+                schedulers=[warmup_scheduler, decay_scheduler],
+                milestones=[warmup_inner_steps],
+            )
+
+            tplr.logger.info(
+                f"[Init] Anneal scheduler: warmup={warmup_inner_steps} inner steps to "
+                f"{peak_lr_factor}x LR, then linear decay over {decay_outer_steps} outer steps "
+                f"({total_decay_steps} inner steps) to {eta_min_factor}x LR"
+            )
+        else:
+            # Normal mode: Linear warmup + cosine annealing
+            warmup_steps = scheduler_config.get("warmup_steps", 750)
+            t_max = scheduler_config.get("t_max", 20000)
+            eta_min_factor = scheduler_config.get("eta_min_factor", 0.1)
+
+            warmup_scheduler = lr_scheduler.LinearLR(
+                self.inner_optimizer,
+                start_factor=1e-6,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            cosine_scheduler = lr_scheduler.CosineAnnealingLR(
+                self.inner_optimizer,
+                T_max=t_max,
+                eta_min=effective_lr * eta_min_factor,
+            )
+            inner_scheduler = lr_scheduler.SequentialLR(
+                self.inner_optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_steps],
+            )
+
+            tplr.logger.info(
+                f"[Init] Constructed {optimizer_type} scheduler with lr={effective_lr}, "
+                f"warmup_steps={warmup_steps}, t_max={t_max}, eta_min_factor={eta_min_factor}"
+            )
 
         return inner_scheduler
 
@@ -913,8 +955,15 @@ class Trainer:
 
                         if not null_round:
                             # Apply warmup LR scaling if we're in warmup period
+                            # Skip in anneal mode - scheduler handles warmup directly
+                            anneal_config = getattr(self.hparams, "anneal_mode", {})
+                            anneal_enabled = anneal_config.get("enabled", False)
+
                             original_lrs = []
-                            if self.warmup_steps_taken < self.warmup_inner_steps:
+                            if (
+                                not anneal_enabled
+                                and self.warmup_steps_taken < self.warmup_inner_steps
+                            ):
                                 warmup_scale = (
                                     self.warmup_steps_taken + 1
                                 ) / self.warmup_inner_steps
@@ -931,14 +980,20 @@ class Trainer:
                             self.scaler.update()
 
                             # Restore original LR after warmup scaling
-                            if self.warmup_steps_taken < self.warmup_inner_steps:
+                            if (
+                                not anneal_enabled
+                                and self.warmup_steps_taken < self.warmup_inner_steps
+                            ):
                                 for i, param_group in enumerate(
                                     self.inner_optimizer.param_groups
                                 ):
                                     param_group["lr"] = original_lrs[i]
 
-                            # Increment warmup counter
-                            if self.warmup_steps_taken < self.warmup_inner_steps:
+                            # Increment warmup counter (only in non-anneal mode)
+                            if (
+                                not anneal_enabled
+                                and self.warmup_steps_taken < self.warmup_inner_steps
+                            ):
                                 self.warmup_steps_taken += 1
 
                             # Step scheduler unless we're in flatten window

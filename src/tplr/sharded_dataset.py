@@ -122,7 +122,13 @@ class SharedShardedDataset(Dataset):
             )
 
         tokens_file = os.path.join(shards_path, f"{file_prefix}_{shard_index:06d}.npy")
-        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.npy")
+        # For anneal mode, sample_ids files use "sample_ids_anneal_" prefix
+        if file_prefix == "anneal":
+            ids_file = os.path.join(
+                shards_path, f"sample_ids_{file_prefix}_{shard_index:06d}.npy"
+            )
+        else:
+            ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.npy")
 
         return tokens_file, ids_file
 
@@ -244,6 +250,7 @@ class ShardedDatasetManager:
         comms: tplr.comms.Comms,
         token_dtype: npt.DTypeLike = np.uint32,
         file_prefix: str = "train",
+        anneal_mode: bool = False,
     ):
         """Initializes the dataset manager.
 
@@ -253,6 +260,8 @@ class ShardedDatasetManager:
             world_size: The total number of processes in distributed training.
             comms: An instance of `tplr.comms.Comms` for communication.
             token_dtype: The numpy data type of the tokens.
+            file_prefix: The prefix for shard files (e.g., "train", "anneal").
+            anneal_mode: If True, lock to single shard with no cycling.
         """
         self.sequence_length = sequence_length
         self.rank = rank
@@ -260,6 +269,7 @@ class ShardedDatasetManager:
         self.token_dtype = token_dtype
         self.file_prefix = file_prefix
         self.shard_index = 0
+        self.anneal_mode = anneal_mode
 
         self.active_dataset: SharedShardedDataset | None = None
         self.upcoming_dataset: asyncio.Task | None = None
@@ -268,6 +278,11 @@ class ShardedDatasetManager:
 
         # should comms glob to know all file paths?
         self.max_dataset_idx = 14  # bucket_glob_files_idx
+
+        if anneal_mode:
+            tplr.logger.info(
+                "[Dataset] Anneal mode: locked to single shard, no cycling"
+            )
 
     @staticmethod
     def remap_shard_index(shard_index: int) -> int:
@@ -380,6 +395,12 @@ class ShardedDatasetManager:
         self.shard_index = current_shard_index
 
         self.active_dataset = await self.create_dataset(current_shard_index)
+
+        # In anneal mode, don't prepare next shard (we stay on shard 0)
+        if self.anneal_mode:
+            self.upcoming_dataset = asyncio.create_task(asyncio.sleep(0))
+            return
+
         next_shard = (current_shard_index + 1) % self.max_dataset_idx
 
         # Only rank 0 prepares the next shard to avoid duplicate downloads
@@ -397,6 +418,10 @@ class ShardedDatasetManager:
         active dataset, and starts preparing the next one. It also cleans up
         the files of the old dataset.
         """
+        if self.anneal_mode:
+            tplr.logger.info("[Dataset] Anneal mode: skipping shard swap")
+            return self.shard_index
+
         self.shard_index += 1
         self.shard_index = self.shard_index % self.max_dataset_idx  # allow replay
 

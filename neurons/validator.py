@@ -545,12 +545,22 @@ class Validator(BaseNode, Trainer):
         self.shard_reset_outer_step = getattr(
             self.hparams, "shard_reset_outer_step", None
         )
+
+        # Get anneal mode config for dataset manager
+        anneal_config = getattr(self.hparams, "anneal_mode", {})
+        anneal_enabled = anneal_config.get("enabled", False)
+        anneal_prefix = (
+            anneal_config.get("file_prefix", "anneal") if anneal_enabled else "train"
+        )
+
         self.dataset_manager = tplr.sharded_dataset.ShardedDatasetManager(
             sequence_length=self.hparams.sequence_length,
             rank=self.local_rank,  # Use local_rank for proper file operations
             world_size=self.world_size,
             comms=self.comms,
             token_dtype=np.uint32,  # Match preprocessing script dtype
+            file_prefix=anneal_prefix,
+            anneal_mode=anneal_enabled,
         )
 
         self.burn_uid = 1
@@ -1274,6 +1284,10 @@ class Validator(BaseNode, Trainer):
             self.outer_steps_per_shard,
             self.shard_reset_outer_step,
         )
+        # In anneal mode, always use shard 0
+        if self.dataset_manager.anneal_mode:
+            current_shard = 0
+            shard_epoch = 0
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
         _ = await self.dataset_manager.initialize_datasets(current_shard)
@@ -1316,31 +1330,36 @@ class Validator(BaseNode, Trainer):
             window_start = tplr.T()
 
             # Check if we need to swap dataset based on shard index change
-            shard_epoch_check, current_shard_check = (
-                tplr.sharded_dataset.compute_shard_state(
-                    self.global_step,
-                    self.outer_steps_per_shard,
-                    self.shard_reset_outer_step,
+            # Skip shard switching in anneal mode - we stay on single shard
+            anneal_config = getattr(self.hparams, "anneal_mode", {})
+            anneal_enabled = anneal_config.get("enabled", False)
+
+            if not anneal_enabled:
+                shard_epoch_check, current_shard_check = (
+                    tplr.sharded_dataset.compute_shard_state(
+                        self.global_step,
+                        self.outer_steps_per_shard,
+                        self.shard_reset_outer_step,
+                    )
                 )
-            )
-            if shard_epoch_check != last_shard_epoch:
-                tplr.logger.info(
-                    f"Resetting shard schedule at outer_step {self.global_step} "
-                    f"to shard {current_shard_check}"
-                )
-                await self.dataset_manager.initialize_datasets(current_shard_check)
-                self.set_dataloader(validator=True)
-                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
-                last_shard_epoch = shard_epoch_check
-                last_shard = current_shard_check
-            elif current_shard_check > last_shard:
-                tplr.logger.info(
-                    f"Swapping dataset after {self.global_step} outer steps at window {self.current_window}"
-                )
-                await self.dataset_manager.swap_datasets()
-                self.set_dataloader(validator=True)
-                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
-                last_shard = current_shard_check
+                if shard_epoch_check != last_shard_epoch:
+                    tplr.logger.info(
+                        f"Resetting shard schedule at outer_step {self.global_step} "
+                        f"to shard {current_shard_check}"
+                    )
+                    await self.dataset_manager.initialize_datasets(current_shard_check)
+                    self.set_dataloader(validator=True)
+                    dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                    last_shard_epoch = shard_epoch_check
+                    last_shard = current_shard_check
+                elif current_shard_check > last_shard:
+                    tplr.logger.info(
+                        f"Swapping dataset after {self.global_step} outer steps at window {self.current_window}"
+                    )
+                    await self.dataset_manager.swap_datasets()
+                    self.set_dataloader(validator=True)
+                    dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                    last_shard = current_shard_check
 
             self.sync_window += 1
             if self.is_master:
@@ -2555,21 +2574,26 @@ class Validator(BaseNode, Trainer):
                 )
 
             with torch.no_grad():
-                for n, p in self.model.named_parameters():
-                    # Sample from local shard to avoid collectives (matches debug dict generation)
-                    if isinstance(p, DT):
-                        flat = p.to_local().detach().cpu().flatten()
-                    else:
-                        flat = p.detach().cpu().flatten()
+                slice_idx = slice(10, 12)  # indices published in miner debug dict
 
-                    # Sample last 2 elements (or 1 if that's all there is) to match debug dict generation
-                    if flat.numel() == 0:
+                for n, p in self.model.named_parameters():
+                    if p.numel() < 12:
                         continue
-                    curr_slice = flat[-2:] if flat.numel() >= 2 else flat[-1:]
+
+                    # Handle DTensor case - get local tensor first
+                    if isinstance(p, DT):
+                        # For DTensor, use the local tensor
+                        local_p = p.to_local()
+                        curr_cpu = local_p.detach().cpu()
+                    else:
+                        # move current weights to CPU once
+                        curr_cpu = p.detach().cpu()
 
                     # compute delta only if we have a previous slice
                     if n in self.prev_param_state:
                         prev_slice = self.prev_param_state[n]
+                        curr_slice = curr_cpu.flatten()[slice_idx]
+
                         delta_slice = torch.abs(curr_slice - prev_slice)
 
                         # lazy-init & EMA update
@@ -2581,24 +2605,26 @@ class Validator(BaseNode, Trainer):
                             ).add_(delta_slice * self.param_change_alpha)
 
                     # stash the new slice for next iteration
-                    self.prev_param_state[n] = curr_slice.clone()
+                    self.prev_param_state[n] = curr_cpu.flatten()[slice_idx].clone()
 
             # Add debug data including successfully gathered peers
             debug_dict = {}
 
-            # Add model parameters debug info (sample from local shard to avoid collectives)
+            # Add model parameters debug info
             for name, param in self.model.named_parameters():
-                if param is not None and self.is_master:
-                    # Use to_local() for DTensor to avoid full_tensor() collective deadlock
+                if (
+                    param is not None and param.numel() >= 2
+                ):  # Check if tensor has at least 2 elements
+                    # Handle DTensor case - get local tensor first
                     if isinstance(param, DT):
-                        flat = param.to_local().data.flatten()
+                        local_param = param.to_local()
+                        debug_dict[name + "_debug"] = (
+                            local_param.flatten()[:2].detach().cpu().tolist()
+                        )
                     else:
-                        flat = param.data.flatten()
-
-                    if flat.numel() > 0:
-                        # Sample last 2 elements to be consistent with comparison
-                        sample = flat[-2:] if flat.numel() >= 2 else flat[-1:]
-                        debug_dict[name + "_debug"] = sample.detach().cpu().tolist()
+                        debug_dict[name + "_debug"] = (
+                            param.flatten()[:2].detach().cpu().tolist()
+                        )
 
             # Add successful peers information
             if len(skipped_uids) > 0:
@@ -3184,6 +3210,7 @@ class Validator(BaseNode, Trainer):
             model=self.model,
             debug_dict=miner_debug_dict,
             learning_rate=self.lr,
+            index_range=(10, 12),
             param_avg_change=self.param_avg_change,
         )
 
