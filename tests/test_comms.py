@@ -1120,6 +1120,152 @@ async def test_gather_without_xshapes_accepts_all(comms_instance, dummy_compress
     assert result.uids == [1, 2], f"Expected UIDs [1, 2], got {result.uids}"
 
 
+@pytest.mark.asyncio
+async def test_gather_validates_4d_xshape_correctly(comms_instance, dummy_compressor):
+    """Test that 4D xshapes (from 2D weight params after encoding) are validated correctly.
+
+    After encoding, 2D weight params become 4D tensors [y, x, h, w].
+    After compression, vals become 3D [y, x, topk].
+    So vals.shape[:-1] should match xshape[:2].
+    """
+    comms_instance.check_compressed_indices = (
+        lambda param_name, idxs, totalk, allowed_topk=None, vals=None: None
+    )
+    comms_instance.get_with_retry = AsyncMock()
+
+    topk = 4
+    # Simulating encoded 4D shape [y, x, h, w] = [8, 16, 32, 64]
+    # vals should be [y, x, topk] = [8, 16, topk]
+    y_dim, x_dim, h_dim, w_dim = 8, 16, 32, 64
+
+    # Peer 1: Correct shape vals [8, 16, topk]
+    peer1_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(y_dim, x_dim, topk),  # [8, 16, 4] - correct
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=1,
+        status="OK",
+    )
+
+    # Peer 2: Wrong shape (sharded y dimension)
+    peer2_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(
+                y_dim // 2, x_dim, topk
+            ),  # [4, 16, 4] - sharded!
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=2,
+        status="OK",
+    )
+
+    comms_instance.get_with_retry.side_effect = [peer1_response, peer2_response]
+
+    # 4D xshape from encoding
+    xshapes = {"0.weight": (y_dim, x_dim, h_dim, w_dim)}
+    totalks = {"0.weight": h_dim * w_dim}
+
+    result = await comms_instance.gather(
+        my_uid=0,
+        uids=[1, 2],
+        window=1,
+        key="gradient",
+        timeout=5,
+        device="cpu",
+        local=True,
+        stale_retention=10,
+        totalks=totalks,
+        xshapes=xshapes,
+        compressor=dummy_compressor,
+    )
+
+    assert result is not None, "Expected a non-None result"
+    # Only peer 1 should be accepted, peer 2 has sharded shape
+    assert result.uids == [1], f"Expected only UID 1, got {result.uids}"
+
+
+@pytest.mark.asyncio
+async def test_gather_accepts_correct_4d_xshape(comms_instance, dummy_compressor):
+    """Test that both peers with correct 4D xshape-derived vals are accepted."""
+    comms_instance.check_compressed_indices = (
+        lambda param_name, idxs, totalk, allowed_topk=None, vals=None: None
+    )
+    comms_instance.get_with_retry = AsyncMock()
+
+    topk = 4
+    y_dim, x_dim, h_dim, w_dim = 8, 16, 32, 64
+
+    # Both peers have correct shape
+    peer1_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(y_dim, x_dim, topk),
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=1,
+        status="OK",
+    )
+
+    peer2_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(y_dim, x_dim, topk),
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=2,
+        status="OK",
+    )
+
+    comms_instance.get_with_retry.side_effect = [peer1_response, peer2_response]
+
+    xshapes = {"0.weight": (y_dim, x_dim, h_dim, w_dim)}
+    totalks = {"0.weight": h_dim * w_dim}
+
+    result = await comms_instance.gather(
+        my_uid=0,
+        uids=[1, 2],
+        window=1,
+        key="gradient",
+        timeout=5,
+        device="cpu",
+        local=True,
+        stale_retention=10,
+        totalks=totalks,
+        xshapes=xshapes,
+        compressor=dummy_compressor,
+    )
+
+    assert result is not None, "Expected a non-None result"
+    assert result.uids == [1, 2], f"Expected UIDs [1, 2], got {result.uids}"
+
+
 # Test Start Window Operations
 async def test_get_start_window(comms_instance):
     """Test fetching start window"""

@@ -1859,9 +1859,14 @@ class Comms(ChainManager):
                                 base_name = param_name[:-4]  # Remove "vals" suffix
                                 expected_shape = xshapes.get(base_name)
                                 if expected_shape is not None:
-                                    # vals.shape should be xshape[:-1] + [topk]
-                                    # So vals.shape[:-1] should match xshape[:-1]
-                                    expected_vals_prefix = expected_shape[:-1]
+                                    # After compression:
+                                    # - 4D xshape [y, x, h, w] -> rearrange to [y, x, h*w] -> vals [y, x, topk]
+                                    # - 2D xshape [x, w] -> no rearrange -> vals [x, topk]
+                                    # So vals.shape[:-1] should match xshape[:2] for 4D, xshape[:1] for 2D
+                                    if len(expected_shape) == 4:
+                                        expected_vals_prefix = expected_shape[:2]
+                                    else:
+                                        expected_vals_prefix = expected_shape[:1]
                                     actual_vals_prefix = tensor.shape[:-1]
                                     if tuple(actual_vals_prefix) != tuple(
                                         expected_vals_prefix
