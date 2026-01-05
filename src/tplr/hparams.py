@@ -63,6 +63,27 @@ DEFAULT_HPARAMS = {
 }
 
 
+def deep_merge(base: dict, override: dict) -> dict:
+    """
+    Recursively merge two dictionaries, with override taking precedence.
+    For nested dictionaries, this performs a deep merge rather than replacing.
+
+    Args:
+        base (dict): Base dictionary
+        override (dict): Dictionary with values to override/merge
+
+    Returns:
+        dict: Merged dictionary
+    """
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 def create_namespace(hparams: dict) -> SimpleNamespace:
     """
     Create a SimpleNamespace from the hyperparameters and add model configuration.
@@ -74,8 +95,7 @@ def create_namespace(hparams: dict) -> SimpleNamespace:
         SimpleNamespace: Namespace containing hyperparameters and model configuration.
     """
     # Merge with defaults
-    full_hparams = DEFAULT_HPARAMS.copy()
-    full_hparams.update(hparams)
+    full_hparams = deep_merge(DEFAULT_HPARAMS, hparams)
 
     hparams_ns = SimpleNamespace(**full_hparams)
 
@@ -150,7 +170,7 @@ def load_hparams(
     try:
         with open(base_hparams_file, "r") as f:
             base_hparams = json.load(f)
-            hparams.update(base_hparams)
+            hparams = deep_merge(hparams, base_hparams)
         logger.info(f"Loaded base config from {base_hparams_file}")
     except FileNotFoundError:
         logger.error(f"CRITICAL: Base config file not found at {base_hparams_file}")
@@ -176,7 +196,7 @@ def load_hparams(
         try:
             with open(model_hparams_file, "r") as f:
                 model_specific_hparams = json.load(f)
-                hparams.update(model_specific_hparams)
+                hparams = deep_merge(hparams, model_specific_hparams)
             logger.info(f"Loaded model-specific config from {model_hparams_file}")
         except FileNotFoundError:
             logger.error(f"Model-specific config file not found: {model_hparams_file}")
@@ -191,7 +211,7 @@ def load_hparams(
         try:
             with open(local_run_file, "r") as f:
                 local_run_hparams = json.load(f)
-                hparams.update(local_run_hparams)
+                hparams = deep_merge(hparams, local_run_hparams)
             logger.info(
                 f"Loaded and applied local run overrides from {local_run_file}: {local_run_hparams}"
             )

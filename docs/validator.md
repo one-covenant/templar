@@ -145,6 +145,7 @@ This guide will help you set up and run a validator for **τemplar**. Validators
    R2_DATASET_BUCKET_NAME=<your_dataset_bucket_name>
    R2_DATASET_READ_ACCESS_KEY_ID=<your_dataset_read_access_key_id>
    R2_DATASET_READ_SECRET_ACCESS_KEY=<your_dataset_read_secret_access_key>
+   DATASET_BINS_PATH="anneal/"
 
    # Aggregator R2 credentials
    R2_AGGREGATOR_ACCOUNT_ID=8af7f92a8a0661cf7f1ac0420c932980
@@ -242,6 +243,7 @@ You should see a container named `templar-validator-<WALLET_HOTKEY>`.
    export R2_DATASET_BUCKET_NAME=your_dataset_bucket_name
    export R2_DATASET_READ_ACCESS_KEY_ID=your_dataset_read_access_key_id
    export R2_DATASET_READ_SECRET_ACCESS_KEY=your_dataset_read_secret_access_key
+   export DATASET_BINS_PATH="anneal/"
 
    # Aggregator R2 credentials
    export R2_AGGREGATOR_ACCOUNT_ID=8af7f92a8a0661cf7f1ac0420c932980
@@ -325,6 +327,7 @@ R2_DATASET_ACCOUNT_ID=your_dataset_account_id
 R2_DATASET_BUCKET_NAME=your_dataset_bucket_name
 R2_DATASET_READ_ACCESS_KEY_ID=your_dataset_read_access_key_id
 R2_DATASET_READ_SECRET_ACCESS_KEY=your_dataset_read_secret_access_key
+DATASET_BINS_PATH="anneal/"
 
 # Aggregator R2 credentials
 R2_AGGREGATOR_ACCOUNT_ID=8af7f92a8a0661cf7f1ac0420c932980

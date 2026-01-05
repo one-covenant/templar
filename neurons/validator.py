@@ -28,6 +28,12 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+
+# Set PyTorch CUDA memory allocator to use expandable segments for better FSDP performance
+# This reduces memory fragmentation and improves allocation efficiency for large models
+# Must be set before importing torch
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Deque, cast
@@ -328,6 +334,21 @@ class Validator(BaseNode, Trainer):
             use_local_run_hparams=cast(bool, self.config.local)
         )
 
+        # Store parallelization parameters
+        tt = getattr(self.hparams, "torchtitan", SimpleNamespace())
+        # Check environment variable first for runtime override, then hparams
+        raw_tp = os.environ.get("TP_DEGREE")
+        if raw_tp is not None:
+            try:
+                self.tp_degree = max(1, int(raw_tp))
+            except (ValueError, TypeError):
+                tplr.logger.warning(
+                    f"Invalid TP_DEGREE='{raw_tp}', falling back to hparams"
+                )
+                self.tp_degree = int(getattr(tt, "tp_degree", 1))
+        else:
+            self.tp_degree = int(getattr(tt, "tp_degree", 1))
+
         # Init bittensor objects
         self.wallet = bt.wallet(config=self.config)
         super().__init__()
@@ -410,7 +431,7 @@ class Validator(BaseNode, Trainer):
 
         self.bootstrap_version = getattr(self.hparams, "checkpoint_init_version", None)
         tplr.logger.info(
-            f"[Miner] code_version={tplr.__version__} "
+            f"[Validator] code_version={tplr.__version__} "
             f"checkpoint_init_flag={self.bootstrap_version or '<none>'}"
         )
 
@@ -524,12 +545,22 @@ class Validator(BaseNode, Trainer):
         self.shard_reset_outer_step = getattr(
             self.hparams, "shard_reset_outer_step", None
         )
+
+        # Get anneal mode config for dataset manager
+        anneal_config = getattr(self.hparams, "anneal_mode", {})
+        anneal_enabled = anneal_config.get("enabled", False)
+        anneal_prefix = (
+            anneal_config.get("file_prefix", "anneal") if anneal_enabled else "train"
+        )
+
         self.dataset_manager = tplr.sharded_dataset.ShardedDatasetManager(
             sequence_length=self.hparams.sequence_length,
             rank=self.local_rank,  # Use local_rank for proper file operations
             world_size=self.world_size,
             comms=self.comms,
             token_dtype=np.uint32,  # Match preprocessing script dtype
+            file_prefix=anneal_prefix,
+            anneal_mode=anneal_enabled,
         )
 
         self.burn_uid = 1
@@ -1253,6 +1284,10 @@ class Validator(BaseNode, Trainer):
             self.outer_steps_per_shard,
             self.shard_reset_outer_step,
         )
+        # In anneal mode, always use shard 0
+        if self.dataset_manager.anneal_mode:
+            current_shard = 0
+            shard_epoch = 0
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
         _ = await self.dataset_manager.initialize_datasets(current_shard)
@@ -1295,31 +1330,36 @@ class Validator(BaseNode, Trainer):
             window_start = tplr.T()
 
             # Check if we need to swap dataset based on shard index change
-            shard_epoch_check, current_shard_check = (
-                tplr.sharded_dataset.compute_shard_state(
-                    self.global_step,
-                    self.outer_steps_per_shard,
-                    self.shard_reset_outer_step,
+            # Skip shard switching in anneal mode - we stay on single shard
+            anneal_config = getattr(self.hparams, "anneal_mode", {})
+            anneal_enabled = anneal_config.get("enabled", False)
+
+            if not anneal_enabled:
+                shard_epoch_check, current_shard_check = (
+                    tplr.sharded_dataset.compute_shard_state(
+                        self.global_step,
+                        self.outer_steps_per_shard,
+                        self.shard_reset_outer_step,
+                    )
                 )
-            )
-            if shard_epoch_check != last_shard_epoch:
-                tplr.logger.info(
-                    f"Resetting shard schedule at outer_step {self.global_step} "
-                    f"to shard {current_shard_check}"
-                )
-                await self.dataset_manager.initialize_datasets(current_shard_check)
-                self.set_dataloader(validator=True)
-                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
-                last_shard_epoch = shard_epoch_check
-                last_shard = current_shard_check
-            elif current_shard_check > last_shard:
-                tplr.logger.info(
-                    f"Swapping dataset after {self.global_step} outer steps at window {self.current_window}"
-                )
-                await self.dataset_manager.swap_datasets()
-                self.set_dataloader(validator=True)
-                dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
-                last_shard = current_shard_check
+                if shard_epoch_check != last_shard_epoch:
+                    tplr.logger.info(
+                        f"Resetting shard schedule at outer_step {self.global_step} "
+                        f"to shard {current_shard_check}"
+                    )
+                    await self.dataset_manager.initialize_datasets(current_shard_check)
+                    self.set_dataloader(validator=True)
+                    dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                    last_shard_epoch = shard_epoch_check
+                    last_shard = current_shard_check
+                elif current_shard_check > last_shard:
+                    tplr.logger.info(
+                        f"Swapping dataset after {self.global_step} outer steps at window {self.current_window}"
+                    )
+                    await self.dataset_manager.swap_datasets()
+                    self.set_dataloader(validator=True)
+                    dist_helper.safe_barrier("sync_shard_switch", self.local_rank)
+                    last_shard = current_shard_check
 
             self.sync_window += 1
             if self.is_master:
@@ -1655,6 +1695,10 @@ class Validator(BaseNode, Trainer):
                         positive_ratio_pct=gather_peers_positive_ratio * 100,
                     )
 
+            # [TP] Sync all ranks before master does async slashing to avoid deadlock
+            if self.world_size > 1 and dist.is_initialized():
+                dist_helper.safe_barrier("validator_pre_slashing", self.local_rank)
+
             # Only master evaluates miner sync and applies slashing
             if self.is_master:
                 await self.slash_for_poor_sync()
@@ -1858,17 +1902,9 @@ class Validator(BaseNode, Trainer):
             # Process each UID with sliding window loading
             for eval_uid in evaluation_uids:
                 uid_eval_start = time.time()
+
                 # Check if window has changed before starting evaluation
                 if self.current_window != eval_window:
-                    if self.is_master:
-                        tplr.log_with_context(
-                            level="info",
-                            message=f"Window changed during evaluation (was {eval_window},"
-                            f" now {self.current_window}), exiting evaluation loop early."
-                            f" Evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs.",
-                            sync_window=self.sync_window,
-                            current_window=self.current_window,
-                        )
                     break
 
                 # Mark this UID as attempted (for counter management)
@@ -2009,6 +2045,7 @@ class Validator(BaseNode, Trainer):
 
                 # 9. Apply gradient and compute loss after
                 apply_ok_local = True
+                exception_msg = ""
                 try:
                     gradient_apply_start = tplr.T()
                     self.update_model_with_gradient(
@@ -2028,13 +2065,25 @@ class Validator(BaseNode, Trainer):
                         )
                 except Exception as e:
                     apply_ok_local = False
-                    if self.is_master:
-                        self.slash_for_invalid_gradient(eval_uid, e)
+                    exception_msg = str(e)
 
-                # Reach group consensus before any barrier
+                # Reach group consensus before any barrier - ALL ranks must participate
                 apply_ok_global = dist_helper.all_ok(
                     apply_ok_local, self.device, tag=f"apply_grad_uid_{eval_uid}"
                 )
+
+                # Only call slash AFTER all_ok completes, so all ranks are synchronized
+                if not apply_ok_global and self.is_master:
+                    # Slash regardless of which rank failed
+                    exc = (
+                        Exception(exception_msg)
+                        if exception_msg
+                        else Exception(
+                            "Gradient application failed on at least one rank"
+                        )
+                    )
+                    self.slash_for_invalid_gradient(eval_uid, exc)
+
                 if not apply_ok_global:
                     # Restore and skip in lockstep
                     self._restore_model_state(saved_state)
@@ -3552,6 +3601,10 @@ class Validator(BaseNode, Trainer):
         clip_norm = True  # Always true in the repo 8/13/2025
         # If all validations pass, apply the gradients
 
+        # NOTE: For evaluation, we MUST use validator's own xshapes, not miner's xshapes
+        # The miner's xshapes are only used in outer_step for gradient aggregation
+        # Here we need to decompress to match the validator's model shape
+
         for n, p in model.named_parameters():
             src_rank = 0
             on_src = self.is_master or not dist_helper.is_distributed()
@@ -3602,16 +3655,21 @@ class Validator(BaseNode, Trainer):
                         if clip_norm:
                             quant_params = None  # Fast route for decompress
 
-                        # Check if we're in distributed mode
+                        # For evaluation, always use validator's own xshapes to match model shape
+                        param_xshape = self.xshapes[n]
+                        param_totalk = self.totalks[n]
+
                         # Use empty_like to avoid copying the param; just provide dtype/device/shape
-                        ref = torch.empty_like(p, device=self.device, dtype=p.dtype)
+                        ref = torch.empty(
+                            param_xshape, device=self.device, dtype=p.dtype
+                        )
 
                         decompressed = self.compressor.decompress(
                             ref,
                             idxs,
                             vals,
-                            self.xshapes[n],
-                            self.totalks[n],
+                            param_xshape,
+                            param_totalk,
                             cast("QuantParamsT | None", quant_params),
                         )
 
@@ -4021,6 +4079,18 @@ class Validator(BaseNode, Trainer):
         Re-create the *exact* index pool a miner used for (uid, window) and
         return a 128-bit hex digest **plus the expected sample count**.
         """
+        # Safe-parse TP_DEGREE
+        raw_tp = os.environ.get("TP_DEGREE")
+        if raw_tp is not None:
+            try:
+                tp_degree = max(1, int(raw_tp))
+            except (ValueError, TypeError):
+                tp_degree = int(getattr(self.hparams, "tp_degree", 1))
+        else:
+            tp_degree = int(getattr(self.hparams, "tp_degree", 1))
+
+        # Use rank=0 to get the first DP rank's indices (representative for all TP ranks)
+        # tp_degree doesn't affect _global_indices(), but pass it for consistency
         miner_sampler = tplr.MinerSampler(
             dataset=self.dataset,
             uid=uid,
@@ -4030,7 +4100,8 @@ class Validator(BaseNode, Trainer):
             batch_size=self.hparams.batch_size,
             target_batch_size=self.hparams.target_batch_size,
             rank=0,
-            world_size=1,
+            world_size=self.world_size,
+            tp_degree=tp_degree,
         )
         idxs = miner_sampler._global_indices()
         ids = miner_sampler.ids_for_indices(idxs.tolist())
