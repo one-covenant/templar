@@ -905,6 +905,221 @@ async def test_gather_timeout(comms_instance, dummy_compressor):
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_gather_rejects_sharded_gradient_shape(comms_instance, dummy_compressor):
+    """Test that gradients with mismatched (sharded) shapes are rejected.
+
+    This validates the xshapes parameter properly filters out gradients
+    that have incorrect dimensions (e.g., from miners uploading sharded
+    gradients instead of full gradients).
+    """
+    comms_instance.check_compressed_indices = (
+        lambda param_name, idxs, totalk, allowed_topk=None, vals=None: None
+    )
+    comms_instance.get_with_retry = AsyncMock()
+
+    # Expected full shape: [4096, 4096] -> vals shape should be [4096, topk]
+    # Sharded shape: [512, 4096] -> vals shape would be [512, topk]
+    topk = 4
+    full_first_dim = 16  # Simulating full gradient
+    sharded_first_dim = 4  # Simulating sharded gradient (1/4 of full)
+
+    # Peer 1: Full gradient (correct shape)
+    peer1_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(full_first_dim, topk),  # [16, 4] - correct
+            "0.weightquant_params": (
+                torch.tensor(0.0),  # shift
+                1.0,  # scale
+                0,  # offset
+                None,  # lookup
+                torch.float32,  # dtype
+            ),
+        },
+        global_step=1,
+        status="OK",
+    )
+
+    # Peer 2: Sharded gradient (incorrect shape - should be rejected)
+    peer2_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(sharded_first_dim, topk),  # [4, 4] - sharded!
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=2,
+        status="OK",
+    )
+
+    comms_instance.get_with_retry.side_effect = [peer1_response, peer2_response]
+
+    # xshapes defines expected shape: [16, 10] means vals should be [16, topk]
+    xshapes = {"0.weight": (full_first_dim, 10)}
+    totalks = {"0.weight": 10}
+
+    result = await comms_instance.gather(
+        my_uid=0,
+        uids=[1, 2],
+        window=1,
+        key="gradient",
+        timeout=5,
+        device="cpu",
+        local=True,
+        stale_retention=10,
+        totalks=totalks,
+        xshapes=xshapes,
+        compressor=dummy_compressor,
+    )
+
+    assert result is not None, "Expected a non-None result"
+    # Only peer 1 should be accepted, peer 2 should be rejected due to shape mismatch
+    assert result.uids == [1], f"Expected only UID 1 (full gradient), got {result.uids}"
+    assert len(result.global_steps) == 1, "Expected only one global step"
+
+
+@pytest.mark.asyncio
+async def test_gather_accepts_correct_gradient_shape(comms_instance, dummy_compressor):
+    """Test that gradients with correct shapes are accepted when xshapes is provided."""
+    comms_instance.check_compressed_indices = (
+        lambda param_name, idxs, totalk, allowed_topk=None, vals=None: None
+    )
+    comms_instance.get_with_retry = AsyncMock()
+
+    topk = 4
+    first_dim = 16
+
+    # Both peers have correct shape
+    peer1_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(first_dim, topk),  # [16, 4] - correct
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=1,
+        status="OK",
+    )
+
+    peer2_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(first_dim, topk),  # [16, 4] - correct
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=2,
+        status="OK",
+    )
+
+    comms_instance.get_with_retry.side_effect = [peer1_response, peer2_response]
+
+    xshapes = {"0.weight": (first_dim, 10)}
+    totalks = {"0.weight": 10}
+
+    result = await comms_instance.gather(
+        my_uid=0,
+        uids=[1, 2],
+        window=1,
+        key="gradient",
+        timeout=5,
+        device="cpu",
+        local=True,
+        stale_retention=10,
+        totalks=totalks,
+        xshapes=xshapes,
+        compressor=dummy_compressor,
+    )
+
+    assert result is not None, "Expected a non-None result"
+    # Both peers should be accepted
+    assert result.uids == [1, 2], f"Expected UIDs [1, 2], got {result.uids}"
+    assert len(result.global_steps) == 2, "Expected two global steps"
+
+
+@pytest.mark.asyncio
+async def test_gather_without_xshapes_accepts_all(comms_instance, dummy_compressor):
+    """Test that when xshapes is None, shape validation is skipped."""
+    comms_instance.check_compressed_indices = (
+        lambda param_name, idxs, totalk, allowed_topk=None, vals=None: None
+    )
+    comms_instance.get_with_retry = AsyncMock()
+
+    topk = 4
+
+    # Two peers with different shapes - both should be accepted when xshapes is None
+    peer1_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(16, topk),  # [16, 4]
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=1,
+        status="OK",
+    )
+
+    peer2_response = CommsGetResult(
+        data={
+            "0.weightidxs": create_packed_indices(list(range(topk))),
+            "0.weightvals": torch.rand(4, topk),  # [4, 4] - different shape
+            "0.weightquant_params": (
+                torch.tensor(0.0),
+                1.0,
+                0,
+                None,
+                torch.float32,
+            ),
+        },
+        global_step=2,
+        status="OK",
+    )
+
+    comms_instance.get_with_retry.side_effect = [peer1_response, peer2_response]
+
+    totalks = {"0.weight": 10}
+
+    # No xshapes provided - should skip shape validation
+    result = await comms_instance.gather(
+        my_uid=0,
+        uids=[1, 2],
+        window=1,
+        key="gradient",
+        timeout=5,
+        device="cpu",
+        local=True,
+        stale_retention=10,
+        totalks=totalks,
+        xshapes=None,  # No shape validation
+        compressor=dummy_compressor,
+    )
+
+    assert result is not None, "Expected a non-None result"
+    # Both should be accepted when xshapes is None
+    assert result.uids == [1, 2], f"Expected UIDs [1, 2], got {result.uids}"
+
+
 # Test Start Window Operations
 async def test_get_start_window(comms_instance):
     """Test fetching start window"""
