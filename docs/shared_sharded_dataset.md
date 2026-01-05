@@ -46,7 +46,7 @@ R2_DATASET_ACCOUNT_ID=8af7f92a8a0661cf7f1ac0420c932980
 R2_DATASET_BUCKET_NAME=mixed-dataset-migration
 R2_DATASET_READ_ACCESS_KEY_ID=e70cd26850f697479bbb5fd9413713f4
 R2_DATASET_READ_SECRET_ACCESS_KEY=11e3364d6ef70e44d671863fb6de32d474aa6220fa2c9c3df45c5e012ebfbda3
-DATASET_BINS_PATH="tokenized/"
+DATASET_BINS_PATH="anneal/"
 ```
 
 That's all! For the minimum setup, the dataset has been built and is available by providing those keys. The `SharedShardedDatasetManager` takes care of everything else. Unlike previously where user steps were required, now you only have to point to a bucket with the shards in it.
@@ -138,21 +138,19 @@ rclone config create r2-dest s3 \
 
 ##### Copy all shards (Full Migration)
 ```bash
-# Copy entire tokenized directory (all shards and sample IDs)
-rclone copy r2-source:mixed-dataset-migration/tokenized/ r2-dest:<your-bucket-name>/tokenized/ \
+# Copy entire anneal directory (all shards and sample IDs)
+rclone copy r2-source:mixed-dataset-migration/anneal/ r2-dest:<your-bucket-name>/anneal/ \
   --transfers 32 \
   --checkers 16 \
   --progress
 ```
 
 ##### Copy specific shards (Partial Migration for Testing)
-If you want to test with just the first two shards:
+If you want to test with just the first shard:
 ```bash
-# Copy first two training shards and their sample IDs
-rclone copy r2-source:mixed-dataset-migration/tokenized/train_000000.npy r2-dest:<your-bucket-name>/tokenized/ --progress
-rclone copy r2-source:mixed-dataset-migration/tokenized/train_000001.npy r2-dest:<your-bucket-name>/tokenized/ --progress
-rclone copy r2-source:mixed-dataset-migration/tokenized/sample_ids_000000.npy r2-dest:<your-bucket-name>/tokenized/ --progress
-rclone copy r2-source:mixed-dataset-migration/tokenized/sample_ids_000001.npy r2-dest:<your-bucket-name>/tokenized/ --progress
+# Copy first training shard and its sample IDs
+rclone copy r2-source:mixed-dataset-migration/anneal/anneal_000000.npy r2-dest:<your-bucket-name>/anneal/ --progress
+rclone copy r2-source:mixed-dataset-migration/anneal/sample_ids_anneal_000000.npy r2-dest:<your-bucket-name>/anneal/ --progress
 ```
 
 After migration, update your environment variables to point to your bucket:
