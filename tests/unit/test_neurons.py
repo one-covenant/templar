@@ -3,11 +3,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 import torch
 
 from tplr.neurons import (
     catchup_with_aggregation_server,
+    check_uid_index_overlap,
     compare_model_with_debug_dict,
     determine_slash_egregiousness,
     instantiate_slashing_multiplier,
@@ -48,30 +48,28 @@ class TestSlashingUtils(unittest.TestCase):
 class TestCompareModelWithDebugDict(unittest.TestCase):
     def setUp(self):
         self.model = MagicMock()
-        # Create a proper parameter-like object with all required attributes
-        self.param1 = torch.nn.Parameter(
-            torch.tensor([1.0, 2.0, 3.0]), requires_grad=False
-        )
+        self.param1 = MagicMock()
+        self.param1.data = torch.tensor([1.0, 2.0, 3.0])
+        self.param1.dtype = torch.float32
         self.model.named_parameters.return_value = [("param1", self.param1)]
 
     def test_compare_model_with_debug_dict_perfect_match(self):
-        # Debug dict should contain first 2 elements (index_range default is (0, 2))
-        debug_dict = {"param1_debug": [1.0, 2.0]}
+        debug_dict = {"param1_debug": [1.0, 2.0, 3.0]}
         result = asyncio.run(
-            compare_model_with_debug_dict(self.model, debug_dict, 0.01)
+            compare_model_with_debug_dict(
+                self.model, debug_dict, 0.01, index_range=(0, 3)
+            )
         )
         self.assertTrue(result["success"])
         self.assertAlmostEqual(result["l2_norm"], 0.0)
         self.assertAlmostEqual(result["avg_steps_behind"], 0.0)
 
-    @pytest.mark.skip(
-        reason="TODO: Fix NaN issue in avg_steps_behind calculation with mocked parameters"
-    )
     def test_compare_model_with_debug_dict_mismatch(self):
-        # Debug dict should contain first 2 elements (but with different values)
-        debug_dict = {"param1_debug": [1.2, 2.3]}
+        debug_dict = {"param1_debug": [1.1, 2.2, 3.3]}
         result = asyncio.run(
-            compare_model_with_debug_dict(self.model, debug_dict, 0.01)
+            compare_model_with_debug_dict(
+                self.model, debug_dict, 0.01, index_range=(0, 3)
+            )
         )
         self.assertTrue(result["success"])
         self.assertGreater(result["l2_norm"], 0.0)
@@ -478,9 +476,7 @@ class TestCatchupWithAggregationServer(unittest.TestCase):
         # Assert
         self.assertEqual(self.instance.comms.get.call_count, 5)
         self.assertEqual(mock_outer_step.call_count, 2)  # Should only step on success
-        self.assertEqual(
-            mock_broadcast.call_count, 5
-        )  # Two per successful window + one for failed window
+        self.assertEqual(mock_broadcast.call_count, 3)  # One for each window iteration
         mock_barrier.assert_called()
 
     @patch("tplr.distributed.dist_helper.safe_barrier")
@@ -524,9 +520,7 @@ class TestCatchupWithAggregationServer(unittest.TestCase):
         # Assert
         self.assertEqual(self.instance.comms.get.call_count, 8)
         self.assertEqual(mock_outer_step.call_count, 4)
-        self.assertEqual(
-            mock_broadcast.call_count, 8
-        )  # Two per window iteration (has_debug_dict + comparison)
+        self.assertEqual(mock_broadcast.call_count, 4)  # One for each window iteration
         mock_barrier.assert_called()
 
     @patch("tplr.distributed.dist_helper.safe_barrier")
@@ -571,11 +565,47 @@ class TestCatchupWithAggregationServer(unittest.TestCase):
         # Assert
         self.assertEqual(self.instance.comms.get.call_count, 3)
         self.assertEqual(mock_outer_step.call_count, 1)  # Should only step on success
-        self.assertEqual(
-            mock_broadcast.call_count, 3
-        )  # One for failed window, two for successful window
+        self.assertEqual(mock_broadcast.call_count, 2)  # One for each window iteration
         mock_barrier.assert_called()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCheckUidIndexOverlap(unittest.TestCase):
+    async def test_no_overlap(self):
+        uids = [1, 2, 3]
+        uid_to_indices = {1: {1, 2}, 2: {3, 4}, 3: {5, 6}}
+        result = await check_uid_index_overlap(uids, uid_to_indices, window=0)
+        self.assertEqual(result, {})
+
+    async def test_single_overlap(self):
+        uids = [1, 2, 3]
+        uid_to_indices = {1: {1, 2}, 2: {2, 3}, 3: {4, 5}}
+        result = await check_uid_index_overlap(uids, uid_to_indices, window=0)
+        self.assertEqual(result, {(1, 2): {2}})
+
+    async def test_multiple_overlaps(self):
+        uids = [1, 2, 3, 4]
+        uid_to_indices = {
+            1: {1, 2, 3},
+            2: {3, 4, 5},
+            3: {5, 6, 7},
+            4: {1, 7, 8},
+        }
+        result = await check_uid_index_overlap(uids, uid_to_indices, window=0)
+        self.assertEqual(
+            result,
+            {(1, 2): {3}, (1, 4): {1}, (2, 3): {5}, (3, 4): {7}},
+        )
+
+    async def test_empty_input(self):
+        result = await check_uid_index_overlap([], {}, window=0)
+        self.assertEqual(result, {})
+
+    async def test_uids_not_in_dict(self):
+        uids = [1, 2, 3]
+        uid_to_indices = {1: {1, 2}}
+        with self.assertRaises(KeyError):
+            await check_uid_index_overlap(uids, uid_to_indices, window=0)

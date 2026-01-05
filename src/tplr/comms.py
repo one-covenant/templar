@@ -47,14 +47,6 @@ from tplr.compress import TopKCompressor, unpack_12bit_indices
 from tplr.config import BUCKET_SECRETS, client_config
 from tplr.schemas import Bucket, CommsGetResult
 
-# Add DTensor types to safe globals for torch.load with weights_only=True
-try:
-    from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
-
-    torch.serialization.add_safe_globals([_StridedShard, Replicate, Shard])
-except ImportError:
-    pass  # DTensor not available, skip
-
 # Constants
 CF_REGION_NAME: str = "enam"
 LOCAL_TMP_DIR = "/tmp/local_store"
@@ -104,9 +96,7 @@ class Comms(ChainManager):
         self.wallet = wallet
 
         # Create temp directory for this instance
-        # Respect TMPDIR environment variable, fallback to /tmp
-        base_tmp = os.getenv("TMPDIR", "/tmp")
-        self.temp_dir = os.path.join(base_tmp, f"templar_{self.uid}")
+        self.temp_dir = os.path.join("/tmp", f"templar_{self.uid}")
         os.makedirs(self.temp_dir, exist_ok=True)
         # Get the bucket directly
         self.bucket = self.get_own_bucket("gradients", "write")
@@ -1321,9 +1311,7 @@ class Comms(ChainManager):
         put_start = tplr.T()
 
         # Create per-uid temp directory
-        # Respect TMPDIR environment variable, fallback to /tmp
-        base_tmp = os.getenv("TMPDIR", "/tmp")
-        temp_dir = os.path.join(base_tmp, str(self.uid))
+        temp_dir = os.path.join("/tmp", str(self.uid))
         os.makedirs(temp_dir, exist_ok=True)
         temp_file_path = os.path.join(temp_dir, f"temp_{filename}")
 
@@ -1629,6 +1617,7 @@ class Comms(ChainManager):
         stale_retention: int = 10,
         time_min: datetime | None = None,
         time_max: datetime | None = None,
+        xshapes: dict[str, tuple] | None = None,
     ) -> SimpleNamespace | None:
         """
         Gathers and processes gradients from a list of peer UIDs.
@@ -1658,6 +1647,9 @@ class Comms(ChainManager):
                 gradients. Defaults to None.
             time_max (datetime | None, optional): The maximum modification time for
                 gradients. Defaults to None.
+            xshapes (dict[str, tuple] | None, optional): Expected shapes for gradient
+                tensors, used to validate that received gradients have the correct
+                dimensions. Defaults to None.
 
         Returns:
             SimpleNamespace | None: A namespace containing the aggregated state dict,
@@ -1859,6 +1851,28 @@ class Comms(ChainManager):
                                 )
                                 valid_response = False
                                 break
+
+                            # ------------------------------------------------------
+                            # (3)  Validate vals shape matches expected model shape
+                            # ------------------------------------------------------
+                            if xshapes is not None:
+                                base_name = param_name[:-4]  # Remove "vals" suffix
+                                expected_shape = xshapes.get(base_name)
+                                if expected_shape is not None:
+                                    # vals.shape should be xshape[:-1] + [topk]
+                                    # So vals.shape[:-1] should match xshape[:-1]
+                                    expected_vals_prefix = expected_shape[:-1]
+                                    actual_vals_prefix = tensor.shape[:-1]
+                                    if tuple(actual_vals_prefix) != tuple(
+                                        expected_vals_prefix
+                                    ):
+                                        tplr.logger.warning(
+                                            f"Shape mismatch for {param_name} from UID {uid}: "
+                                            f"expected shape prefix {expected_vals_prefix}, "
+                                            f"got {actual_vals_prefix} (likely sharded gradient)"
+                                        )
+                                        valid_response = False
+                                        break
 
                     missing_params = (
                         expected_compressed_params - received_compressed_params
