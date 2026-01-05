@@ -122,7 +122,13 @@ class SharedShardedDataset(Dataset):
             )
 
         tokens_file = os.path.join(shards_path, f"{file_prefix}_{shard_index:06d}.npy")
-        ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.npy")
+        # For anneal mode, sample_ids files use "sample_ids_anneal_" prefix
+        if file_prefix == "anneal":
+            ids_file = os.path.join(
+                shards_path, f"sample_ids_{file_prefix}_{shard_index:06d}.npy"
+            )
+        else:
+            ids_file = os.path.join(shards_path, f"sample_ids_{shard_index:06d}.npy")
 
         return tokens_file, ids_file
 
