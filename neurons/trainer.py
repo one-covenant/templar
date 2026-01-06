@@ -178,14 +178,11 @@ class Trainer:
                 total_iters=warmup_inner_steps,
             )
             # Decay from peak_lr_factor down to eta_min_factor
-            # end_factor is relative to current LR, so we compute the ratio
-            decay_end_factor = (
-                eta_min_factor / peak_lr_factor if peak_lr_factor > 0 else 0.0
-            )
+            # Both factors are relative to base_lr, ensuring no discontinuity
             decay_scheduler = lr_scheduler.LinearLR(
                 self.inner_optimizer,
-                start_factor=1.0,
-                end_factor=decay_end_factor,
+                start_factor=peak_lr_factor,
+                end_factor=eta_min_factor,
                 total_iters=total_decay_steps,
             )
             inner_scheduler = lr_scheduler.SequentialLR(
