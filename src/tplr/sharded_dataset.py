@@ -396,7 +396,7 @@ class ShardedDatasetManager:
 
         self.active_dataset = await self.create_dataset(current_shard_index)
 
-        # In anneal mode, don't prepare next shard (we stay on shard 0)
+        # In anneal mode, don't prepare next shard (we stay on one shard)
         if self.anneal_mode:
             self.upcoming_dataset = asyncio.create_task(asyncio.sleep(0))
             return
