@@ -1095,10 +1095,36 @@ class Comms(ChainManager):
 
                         except asyncio.CancelledError:
                             raise
-                        except Exception as e:
-                            tplr.logger.error(
-                                f"Error downloading chunk {chunk_number} (attempt {attempt + 1}/{max_retries}): {e}"
+                        except asyncio.TimeoutError:
+                            tplr.logger.warning(
+                                f"Timeout downloading chunk {chunk_number} (attempt {attempt + 1}/{max_retries}) - "
+                                f"possible rate limiting or slow network"
                             )
+                            if attempt == max_retries - 1:
+                                raise
+                            await asyncio.sleep((2**attempt) + random.uniform(0, 1))
+                        except Exception as e:
+                            # Check for rate limiting indicators
+                            error_str = str(e).lower()
+                            if any(
+                                indicator in error_str
+                                for indicator in [
+                                    "429",
+                                    "throttl",
+                                    "slow down",
+                                    "rate limit",
+                                    "503",
+                                    "service unavailable",
+                                    "too many",
+                                ]
+                            ):
+                                tplr.logger.error(
+                                    f"RATE LIMITING DETECTED downloading chunk {chunk_number}: {e}"
+                                )
+                            else:
+                                tplr.logger.error(
+                                    f"Error downloading chunk {chunk_number} (attempt {attempt + 1}/{max_retries}): {e}"
+                                )
                             if attempt == max_retries - 1:
                                 raise
                             await asyncio.sleep((2**attempt) + random.uniform(0, 1))
@@ -1700,9 +1726,20 @@ class Comms(ChainManager):
 
             try:
                 download_start = tplr.T()
-                batch_responses = await asyncio.gather(
-                    *batch_tasks, return_exceptions=True
-                )
+                # Overall timeout for all downloads: 10 minutes max
+                # This prevents indefinite hangs from rate limiting or network issues
+                gather_timeout = 600  # 10 minutes
+                try:
+                    batch_responses = await asyncio.wait_for(
+                        asyncio.gather(*batch_tasks, return_exceptions=True),
+                        timeout=gather_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    tplr.logger.error(
+                        f"Gather download phase timed out after {gather_timeout}s - "
+                        f"possible rate limiting or network issue. Aborting gather."
+                    )
+                    return None
                 tplr.logger.info(
                     f"{tplr.P(window, tplr.T() - download_start)} Downloaded peer gradients <--"
                 )
