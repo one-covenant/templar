@@ -3,8 +3,8 @@
     "anneal_mode": {
       "enabled": true,
       "start_global_step": 6100,
-      "warmup_inner_steps": 200,
-      "decay_outer_steps": 550,
+      "warmup_inner_steps": 100,
+      "decay_outer_steps": 120,
       "peak_lr_factor": 0.25,
       "eta_min_factor": 0.0,
       "file_prefix": "anneal"
