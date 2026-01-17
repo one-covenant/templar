@@ -1263,9 +1263,9 @@ class Validator(BaseNode, Trainer):
             self.outer_steps_per_shard,
             self.shard_reset_outer_step,
         )
-        # In anneal mode, always use shard 2
+        # In anneal mode, always use shard 4
         if self.dataset_manager.anneal_mode:
-            current_shard = 2
+            current_shard = 4
             shard_epoch = 0
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
