@@ -19,6 +19,7 @@
 import asyncio
 import gc
 import math
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -42,6 +43,30 @@ if TYPE_CHECKING:
     from neurons.validator import Validator
 
 NeuronT = TypeVar("NeuronT", "Miner", "Validator")
+
+
+def _resolve_cuda_device(device: str | torch.device | None) -> torch.device | None:
+    """Return a torch.device for CUDA operations if available."""
+    if not torch.cuda.is_available():
+        return None
+
+    if device is None:
+        try:
+            current_index = torch.cuda.current_device()
+        except RuntimeError:
+            if torch.cuda.device_count() == 0:
+                return None
+            return torch.device("cuda:0")
+        return torch.device(f"cuda:{current_index}")
+
+    try:
+        resolved = torch.device(device)
+    except (TypeError, ValueError, RuntimeError):
+        if torch.cuda.device_count() == 0:
+            return None
+        return torch.device("cuda:0")
+
+    return resolved if resolved.type == "cuda" else None
 
 
 def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = False):
@@ -239,6 +264,55 @@ def outer_step(
     global_step: int | None = None,
 ) -> dict | None:
     """
+    Apply aggregated gradients from peers to the model.
+
+    Distributed gather merges partials internally, so this function always
+    receives a single merged result (not a list of partials).
+
+    Memory-minimizing implementation:
+      - Builds and applies ONE param's grad at a time
+      - Calls optimizer.step() per param (others have grad=None, so they're skipped)
+      - Frees all temporaries and grad immediately after each step
+
+    Returns:
+      Fingerprint dict containing gradient statistics (master rank only), or None.
+    """
+    return _outer_step_single(
+        model=model,
+        optimizer=optimizer,
+        gather_result=gather_result,
+        transformer=transformer,
+        compressor=compressor,
+        xshapes=xshapes,
+        totalks=totalks,
+        device=device,
+        is_master=is_master,
+        world_size=world_size,
+        use_dct=use_dct,
+        wandb_run=wandb_run,
+        global_step=global_step,
+    )
+
+
+def _outer_step_single(
+    model: nn.Module,
+    optimizer: Optimizer,
+    *,
+    gather_result: SimpleNamespace | None,
+    transformer: tplr.compress.ChunkingTransformer,
+    compressor: tplr.compress.TopKCompressor,
+    xshapes: dict,
+    totalks: dict,
+    device: str,
+    is_master: bool,
+    world_size: int,
+    use_dct: bool = False,
+    wandb_run: Run | None = None,
+    global_step: int | None = None,
+) -> dict | None:
+    """
+    Original single-result outer step implementation.
+
     Memory-minimizing variant:
       - Builds and applies ONE param's grad at a time.
       - Calls optimizer.step() per param (others have grad=None, so they're skipped).
@@ -255,6 +329,7 @@ def outer_step(
     ddp = world_size > 1 and dist.is_available() and dist.is_initialized()
     src_rank = 0
     on_src = is_master or not ddp
+    cuda_device = _resolve_cuda_device(device)
 
     # Only master reads aggregated payload (others rely on broadcasts).
     # Accept both SimpleNamespace and plain dict payloads.
@@ -1104,7 +1179,7 @@ async def catchup_with_aggregation_server(
         if instance.is_master and (start_w - checkpoint_current_window) % 5 == 0:
             log_memory_usage(f"After window {start_w} cleanup")
         # ──────────────────────────────────────────────────────────────────────
-        # 3) Debug‑dict comparison to estimate “how many steps behind” we are
+        # 3) Debug‑dict comparison to estimate "how many steps behind" we are
         # ──────────────────────────────────────────────────────────────────────
         try:
             if instance.is_master:
@@ -1297,7 +1372,7 @@ async def compare_model_with_debug_dict(
 @torch.no_grad()
 async def check_uid_index_overlap(
     neuron: NeuronT,
-    gather_result: SimpleNamespace,
+    gather_result: SimpleNamespace | list[SimpleNamespace],
     window: int,
     *,
     overlap_threshold: float = 0.90,
@@ -1306,10 +1381,36 @@ async def check_uid_index_overlap(
     For every peer-pair compute the per-chunk *set* overlap of their top-k index
     lists on each parameter.  A pair is flagged **only if the size-weighted
     average across *all* checked parameters** is ≥ `overlap_threshold`.
+
+    Supports both merged results (typical usage) and partial results (for flexibility).
     """
 
-    # ── 0. basic sanity ───────────────────────────────────────────────────
-    uids: list[int] = list(getattr(gather_result, "uids", []))
+    # ── 0. Extract UIDs and state_dicts from either partials or merged ────
+    if isinstance(gather_result, list):
+        # Partials: collect UIDs and state_dicts from all partials
+        all_uids: list[int] = []
+        all_state_dicts: list = []
+        # Create UID-to-partial mapping for O(1) lookup (optimization for O(n×m) → O(n))
+        uid_to_partial: dict[int, tuple[SimpleNamespace, int]] = {}
+
+        for partial in gather_result:
+            if partial is not None:
+                partial_uids = getattr(partial, "uids", [])
+                all_uids.extend(partial_uids)
+                # Store state_dict along with its UIDs for later lookup
+                for idx, uid in enumerate(partial_uids):
+                    all_state_dicts.append(partial.state_dict)
+                    # Map UID to (partial, index_in_partial) for O(1) lookup
+                    uid_to_partial[uid] = (partial, idx)
+
+        uids = all_uids
+        # state_dicts[i] corresponds to uids[i]
+    else:
+        # Merged result: traditional path
+        uids = list(getattr(gather_result, "uids", []))
+        # All UIDs share the same merged state_dict
+        all_state_dicts = [gather_result.state_dict] * len(uids)
+        uid_to_partial = None  # Not needed for merged results
     Ptot = len(uids)
     if Ptot < 2:
         tplr.logger.info("[overlap] <2 peers – skip")
@@ -1341,27 +1442,59 @@ async def check_uid_index_overlap(
     # ── 2. iterate over parameters that have compressed indices ───────────
     for pname, _ in neuron.model.named_parameters():
         idx_key = pname + "idxs"
-        idxs_all = getattr(gather_result.state_dict, idx_key, None)
-        if idxs_all is None:
-            continue
-
-        # Get values for unpacking shape
         vals_key = pname + "vals"
-        vals_all = getattr(gather_result.state_dict, vals_key, None)
-        if vals_all is None:
-            continue
 
         # Unpack all 12-bit packed indices using values shape
+        # Now each UID has its own state_dict
         unpacked_indices = []
+        valid_uids_for_param = []
+
         for i in range(Ptot):
-            idx_data = idxs_all[i] if isinstance(idxs_all, list) else idxs_all
-            val_data = vals_all[i] if isinstance(vals_all, list) else vals_all
+            state_dict = all_state_dicts[i]
+
+            # Get indices and values from this UID's state_dict
+            if isinstance(gather_result, list):
+                # Partials: use O(1) lookup instead of O(m) search
+                # Direct lookup instead of searching (O(n×m) → O(n) optimization)
+                if uids[i] not in uid_to_partial:
+                    continue
+
+                partial, uid_idx_in_partial = uid_to_partial[uids[i]]
+                state_dict = partial.state_dict
+
+                idxs_list = getattr(state_dict, idx_key, None)
+                vals_list = getattr(state_dict, vals_key, None)
+
+                if (
+                    idxs_list is None
+                    or vals_list is None
+                    or uid_idx_in_partial >= len(idxs_list)
+                ):
+                    continue
+
+                idx_data = idxs_list[uid_idx_in_partial]
+                val_data = vals_list[uid_idx_in_partial]
+            else:
+                # Merged: traditional indexing
+                idxs_list = getattr(state_dict, idx_key, None)
+                vals_list = getattr(state_dict, vals_key, None)
+
+                if idxs_list is None or vals_list is None:
+                    continue
+
+                idx_data = idxs_list[i] if isinstance(idxs_list, list) else idxs_list
+                val_data = vals_list[i] if isinstance(vals_list, list) else vals_list
 
             # 12-bit packed format - use values shape for unpacking
             unpacked = unpack_12bit_indices(
                 idx_data.to(neuron.config.device), val_data.shape
             )
             unpacked_indices.append(unpacked)
+            valid_uids_for_param.append(i)
+
+        if len(unpacked_indices) < 2:
+            # Not enough peers have this parameter
+            continue
 
         idxs_tensor = torch.stack(unpacked_indices, dim=0)
         P, *chunk_dims, k = idxs_tensor.shape
@@ -1370,6 +1503,7 @@ async def check_uid_index_overlap(
 
         param_weight = C * k  # size weight
 
+        # Compare pairs using original UID indices for consistent keys
         for i in range(P):
             for j in range(i + 1, P):
                 a = idxs_flat[i].unsqueeze(-1)  # (C,k,1)
@@ -1380,7 +1514,10 @@ async def check_uid_index_overlap(
                 total_weighted_sum += mean_frac * param_weight
                 total_weight += param_weight
 
-                acc = pair_acc[(i, j)]
+                # Use original UID indices (from valid_uids_for_param) for pair keys
+                uid_idx_i = valid_uids_for_param[i]
+                uid_idx_j = valid_uids_for_param[j]
+                acc = pair_acc[(uid_idx_i, uid_idx_j)]
                 acc[0] += mean_frac * param_weight
                 acc[1] += param_weight
 

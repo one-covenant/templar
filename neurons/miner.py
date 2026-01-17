@@ -28,12 +28,18 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+
+# Set CUDA memory allocator config before importing torch
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 from types import SimpleNamespace
 from typing import cast
 
 import bittensor as bt
 import numpy as np
 import torch
+import torch.distributed as dist
 import uvloop
 from torch.amp.grad_scaler import GradScaler
 from torch.distributed.tensor import DTensor as DT
@@ -486,6 +492,26 @@ class Miner(BaseNode, Trainer):
                 await tplr.neurons.update_peers(
                     instance=self, window=step_window, peer_start=peer_start
                 )
+                # Refresh commitments to get updated bucket info for all peers
+                self.comms.commitments = await self.comms.get_commitments()
+
+            # Broadcast peer / reserve lists and commitments from master to all ranks for distributed gather
+            if dist_helper.world_size > 1 and dist_helper.is_distributed():
+                payload = (
+                    [self.comms.peers, self.comms.reserve_peers, self.comms.commitments]
+                    if self.is_master
+                    else [None, None, None]
+                )
+                dist.broadcast_object_list(payload, src=0)
+                self.comms.peers = payload[0]
+                self.comms.reserve_peers = payload[1]
+                self.comms.commitments = payload[2]
+
+                if not self.is_master:
+                    tplr.logger.info(
+                        f"[Rank {dist_helper.rank}] Received peers from master: gather={self.comms.peers}, reserve={self.comms.reserve_peers}"
+                    )
+
             peer_update_time = tplr.T() - peer_start
 
             # 2. Load data
@@ -566,6 +592,15 @@ class Miner(BaseNode, Trainer):
                     )
             else:
                 tplr.logger.info("Start accumulating...")
+
+            # Aggressive memory cleanup before training to prevent OOM
+            # This ensures memory from previous outer step is fully released
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            # Clear any lingering gradients
+            if hasattr(self, "model") and self.model is not None:
+                self.model.zero_grad(set_to_none=True)
 
             res = await self.inner_steps(
                 loader=self.loader, step_window=step_window, null_round=null_round
@@ -744,19 +779,36 @@ class Miner(BaseNode, Trainer):
             gather_time = 0.0
             should_update = True
 
-            if self.is_master:
-                gather_start = tplr.T()
-                tplr.logger.info("Waiting on gather task...")
+            # Use distributed gather automatically when running with multiple ranks
+            use_distributed_gather = (
+                dist_helper.world_size > 1 and dist_helper.is_distributed()
+            )
+
+            gather_start = tplr.T()
+
+            # Log gather mode
+            if use_distributed_gather:
+                tplr.logger.info(
+                    f"[Rank {dist_helper.rank}] Starting distributed gather from {len(self.comms.peers)} peer(s) (world_size={dist_helper.world_size})"
+                )
+            elif self.is_master:
+                tplr.logger.info(
+                    f"Starting sequential gather from {len(self.comms.peers)} peer(s)"
+                )
+
+            # For distributed gather, all ranks must participate (for collective operations)
+            # For sequential gather, only master rank performs the operation
+            if self.is_master or use_distributed_gather:
                 gather_result = await self.comms.gather_with_reserve(
                     my_uid=self.uid,
                     gather_uids=self.comms.peers,
-                    reserve_uids=self.comms.reserve_peers,
+                    reserve_uids=self.comms.reserve_peers,  # Miners gather same way as validator
+                    return_partials=False,  # Always return merged result (distributed gather merges internally)
                     window=step_window,
                     key="gradient",
                     timeout=90,
                     device=str(self.device),
                     local=False,
-                    stale_retention=100,
                     totalks=self.totalks,
                     xshapes=self.xshapes,
                     compressor=self.compressor,
@@ -764,11 +816,45 @@ class Miner(BaseNode, Trainer):
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
                 )
-                tplr.logger.info("Gather task completed!")
                 gather_time = tplr.T() - gather_start
-                should_update = gather_result is not None
 
-            # Broadcast whether we should update to all ranks
+                # Log gather completion
+                if use_distributed_gather:
+                    if gather_result is not None:
+                        tplr.logger.info(
+                            f"[Rank {dist_helper.rank}] Distributed gather complete: {len(gather_result.uids)}/{len(self.comms.peers)} successful, "
+                            f"{len(gather_result.skipped_uids)} skipped, success_rate={gather_result.success_rate:.2%}, "
+                            f"time={gather_time:.2f}s"
+                        )
+                    else:
+                        tplr.logger.warning(
+                            f"[Rank {dist_helper.rank}] Distributed gather failed - no gradients collected from peers"
+                        )
+                else:
+                    # Sequential gather logging (master only)
+                    if gather_result is not None:
+                        tplr.logger.info(
+                            f"Sequential gather complete: {len(gather_result.uids)}/{len(self.comms.peers)} successful, "
+                            f"{len(gather_result.skipped_uids)} skipped, "
+                            f"success_rate={gather_result.success_rate:.2%}, "
+                            f"time={gather_time:.2f}s"
+                        )
+                    else:
+                        tplr.logger.warning(
+                            "Sequential gather failed - no gradients collected from peers"
+                        )
+
+                # For distributed gather: only master checks result, others will follow master's decision
+                # For sequential gather: only master has result anyway
+                if use_distributed_gather:
+                    # Master checks if gather succeeded, non-master ranks defer to master
+                    should_update = (
+                        gather_result is not None if self.is_master else True
+                    )
+                else:
+                    should_update = gather_result is not None
+
+            # Broadcast whether we should update to all ranks (master's decision)
             should_update = dist_helper.all_ok(
                 should_update, self.device, "gather_update"
             )
@@ -793,6 +879,11 @@ class Miner(BaseNode, Trainer):
                 self.global_step += (
                     1  # Increment only when we actually do an outer step
                 )
+
+                # Clear gradients after outer step
+                if hasattr(self, "model") and self.model is not None:
+                    self.model.zero_grad(set_to_none=True)
+
                 model_update_time = tplr.T() - update_start
                 if gradient_fingerprint is not None:
                     tplr.logger.info(
@@ -844,12 +935,13 @@ class Miner(BaseNode, Trainer):
 
                 # Add successful peers information
                 if gather_result is not None:
+                    successful_uids = set(gather_result.uids)
+                    skipped_uids = set(gather_result.skipped_uids)
+
                     debug_dict["successful_peers"] = sorted(
-                        list(set(self.comms.peers) - set(gather_result.skipped_uids))
+                        list(set(self.comms.peers) - skipped_uids)
                     )
-                    debug_dict["skipped_peers"] = sorted(
-                        list(gather_result.skipped_uids)
-                    )
+                    debug_dict["skipped_peers"] = sorted(list(skipped_uids))
 
                 # Store the debug dictionary
                 await self.comms.put(
@@ -884,9 +976,14 @@ class Miner(BaseNode, Trainer):
                     sum(momentum_norms) / len(momentum_norms) if momentum_norms else 0
                 )
                 window_total_time = tplr.T() - window_start
-                gather_success_rate = (
-                    gather_result.success_rate * 100 if gather_result else 0.0
-                )
+
+                # Calculate success rate and extract skipped UIDs
+                if gather_result is None:
+                    gather_success_rate = 0.0
+                    skipped_uids_list = []
+                else:
+                    gather_success_rate = gather_result.success_rate * 100
+                    skipped_uids_list = list(gather_result.skipped_uids)
                 inner_lr = self.inner_scheduler.get_last_lr()[0]
 
                 # Only log to WandB when we've performed an outer step
@@ -950,9 +1047,7 @@ class Miner(BaseNode, Trainer):
                         "n_gather_peers": int(len(self.comms.peers)),
                         "gather_success_rate": gather_success_rate,
                         "gather_peers": json.dumps(self.comms.peers),
-                        "skipped_peers": json.dumps(
-                            gather_result.skipped_uids if gather_result else []
-                        ),
+                        "skipped_peers": json.dumps(skipped_uids_list),
                         "window_total_time": window_total_time,
                         "peer_update_time": peer_update_time,
                         "compression_time": compression_time,
@@ -969,10 +1064,15 @@ class Miner(BaseNode, Trainer):
 
             dist_helper.safe_barrier("post_outer_step", self.local_rank)
 
-            # Delete any remaining local variables to clear up memory
+            # Delete local variables and force cleanup
             del shard_gradient
             if gather_result is not None:
+                # Clear state_dict to free memory
+                if hasattr(gather_result, "state_dict"):
+                    if hasattr(gather_result.state_dict, "__dict__"):
+                        gather_result.state_dict.__dict__.clear()
                 del gather_result
+            gc.collect()
             torch.cuda.empty_cache()
             # Check memory threshold periodically
             self.check_memory_threshold(threshold_gb=0.5)
