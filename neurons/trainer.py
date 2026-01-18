@@ -456,6 +456,22 @@ class Trainer:
                     labels == self.tokenizer.pad_token_id, -100, labels
                 )
 
+                # Skip batch if all labels are masked (would cause NaN in cross_entropy)
+                # Make skip decision collective to avoid breaking ddp_reduce later
+                has_valid_labels = (labels != -100).any().item()
+                all_have_valid = dist_helper.all_ok(has_valid_labels, device)
+                if not all_have_valid:
+                    if dist_helper.is_master:
+                        tplr.log_with_context(
+                            level="warning",
+                            message="Batch has all labels masked (-100) on at least one rank; "
+                            "skipping synchronously to avoid NaN/desync",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+                    del input_ids, labels
+                    continue
+
                 with autocast(device_type=device.type, dtype=torch.bfloat16):
                     logits = model(input_ids)
 
@@ -838,6 +854,19 @@ class Trainer:
                     labels = torch.where(
                         labels == self.tokenizer.pad_token_id, -100, labels
                     )
+
+                    # Skip batch if all labels are masked (would cause NaN in cross_entropy)
+                    # Make skip decision collective to avoid breaking ddp_reduce later
+                    has_valid_labels = (labels != -100).any().item()
+                    all_have_valid = dist_helper.all_ok(has_valid_labels, self.device)
+                    if not all_have_valid:
+                        if self.is_master:
+                            tplr.logger.warning(
+                                "Batch has all labels masked (-100) on at least one rank; "
+                                "skipping synchronously to avoid NaN/desync"
+                            )
+                        del input_ids, labels
+                        continue
 
                 # ------------------------------------------------------------------ #
                 # 3. Forward + backward
