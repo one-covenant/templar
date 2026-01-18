@@ -148,9 +148,9 @@ rclone copy r2-source:mixed-dataset-migration/anneal/ r2-dest:<your-bucket-name>
 ##### Copy specific shards (Partial Migration for Testing)
 If you want to test with the current anneal shard:
 ```bash
-# Copy anneal shard 4 and its sample IDs
-rclone copy r2-source:mixed-dataset-migration/anneal/anneal_000004.npy r2-dest:<your-bucket-name>/anneal/ --progress
-rclone copy r2-source:mixed-dataset-migration/anneal/sample_ids_anneal_000004.npy r2-dest:<your-bucket-name>/anneal/ --progress
+# Copy anneal shard 5 and its sample IDs
+rclone copy r2-source:mixed-dataset-migration/anneal/anneal_000005.npy r2-dest:<your-bucket-name>/anneal/ --progress
+rclone copy r2-source:mixed-dataset-migration/anneal/sample_ids_anneal_000005.npy r2-dest:<your-bucket-name>/anneal/ --progress
 ```
 
 After migration, update your environment variables to point to your bucket:
