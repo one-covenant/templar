@@ -457,14 +457,18 @@ class Trainer:
                 )
 
                 # Skip batch if all labels are masked (would cause NaN in cross_entropy)
-                valid_labels = (labels != -100).sum().item()
-                if valid_labels == 0:
-                    tplr.log_with_context(
-                        level="warning",
-                        message=f"Batch {i} has all labels masked (-100), skipping to avoid NaN",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                    )
+                # Make skip decision collective to avoid breaking ddp_reduce later
+                has_valid_labels = (labels != -100).any().item()
+                all_have_valid = dist_helper.all_ok(has_valid_labels, device)
+                if not all_have_valid:
+                    if dist_helper.is_master:
+                        tplr.log_with_context(
+                            level="warning",
+                            message="Batch has all labels masked (-100) on at least one rank; "
+                            "skipping synchronously to avoid NaN/desync",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
                     del input_ids, labels
                     continue
 
@@ -852,11 +856,15 @@ class Trainer:
                     )
 
                     # Skip batch if all labels are masked (would cause NaN in cross_entropy)
-                    valid_labels = (labels != -100).sum().item()
-                    if valid_labels == 0:
-                        tplr.logger.warning(
-                            f"Batch {batch_count} has all labels masked (-100), skipping to avoid NaN"
-                        )
+                    # Make skip decision collective to avoid breaking ddp_reduce later
+                    has_valid_labels = (labels != -100).any().item()
+                    all_have_valid = dist_helper.all_ok(has_valid_labels, self.device)
+                    if not all_have_valid:
+                        if self.is_master:
+                            tplr.logger.warning(
+                                "Batch has all labels masked (-100) on at least one rank; "
+                                "skipping synchronously to avoid NaN/desync"
+                            )
                         del input_ids, labels
                         continue
 
