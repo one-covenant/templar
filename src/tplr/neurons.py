@@ -34,7 +34,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from wandb.sdk.wandb_run import Run
 
 import tplr
-from tplr.compress import unpack_12bit_indices
+from tplr.compression import decode_batch_rows
 from tplr.distributed import dist_helper
 
 if TYPE_CHECKING:
@@ -1345,30 +1345,46 @@ async def check_uid_index_overlap(
         if idxs_all is None:
             continue
 
-        # Get values for unpacking shape
-        vals_key = pname + "vals"
-        vals_all = getattr(gather_result.state_dict, vals_key, None)
-        if vals_all is None:
+        def _as_bytes(x) -> bytes:
+            if isinstance(x, (bytes, bytearray)):
+                return bytes(x)
+            if isinstance(x, torch.Tensor):
+                if x.dtype != torch.uint8:
+                    raise ValueError(
+                        f"Expected torch.uint8 for Rice payload, got {x.dtype}"
+                    )
+                return x.detach().cpu().contiguous().numpy().tobytes()
+            raise TypeError(f"Unsupported idx payload type: {type(x)}")
+
+        decoded_per_peer: list[torch.Tensor] = []
+
+        for i in range(Ptot):
+            idx_data = idxs_all[i] if isinstance(idxs_all, (list, tuple)) else idxs_all
+            payload = _as_bytes(idx_data)
+
+            rows_i, _C_codec, N_rows = decode_batch_rows(
+                payload
+            )  # rows_i: list[list[int]]
+            if N_rows == 0:
+                # no rows for this param/peer → skip param entirely
+                decoded_per_peer = []
+                break
+
+            # ensure rectangular (constant k)
+            k0 = len(rows_i[0])
+            if not all(len(r) == k0 for r in rows_i):
+                raise ValueError("Rice payload has variable k per row; unsupported.")
+
+            decoded_per_peer.append(torch.tensor(rows_i, dtype=torch.int64))
+
+        if not decoded_per_peer:
             continue
 
-        # Unpack all 12-bit packed indices using values shape
-        unpacked_indices = []
-        for i in range(Ptot):
-            idx_data = idxs_all[i] if isinstance(idxs_all, list) else idxs_all
-            val_data = vals_all[i] if isinstance(vals_all, list) else vals_all
+        idxs_tensor = torch.stack(decoded_per_peer, dim=0)  # [P, C, K]
+        P, C_chunks, k = idxs_tensor.shape
+        idxs_flat = idxs_tensor  # already [P, C, K]
 
-            # 12-bit packed format - use values shape for unpacking
-            unpacked = unpack_12bit_indices(
-                idx_data.to(neuron.config.device), val_data.shape
-            )
-            unpacked_indices.append(unpacked)
-
-        idxs_tensor = torch.stack(unpacked_indices, dim=0)
-        P, *chunk_dims, k = idxs_tensor.shape
-        C = int(torch.prod(torch.tensor(chunk_dims)))  # num chunks
-        idxs_flat = idxs_tensor.reshape(P, C, k)
-
-        param_weight = C * k  # size weight
+        param_weight = C_chunks * k  # size weight
 
         for i in range(P):
             for j in range(i + 1, P):

@@ -218,6 +218,7 @@ class Miner(BaseNode, Trainer):
             use_quantization=True,
             quantization_bins=self.hparams.quantization_bins,
             quantization_range=self.hparams.quantization_range,
+            b_choices=self.hparams.compression_b_choices,
         )
         tplr.logger.info("[Init] compression pipeline ready")
 
