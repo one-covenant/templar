@@ -1,5 +1,7 @@
 # Miner Setup
 
+> **⚠️ 100% Burn Period Active**: Miners are not being evaluated and no emissions are being distributed. The Covenant72B training phase is complete. **Templar: Crusades** - a new competition system - is coming soon. See the main [README](../README.md) for current status.
+
 This document provides a comprehensive guide on how to set up and run a miner using `miner.py`. Miners are crucial components of **τemplar**, responsible for training the model on assigned data subsets and sharing their gradients with peers.
 
 ## Table of Contents

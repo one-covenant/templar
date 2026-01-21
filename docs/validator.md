@@ -1,5 +1,7 @@
 # Validator Setup
 
+> **⚠️ 100% Burn Period Active**: The Covenant72B training phase is complete. Validators are burning 100% of emissions (see [`neurons/burn.py`](../neurons/burn.py)) and are not evaluating miner gradients. **Templar: Crusades** information coming soon. See the main [README](../README.md) for current status.
+
 This document provides a comprehensive guide on how to set up and run a validator using `validator.py`. Validators are crucial components of **τemplar**, responsible for evaluating miners' contributions by assessing their uploaded gradients.
 
 ## Table of Contents
