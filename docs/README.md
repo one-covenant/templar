@@ -1,5 +1,7 @@
 # Templar Documentation
 
+> **⚠️ 100% Burn Period Active**: Miners are not being evaluated and no emissions are being distributed. See the main [README](../README.md) for current status and information about Templar: Crusades.
+
 Welcome to the Templar documentation. This index provides an overview of all available documentation to help you navigate and find the information you need.
 
 ## 📚 Table of Contents
