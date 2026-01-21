@@ -60,24 +60,12 @@ if [ "$NODE_TYPE" = "miner" ]; then
         ${PROJECT:+--project ${PROJECT}} \
         ${DEBUG_FLAG}
 elif [ "$NODE_TYPE" = "validator" ]; then
-    echo "Starting validator with torchrun..."
-    # Enable per-rank logging to separate files
-    exec torchrun \
-        --standalone \
-        --nnodes 1 \
-        --nproc_per_node 4 \
-        --log_dir /app/logs/torchrun \
-        --redirects 3 \
-        --tee 3 \
-        neurons/validator.py \
+    echo "Starting burn validator..."
+    exec python neurons/burn.py \
         --wallet.name ${WALLET_NAME} \
         --wallet.hotkey ${WALLET_HOTKEY} \
         --netuid ${NETUID} \
-        --device cuda \
-        --subtensor.network ${NETWORK} \
-        --use_wandb \
-        ${PROJECT:+--project ${PROJECT}} \
-        ${DEBUG_FLAG}
+        --subtensor.network ${NETWORK}
 elif [ "$NODE_TYPE" = "evaluator" ]; then
     # Count the number of visible GPUs for evaluator
     if [ -n "$NVIDIA_VISIBLE_DEVICES" ]; then
