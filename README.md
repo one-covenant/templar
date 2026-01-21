@@ -19,6 +19,14 @@ Documentation: <a href="https://github.com/one-covenant/templar/blob/main/docs/m
   <a href="https://github.com/one-covenant/templar/actions/workflows/ci.yml"><img src="https://github.com/one-covenant/templar/actions/workflows/ci.yml/badge.svg" alt="CI" style="border: none;" /></a><a href="https://codecov.io/gh/one-covenant/templar"><img src="https://codecov.io/gh/one-covenant/templar/branch/main/graph/badge.svg" alt="Codecov" style="border: none;" /></a><a href="https://github.com/one-covenant/templar/blob/main/LICENSE"><img src="https://img.shields.io/github/license/one-covenant/templar" alt="License" style="border: none;" /></a><a href="https://github.com/one-covenant/templar/commits/main"><img src="https://img.shields.io/github/last-commit/one-covenant/templar" alt="Last Commit" style="border: none;" /></a><a href="https://deepwiki.com/one-covenant/templar"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" style="border: none;" /></a><a href="https://wandb.ai/tplr/templar"><img src="https://img.shields.io/badge/W%26B-Public%20Dashboard-FFBE00?logo=weightsandbiases" alt="Weights & Biases" style="border: none;" /></a><a href="https://grafana.tplr.ai/d/ceia6bwlwn8qof/eval-metrics"><img src="https://img.shields.io/badge/Grafana-Eval%20Metrics-F46800?logo=grafana&logoColor=white" alt="Grafana Dashboard" style="border: none;" /></a>
 </p>
 
+> **⚠️ 100% Burn Period Active (January 2026)**
+>
+> **Templar is currently in a 100% burn period. Miners are not being evaluated and no emissions are being distributed.**
+>
+> The Covenant72B training run is complete - the largest model trained on decentralized infrastructure (72B parameters).
+>
+> We are now finalizing **Templar: Crusades**, a competition system where you submit training code, we evaluate it on target hardware, and the fastest implementation earns emissions. Full details coming soon.
+
 ## Introduction
 
 τemplar is a decentralized training framework that enables large-scale model training across heterogeneous compute resources over the internet. By connecting diverse computational nodes through a carefully designed incentive mechanism, τemplar makes it possible to train large models collaboratively while ensuring honest participation and quality contributions.
