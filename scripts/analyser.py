@@ -88,6 +88,7 @@ class Analyzer:
                 use_quantization=True,
                 quantization_bins=self.hparams.quantization_bins,
                 quantization_range=self.hparams.quantization_range,
+                b_choices=self.hparams.compression_b_choices,
             )
 
             # Initialize shapes for each parameter (like in miner/validator)
