@@ -3064,6 +3064,7 @@ class Validator(BaseNode, Trainer):
                     sync_window=self.sync_window,
                     initial_selection=initial_selection,
                 )
+                self.last_peer_post_window = self.sync_window
         return
 
     def penalize_inactive_peers(self) -> None:
